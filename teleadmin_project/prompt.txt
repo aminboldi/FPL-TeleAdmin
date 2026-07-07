@@ -1,0 +1,51 @@
+Translate the input text into natural, idiomatically correct Persian (Farsi), specifically tailored for the Fantasy Premier League (FPL) community.
+
+Constraints:
+- Maintain all original markdown links, layout paragraph breaks, formatting syntax, and emojis exactly.
+- Output ONLY the final Persian text. No headers, no conversational filler, and no notes.
+- Use the following strict dictionary mapping for FPL terminology and team codes:
+
+FPL Terms:
+Asset: گزینه فانتزی
+Bandwagon: ورودی محبوب
+Bench Boost: بنچ بوست
+Bench fodder: نیمکت سوم
+Blank Gameweek / BGW: هفته پوچ
+Blanked: امتیاز نیاورد
+Bus team: تیم حداقلی
+Chips: چیپ ها
+Dead teams: تیم های مرده
+Defensive contribution points: امتیاز دفکان
+Differential: دیف
+Double Gameweek / DGW: هفته دوبل
+Effective ownership / EO: مالکیت موثر
+Enabler: گزینه اقتصادی
+Essential: گزینه ضروری
+Eye test: به چشم
+FDR rating / FDR: درجه سختی بازی ها
+FPL: فانتزی
+FPL Managers: فانتزی بازان
+Free Hit: فری هیت
+Heavy-hitters / Premium: گزینه های انفجاری
+Hit: منفی
+Out of position / OOP: OOP
+Rank killer: قاتل رتبه
+Return: امتیاز
+Rolling a transfer: ترنسفر نکردن
+Rotation-proof: فیکس
+Single Gameweek: هفته معمولی
+Template: تمپلیت
+Triple Captain: تریپل
+Wildcard: وایلد
+xA: xA
+xG: xG
+xGA: xGA
+xGI: xGI
+H: میزبان
+A: مهمان
+
+Team Abbreviations:
+BOU: بورنموث | ARS: آرسنال | AVL: استون ویلا | BRE: برنتفورد | BHA: برایتون | BUR: برنلی | CHE: چلسی | CRY: کریستال پالاس | EVE: اورتون | FUL: فولام | LEE: لیدز | LIV: لیورپول | MCI: منچستر سیتی | MUN: منچستر یونایتد | NEW: نیوکاسل | NFO: ناتینگهام فارست | SUN: ساندرلند | TOT: تاتنهام | WHU: وست هم | WOL: ولوز | BIR: بیرمنگام | BBR: بلکبرن | BRC: بریستول | CHA: چارلتون | COV: کاونتری | DER: داربی کانتی | HUL: هال سیتی | IPS: ایپسویچ | LEI: لستر | MID: میدلزبرو | MIL: میلوال | NOR: نوریچ | OXF: آکسفورد | POR: پورتموث | PNE: پرستون | QPR: کیو پی آر | SHU: شفیلد یونایتد | SHW: شفیلد ونزدی | SOU: ساوتهمپتون | STO: استوک | SWA: سوانزی | WAT: واتفورد | WBA: وست بروم | WXH: رکسهم
+
+Text to translate:
+{text}
