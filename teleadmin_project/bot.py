@@ -34,6 +34,10 @@ client = TelegramClient(
 )
 
 
+_SOURCE_CHANNELS = [
+    c for c in (settings.source_channel_id, settings.source_channel2_id) if c
+]
+
 SIGNATURE = "@EPL_Fantasy"
 SCHEDULE_DELAY_MINUTES = 10
 
@@ -103,6 +107,39 @@ def _media_suffix(event) -> str:
     return ""
 
 
+async def _send_notification(event, caption: str):
+    if not settings.notif_channel_id:
+        return
+
+    source = (
+        getattr(event.chat, "title", None)
+        or getattr(event.chat, "username", None)
+        or str(event.chat_id)
+    )
+    schedule_time = datetime.now(tz=timezone.utc) + timedelta(
+        minutes=SCHEDULE_DELAY_MINUTES
+    )
+    time_str = schedule_time.strftime("%Y-%m-%d %H:%M UTC")
+
+    preview = caption
+    if len(preview) > 300:
+        preview = preview[:300] + "..."
+
+    media_tag = "Media" if event.message.media else "Text"
+    notif = (
+        f"<b>[{media_tag}] New post scheduled</b>\n"
+        f"<b>Source:</b> {source}\n"
+        f"<b>Scheduled:</b> {time_str}\n\n"
+        f"{preview}"
+    )
+
+    await client.send_message(
+        settings.notif_channel_id,
+        notif,
+        parse_mode="html",
+    )
+
+
 async def _forward_message(caption: str, event):
     media = event.message.media
     schedule_time = datetime.now(tz=timezone.utc) + timedelta(
@@ -132,7 +169,7 @@ async def _forward_message(caption: str, event):
         )
 
 
-@client.on(events.NewMessage(chats=[settings.source_channel_id]))
+@client.on(events.NewMessage(chats=_SOURCE_CHANNELS))
 async def handle_new_message(event):
     text = event.message.text
     media = event.message.media
@@ -166,18 +203,22 @@ async def handle_new_message(event):
     try:
         await _forward_message(caption, event)
         logger.info("Forwarded message to %s", settings.target_channel_id)
+        await _send_notification(event, caption)
     except FloodWaitError as e:
         logger.warning("FloodWaitError: sleeping %ss", e.seconds)
         await asyncio.sleep(e.seconds)
         await _forward_message(caption, event)
+        await _send_notification(event, caption)
     except Exception as e:
         logger.error("Failed to send message: %s", e)
 
 
 async def main():
     logger.info("Starting TeleAdmin bot...")
-    logger.info("  Source : %s", settings.source_channel_id)
+    logger.info("  Sources: %s", ", ".join(_SOURCE_CHANNELS))
     logger.info("  Target : %s", settings.target_channel_id)
+    if settings.notif_channel_id:
+        logger.info("  Notif  : %s", settings.notif_channel_id)
     logger.info("  Model  : %s", settings.openrouter_model)
 
     await client.start()

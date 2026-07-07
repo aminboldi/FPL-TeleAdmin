@@ -37,6 +37,8 @@ Single Gameweek: هفته معمولی
 Template: تمپلیت
 Triple Captain: تریپل
 Wildcard: وایلد
+Price Risers: افزایش قیمت
+Price Fallers: کاهش قیمت
 xA: xA
 xG: xG
 xGA: xGA
@@ -46,6 +48,8 @@ A: مهمان
 
 Team Abbreviations:
 BOU: بورنموث | ARS: آرسنال | AVL: استون ویلا | BRE: برنتفورد | BHA: برایتون | BUR: برنلی | CHE: چلسی | CRY: کریستال پالاس | EVE: اورتون | FUL: فولام | LEE: لیدز | LIV: لیورپول | MCI: منچستر سیتی | MUN: منچستر یونایتد | NEW: نیوکاسل | NFO: ناتینگهام فارست | SUN: ساندرلند | TOT: تاتنهام | WHU: وست هم | WOL: ولوز | BIR: بیرمنگام | BBR: بلکبرن | BRC: بریستول | CHA: چارلتون | COV: کاونتری | DER: داربی کانتی | HUL: هال سیتی | IPS: ایپسویچ | LEI: لستر | MID: میدلزبرو | MIL: میلوال | NOR: نوریچ | OXF: آکسفورد | POR: پورتموث | PNE: پرستون | QPR: کیو پی آر | SHU: شفیلد یونایتد | SHW: شفیلد ونزدی | SOU: ساوتهمپتون | STO: استوک | SWA: سوانزی | WAT: واتفورد | WBA: وست بروم | WXH: رکسهم
+
+Don't translate "m" in prices, for example "£10.0m" doesn't translate to "£10.0م"
 
 Text to translate:
 {text}

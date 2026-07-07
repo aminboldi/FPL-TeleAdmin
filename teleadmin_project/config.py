@@ -16,7 +16,9 @@ class Settings:
     openrouter_model: str
     fallback_model: str
     source_channel_id: str
+    source_channel2_id: str | None
     target_channel_id: str
+    notif_channel_id: str | None
 
 
 def load_config() -> Settings:
@@ -48,5 +50,7 @@ def load_config() -> Settings:
         ),
         fallback_model="google/gemini-2.5-flash-lite",
         source_channel_id=os.getenv("SOURCE_CHANNEL_ID"),
+        source_channel2_id=os.getenv("SOURCE_CHANNEL2_ID") or None,
         target_channel_id=os.getenv("TARGET_CHANNEL_ID"),
+        notif_channel_id=os.getenv("NOTIF_CHANNEL_ID") or None,
     )
