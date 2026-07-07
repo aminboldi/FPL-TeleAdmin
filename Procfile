@@ -1,1 +1,1 @@
-worker: cd teleadmin_project && python bot.py
+web: cd teleadmin_project && python bot.py

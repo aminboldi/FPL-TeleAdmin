@@ -213,6 +213,22 @@ async def handle_new_message(event):
         logger.error("Failed to send message: %s", e)
 
 
+async def _health_handler(reader, writer):
+    try:
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+        await writer.drain()
+    finally:
+        writer.close()
+
+
+async def _start_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = await asyncio.start_server(_health_handler, "0.0.0.0", port)
+    logger.info("Health server listening on port %s", port)
+    async with server:
+        await server.serve_forever()
+
+
 async def main():
     logger.info("Starting TeleAdmin bot...")
     logger.info("  Sources: %s", ", ".join(_SOURCE_CHANNELS))
@@ -223,7 +239,11 @@ async def main():
 
     await client.start()
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    await client.run_until_disconnected()
+
+    await asyncio.gather(
+        _start_health_server(),
+        client.run_until_disconnected(),
+    )
 
 
 if __name__ == "__main__":
