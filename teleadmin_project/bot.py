@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 
 from config import load_config
 from translator import Translator, TranslationError
@@ -27,8 +28,9 @@ translator = Translator(
     fallback_model=settings.fallback_model,
 )
 
+_session_string = os.getenv("TELETHON_SESSION_STRING")
 client = TelegramClient(
-    "translation_session",
+    StringSession(_session_string) if _session_string else "translation_session",
     settings.telegram_api_id,
     settings.telegram_api_hash,
 )
