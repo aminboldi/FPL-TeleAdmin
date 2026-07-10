@@ -1,3 +1,6 @@
 telethon
 openai
 python-dotenv
+beautifulsoup4
+requests
+telegraph

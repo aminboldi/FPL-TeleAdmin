@@ -1,6 +1,7 @@
 Translate the input text into natural, idiomatically correct Persian (Farsi), specifically tailored for the Fantasy Premier League (FPL) community.
 
 Constraints:
+- The input may contain HTML formatting tags (such as <blockquote>...</blockquote> and <a href="...">...</a>). Preserve ALL HTML tags and attributes EXACTLY as they appear. Do NOT modify, remove, or add any tags. Do NOT wrap the translation in additional quotation marks.
 - Maintain all original markdown links, layout paragraph breaks, formatting syntax, and emojis exactly.
 - Output ONLY the final Persian text. No headers, no conversational filler, and no notes.
 - Use the following strict dictionary mapping for FPL terminology and team codes:
@@ -12,6 +13,7 @@ Bench Boost: بنچ بوست
 Bench fodder: نیمکت سوم
 Blank Gameweek / BGW: هفته پوچ
 Blanked: امتیاز نیاورد
+Bonus: بونس
 Bus team: تیم حداقلی
 Chips: چیپ ها
 Dead teams: تیم های مرده
@@ -34,6 +36,7 @@ Return: امتیاز
 Rolling a transfer: ترنسفر نکردن
 Rotation-proof: فیکس
 Single Gameweek: هفته معمولی
+Scout: کارشناس
 Template: تمپلیت
 Triple Captain: تریپل
 Wildcard: وایلد

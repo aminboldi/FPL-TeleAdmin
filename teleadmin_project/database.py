@@ -105,6 +105,13 @@ CREATE TABLE IF NOT EXISTS last_updated (
     value   TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS message_map (
+    source_chat_id  INTEGER NOT NULL,
+    source_msg_id   INTEGER NOT NULL,
+    target_msg_id   INTEGER NOT NULL,
+    PRIMARY KEY (source_chat_id, source_msg_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
 CREATE INDEX IF NOT EXISTS idx_players_position ON players(position_id);
 CREATE INDEX IF NOT EXISTS idx_players_form ON players(form);
@@ -329,6 +336,22 @@ def query_scalar(sql: str, params: tuple = ()) -> Any:
 
 def get_db_path() -> Path:
     return DB_PATH
+
+
+def store_message_mapping(source_chat_id: int, source_msg_id: int, target_msg_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO message_map (source_chat_id, source_msg_id, target_msg_id) "
+            "VALUES (?, ?, ?)",
+            (source_chat_id, source_msg_id, target_msg_id),
+        )
+
+
+def lookup_target_msg(source_chat_id: int, source_msg_id: int) -> int | None:
+    return query_scalar(
+        "SELECT target_msg_id FROM message_map WHERE source_chat_id = ? AND source_msg_id = ?",
+        (source_chat_id, source_msg_id),
+    )
 
 
 if __name__ == "__main__":

@@ -105,11 +105,9 @@ Formatting: `alerts.format_lineup()` includes kickoff time (converted to Iran ti
 
 ## Deadline automation
 
-Two automated operations in `deadlines.py`, running as a background loop every 60s:
+An event-driven loop in `deadlines.py` that posts a deadline-passed message at each gameweek's deadline time.
 
-1. **Schedule reminder**: 2 hours after the last game of the previous GW finishes, schedules a Telegram message for the upcoming GW's deadline saying `شنبه ساعت 14:30، دللاین هفته 39`.
-
-2. **Deadline-passed post**: At deadline time, posts `deadline.jpg` with caption announcing the deadline passed, including the league invite link.
+- **Deadline-passed post**: At deadline time, posts `deadline.jpg` with caption announcing the deadline passed, including the league invite link.
 
 The FPL league code is stored in `LEAGUE_CODE` env var (default `433b70`). The full link is `https://fantasy.premierleague.com/leagues/auto-join/{code}`.
 
@@ -120,3 +118,16 @@ All numbers in automated posts use English digits and are wrapped in `<b>` tags.
 ### Iran timezone
 
 UTC+3:30 year-round (Iran does not observe DST). All times from the FPL API (GMT/UTC) are converted to Iran time.
+
+### Reply chain preservation
+
+If a source post is a reply to another source post, the target post replies to the corresponding translated post. The `message_map` table stores source→target message ID pairs. `_get_reply_to()` resolves the target reply ID, `_save_mapping()` records it after each post.
+
+## Article translation
+
+When a source message contains a Premier League article URL (`premierleague.com/en/news/...` or short link `preml.ge/...`), the bot fetches the page, extracts the article content, and posts a full translation.
+
+- `articles.py` uses BeautifulSoup to extract the title, publish date, summary, and body paragraphs from the `.article__content` div
+- Promotional cards (`.articleWidget`, `.embeddable-article`) are stripped
+- Content is formatted as HTML with bold title and a "پست اصلی" link to the original article
+- The translated HTML is posted directly (no scheduling, no signature appended)

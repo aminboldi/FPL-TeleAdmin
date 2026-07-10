@@ -9,12 +9,18 @@ from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
+from telethon.tl.types import (
+    MessageEntityBlockquote,
+    MessageEntityTextUrl,
+)
 
 from config import load_config
 from translator import Translator, TranslationError
 import alerts
 import price_changes
 import deadlines
+import articles
+import database as db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +50,83 @@ _SOURCE_CHANNELS = [
 ]
 
 SIGNATURE = "@EPL_Fantasy"
-SCHEDULE_DELAY_MINUTES = 10
+_ALBUM_TIMEOUT = 5  # seconds to wait for all album parts
+
+_album_buffer: dict[int, list] = {}
+_album_tasks: dict[int, asyncio.Task] = {}
+_album_caption: dict[int, str] = {}
+
+
+def _get_reply_to(event) -> int | None:
+    if not event.message.reply_to:
+        return None
+    reply_msg_id = event.message.reply_to.reply_to_msg_id
+    if not reply_msg_id:
+        return None
+    return db.lookup_target_msg(event.chat_id, reply_msg_id)
+
+
+def _save_mapping(event, target_msg_id: int) -> None:
+    db.store_message_mapping(event.chat_id, event.message.id, target_msg_id)
+
+
+def _strip_quotes(text: str) -> str:
+    for ch in "\u201c\u201d\u201e\u201f\u2033\u2036\"\u00ab\u00bb\u2039\u203a":
+        text = text.replace(ch, "")
+    return text
+
+
+def _message_to_html(text: str, entities: list | None) -> str:
+    if not entities:
+        return _escape_html(text)
+
+    offsets: list[tuple[int, str]] = []
+    for e in entities:
+        entity_type = type(e)
+        if entity_type is MessageEntityBlockquote:
+            offsets.append((e.offset, "<blockquote>"))
+            offsets.append((e.offset + e.length, "</blockquote>"))
+        elif entity_type is MessageEntityTextUrl:
+            tag = f'<a href="{_escape_html(e.url)}">'
+            offsets.append((e.offset, tag))
+            offsets.append((e.offset + e.length, "</a>"))
+
+    if not offsets:
+        return _escape_html(text)
+
+    offsets.sort(key=lambda x: (x[0], x[1]))
+    result = []
+    pos = 0
+    for offset, tag in offsets:
+        if offset > pos:
+            result.append(_escape_html(text[pos:offset]))
+        result.append(tag)
+        pos = offset
+    if pos < len(text):
+        result.append(_escape_html(text[pos:]))
+    return "".join(result)
+
+
+def _fix_unclosed_tags(html: str) -> str:
+    depth = 0
+    result = []
+    i = 0
+    while i < len(html):
+        if html[i:i+12] == "<blockquote>":
+            depth += 1
+            result.append("<blockquote>")
+            i += 12
+        elif html[i:i+13] == "</blockquote>":
+            depth -= 1
+            result.append("</blockquote>")
+            i += 13
+        else:
+            result.append(html[i])
+            i += 1
+    while depth > 0:
+        result.append("</blockquote>")
+        depth -= 1
+    return "".join(result)
 
 _PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
 _ENGLISH_DIGITS = "01234567890123456789"
@@ -93,12 +175,25 @@ def _extract_urls(event) -> list[str]:
     return urls
 
 
+def _clean_text(text: str, event=None) -> tuple[str | None, str | None]:
+    text = _strip_hashtags(text)
+    urls = _extract_urls(event) if event else []
+    link_url = urls[0] if urls else None
+    for url in urls:
+        text = text.replace(url, "")
+    text = text.strip() or None
+    return text, link_url
+
+
 def _build_caption(
-    translated: str | None, *, link_url: str | None = None
+    translated: str | None, *, link_url: str | None = None, html: bool = False
 ) -> str:
     parts = []
     if translated:
-        parts.append(_format_numbers(translated))
+        if html:
+            parts.append(translated)
+        else:
+            parts.append(_format_numbers(translated))
     if link_url:
         parts.append(f'<a href="{link_url}">لینک</a>')
     if not parts:
@@ -121,10 +216,6 @@ async def _send_notification(event, caption: str):
         or getattr(event.chat, "username", None)
         or str(event.chat_id)
     )
-    schedule_time = datetime.now(tz=timezone.utc) + timedelta(
-        minutes=SCHEDULE_DELAY_MINUTES
-    )
-    time_str = schedule_time.strftime("%Y-%m-%d %H:%M UTC")
 
     preview = caption
     if len(preview) > 300:
@@ -132,9 +223,8 @@ async def _send_notification(event, caption: str):
 
     media_tag = "Media" if event.message.media else "Text"
     notif = (
-        f"<b>[{media_tag}] New post scheduled</b>\n"
-        f"<b>Source:</b> {source}\n"
-        f"<b>Scheduled:</b> {time_str}\n\n"
+        f"<b>[{media_tag}] New post</b>\n"
+        f"<b>Source:</b> {source}\n\n"
         f"{preview}"
     )
 
@@ -145,81 +235,190 @@ async def _send_notification(event, caption: str):
     )
 
 
-async def _post_price_changes(farsi_text: str):
+async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=None, is_album=False):
+    reply_to = _get_reply_to(event) if event else None
     try:
-        await client.send_message(
-            settings.target_channel_id,
-            farsi_text,
-            parse_mode="html",
-        )
-        logger.info("Posted price changes to %s", settings.target_channel_id)
+        if album_paths:
+            msg = await client.send_file(
+                settings.target_channel_id,
+                album_paths,
+                caption=text,
+                reply_to=reply_to,
+                parse_mode="html",
+            )
+        elif file_path:
+            msg = await client.send_file(
+                settings.target_channel_id,
+                file_path,
+                caption=text,
+                reply_to=reply_to,
+                parse_mode="html",
+            )
+        else:
+            msg = await client.send_message(
+                settings.target_channel_id,
+                text,
+                reply_to=reply_to,
+                parse_mode="html",
+            )
+        if event:
+            _save_mapping(event, msg.id)
+        return msg
     except FloodWaitError as e:
         logger.warning("FloodWaitError: sleeping %ss", e.seconds)
         await asyncio.sleep(e.seconds)
-        await client.send_message(
-            settings.target_channel_id,
-            farsi_text,
-            parse_mode="html",
-        )
-    except Exception as e:
-        logger.error("Failed to post price changes: %s", e)
+        if album_paths:
+            msg = await client.send_file(
+                settings.target_channel_id,
+                album_paths,
+                caption=text,
+                reply_to=reply_to,
+                parse_mode="html",
+            )
+        elif file_path:
+            msg = await client.send_file(
+                settings.target_channel_id,
+                file_path,
+                caption=text,
+                reply_to=reply_to,
+                parse_mode="html",
+            )
+        else:
+            msg = await client.send_message(
+                settings.target_channel_id,
+                text,
+                reply_to=reply_to,
+                parse_mode="html",
+            )
+        if event:
+            _save_mapping(event, msg.id)
+        return msg
+
+
+async def _post_price_changes(farsi_text: str):
+    await _send_to_target(farsi_text)
+    logger.info("Posted price changes to %s", settings.target_channel_id)
 
 
 async def _send_alert(farsi_text: str, event):
-    try:
-        await client.send_message(
-            settings.target_channel_id,
-            farsi_text,
-            parse_mode="html",
-        )
-        logger.info("Sent game alert to %s", settings.target_channel_id)
-        await _send_notification(event, farsi_text)
-    except FloodWaitError as e:
-        logger.warning("FloodWaitError: sleeping %ss", e.seconds)
-        await asyncio.sleep(e.seconds)
-        await client.send_message(
-            settings.target_channel_id,
-            farsi_text,
-            parse_mode="html",
-        )
-        await _send_notification(event, farsi_text)
+    await _send_to_target(farsi_text, event=event)
+    logger.info("Sent game alert to %s", settings.target_channel_id)
+    await _send_notification(event, farsi_text)
 
 
 async def _forward_message(caption: str, event):
     media = event.message.media
-    schedule_time = datetime.now(tz=timezone.utc) + timedelta(
-        minutes=SCHEDULE_DELAY_MINUTES
-    )
+    if media:
+        await _forward_media(caption, event)
+    else:
+        await _send_to_target(caption, event=event)
 
+
+async def _forward_media(caption: str, event):
+    media = event.message.media
     if media:
         temp = tempfile.NamedTemporaryFile(delete=False, suffix=_media_suffix(event))
         try:
             temp.close()
             await event.message.download_media(file=temp.name)
-            await client.send_file(
-                settings.target_channel_id,
-                temp.name,
-                caption=caption,
-                schedule=schedule_time,
-                parse_mode="html",
-            )
+            await _send_to_target(caption, file_path=temp.name, event=event)
         finally:
             os.unlink(temp.name)
-    else:
-        await client.send_message(
-            settings.target_channel_id,
-            caption,
-            schedule=schedule_time,
-            parse_mode="html",
-        )
+
+
+async def _forward_album(caption: str, events: list):
+    temps = []
+    try:
+        for evt in events:
+            if evt.message.media:
+                temp = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=_media_suffix(evt)
+                )
+                temp.close()
+                await evt.message.download_media(file=temp.name)
+                temps.append(temp.name)
+
+        if not temps:
+            return
+
+        if len(temps) == 1:
+            await _send_to_target(caption, file_path=temps[0], event=events[0])
+        else:
+            await _send_to_target(caption, album_paths=temps, event=events[0])
+    finally:
+        for path in temps:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+async def _finish_album(gid: int):
+    await asyncio.sleep(_ALBUM_TIMEOUT)
+    events = _album_buffer.pop(gid, [])
+    _album_tasks.pop(gid, None)
+    raw_text = _album_caption.pop(gid, "")
+
+    if not events:
+        return
+
+    caption = raw_text
+    if raw_text:
+        if alerts.is_game_alert(raw_text):
+            parsed = alerts.parse(raw_text)
+            if parsed:
+                caption = alerts.format_farsi(parsed) or raw_text
+        elif alerts.is_lineup(raw_text):
+            parsed = alerts.parse_lineup(raw_text)
+            if parsed:
+                caption = alerts.format_lineup(parsed) or raw_text
+        else:
+            try:
+                first_evt = events[0]
+                html = _message_to_html(raw_text, first_evt.message.entities)
+                html = _strip_hashtags(html)
+                html = _strip_quotes(html)
+                links = _extract_urls(first_evt)
+                link_url = links[0] if links else None
+                for url in links:
+                    html = html.replace(url, "")
+                html = html.strip()
+                if html:
+                    translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
+                    caption = _build_caption(translated, link_url=link_url, html=True)
+                else:
+                    caption = _build_caption(None, link_url=link_url)
+            except Exception as e:
+                logger.error("Translation error for album: %s", e)
+                caption = raw_text
+
+    logger.info("Processing album %d: %d items", gid, len(events))
+
+    await _forward_album(caption, events)
+    await _send_notification(events[0], caption)
 
 
 @client.on(events.NewMessage(chats=_SOURCE_CHANNELS))
 async def handle_new_message(event):
     text = event.message.text
     media = event.message.media
+    grouped_id = event.message.grouped_id
 
     if not text and not media:
+        return
+
+    # Album messages: buffer and process together
+    if grouped_id:
+        if grouped_id not in _album_buffer:
+            _album_buffer[grouped_id] = []
+        _album_buffer[grouped_id].append(event)
+        if text:
+            _album_caption[grouped_id] = text
+
+        if grouped_id not in _album_tasks:
+            _album_tasks[grouped_id] = asyncio.create_task(
+                _finish_album(grouped_id)
+            )
         return
 
     if text and alerts.is_game_alert(text):
@@ -252,20 +451,19 @@ async def handle_new_message(event):
                 await _post_price_changes(combined)
             return
 
-    link_url = None
-    if text:
-        text = _strip_hashtags(text)
-        urls = _extract_urls(event)
-        if urls:
-            link_url = urls[0]
-            for url in urls:
-                text = text.replace(url, "")
-        text = text.strip() or None
+    html = _message_to_html(text or "", event.message.entities)
+    html = _strip_hashtags(html)
+    html = _strip_quotes(html)
+    links = _extract_urls(event)
+    link_url = links[0] if links else None
+    for url in links:
+        html = html.replace(url, "")
+    html = html.strip()
 
     translated = None
-    if text:
+    if html:
         try:
-            translated = await translator.translate(text)
+            translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
         except TranslationError as e:
             logger.error("Translation error: %s", e)
             return
@@ -273,19 +471,54 @@ async def handle_new_message(event):
             logger.error("Unexpected translation error: %s", e)
             return
 
-    caption = _build_caption(translated, link_url=link_url)
+    caption = _build_caption(translated, link_url=link_url, html=True)
 
+    await _forward_message(caption, event)
+    logger.info("Forwarded message to %s", settings.target_channel_id)
+    await _send_notification(event, caption)
+
+    await _maybe_post_article(text or "", event)
+
+
+async def _maybe_post_article(text: str, event):
+    url = None
+    for m in re.finditer(r"(?:https?://)?\S+", text):
+        raw = m.group(0)
+        if articles.is_pl_article_url(raw):
+            url = articles.resolve_url(raw)
+            break
+    if not url and event.message.entities:
+        for e in event.message.entities:
+            u = getattr(e, "url", None)
+            if u and articles.is_pl_article_url(u):
+                url = u
+                break
+    if not url:
+        return
+
+    logger.info("Post-processing article URL: %s", url)
+    article = articles.fetch_article(url)
+
+    logger.info("Post-processing article URL: %s", url)
+    article = articles.fetch_article(url)
+    if not article or not article.get("parts"):
+        logger.warning("Could not extract article from %s", url)
+        return
+
+    raw_html = articles.build_article_html(
+        article["title"], article["date"], article["summary"],
+        article["parts"], article["url"], article.get("header_image", ""),
+    )
     try:
-        await _forward_message(caption, event)
-        logger.info("Forwarded message to %s", settings.target_channel_id)
-        await _send_notification(event, caption)
-    except FloodWaitError as e:
-        logger.warning("FloodWaitError: sleeping %ss", e.seconds)
-        await asyncio.sleep(e.seconds)
-        await _forward_message(caption, event)
-        await _send_notification(event, caption)
+        translated = _fix_unclosed_tags(
+            _strip_quotes(await translator.translate(raw_html))
+        )
+        telegraph_url = articles.publish_to_telegraph(article["title"], translated)
+        if telegraph_url:
+            await _send_to_target(telegraph_url, event=event)
+            await _send_notification(event, telegraph_url)
     except Exception as e:
-        logger.error("Failed to send message: %s", e)
+        logger.error("Article post-processing error: %s", e)
 
 
 async def _health_handler(reader, writer):
