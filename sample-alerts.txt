@@ -1,0 +1,142 @@
+SOURCE TEXT:
+
+Goal - MATETA
+Assist - YEREMY
+
+Crystal Palace 1-2 Arsenal (89 mins)
+
+#FPL #CRYARS
+
+--------------------
+
+
+Goal - WATKINS
+Assist - BARKLEY
+
+Man City 1-2 Aston Villa (61 mins)
+
+#FPL #MCIAVL
+
+
+--------------------
+
+Red card - FOFANA
+
+Sunderland 2-1 Chelsea (62 mins)
+
+#FPL #SUNCHE
+
+
+
+--------------------
+
+
+Goal - own goal (Gusto)
+Assist - BROBBEY
+
+Sunderland 2-0 Chelsea (50 mins)
+
+#FPL #SUNCHE
+
+
+---------------------
+
+
+Goal - ARMSTRONG (pen)
+Assist - KREJCI
+
+Burnley 0-1 Wolves (5 mins)
+
+#FPL #BURWOL
+
+
+-----------------------
+
+Goal - SARR (pen)
+Assist - none
+
+Brentford 0-1 Crystal Palace (6 mins)
+
+#FPL #BRECRY
+
+
+-----------------------
+
+
+Penalty missed - PALMER
+Penalty saved - SELS
+
+Chelsea 0-2 Nottingham Forest (45+10 mins)
+
+#FPL #CHENFO
+
+
+------------------------
+
+
+Goal - WOOD
+Assist - TBD
+
+Sunderland 0-2 Nottingham Forest (31 mins)
+
+#FPL #SUNNFO
+
+
+*********************************************************************************
+
+TARGET TEXT
+
+'15 | چلسی 1 بورنموث 1
+
+⚽ پالمر 10.4M (پنالتی)
+🅰️ استوائو 6.4M
+
+@EPL_Fantasy
+
+---------------------
+
+'90+1 | برنتفورد 4 بورنموث 1
+
+⚽ شید 7.0M
+🅰️ دمسگارد 5.8M
+
+@EPL_Fantasy
+
+
+--------------------------
+
+'39 | برنتفورد 2 بورنموث 0
+
+⚽ پتروویچ 4.5G (گل بخودی)
+🅰️ ندارد
+
+@EPL_Fantasy
+
+
+------------------------------------
+
+'60 | برنتفورد 1 ساندرلند 0
+ 
+📛 کلهر 4.5G (مهار پنالتی)
+❌ لوفی 4.9M
+
+@EPL_Fantasy
+
+
+---------------------------------
+
+'36 | بورنموث 2 تاتنهام 1
+
+⚽ کروپی 4.6F
+🅰️ در دست بررسی
+
+@EPL_Fantasy
+
+
+--------------------------------------
+
+'87 | اورتون 1 ولوز 1
+
+♦ اخراج گریلیش 6.5M (اورتون)
+
+@EPL_Fantasy

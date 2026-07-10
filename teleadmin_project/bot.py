@@ -12,6 +12,9 @@ from telethon.sessions import StringSession
 
 from config import load_config
 from translator import Translator, TranslationError
+import alerts
+import price_changes
+import deadlines
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,6 +145,46 @@ async def _send_notification(event, caption: str):
     )
 
 
+async def _post_price_changes(farsi_text: str):
+    try:
+        await client.send_message(
+            settings.target_channel_id,
+            farsi_text,
+            parse_mode="html",
+        )
+        logger.info("Posted price changes to %s", settings.target_channel_id)
+    except FloodWaitError as e:
+        logger.warning("FloodWaitError: sleeping %ss", e.seconds)
+        await asyncio.sleep(e.seconds)
+        await client.send_message(
+            settings.target_channel_id,
+            farsi_text,
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error("Failed to post price changes: %s", e)
+
+
+async def _send_alert(farsi_text: str, event):
+    try:
+        await client.send_message(
+            settings.target_channel_id,
+            farsi_text,
+            parse_mode="html",
+        )
+        logger.info("Sent game alert to %s", settings.target_channel_id)
+        await _send_notification(event, farsi_text)
+    except FloodWaitError as e:
+        logger.warning("FloodWaitError: sleeping %ss", e.seconds)
+        await asyncio.sleep(e.seconds)
+        await client.send_message(
+            settings.target_channel_id,
+            farsi_text,
+            parse_mode="html",
+        )
+        await _send_notification(event, farsi_text)
+
+
 async def _forward_message(caption: str, event):
     media = event.message.media
     schedule_time = datetime.now(tz=timezone.utc) + timedelta(
@@ -178,6 +221,36 @@ async def handle_new_message(event):
 
     if not text and not media:
         return
+
+    if text and alerts.is_game_alert(text):
+        parsed = alerts.parse(text)
+        if parsed:
+            farsi = alerts.format_farsi(parsed)
+            if farsi:
+                logger.info("Detected game-action alert, formatting directly")
+                await _send_alert(farsi, event)
+                return
+
+    if text and alerts.is_lineup(text):
+        parsed = alerts.parse_lineup(text)
+        if parsed:
+            farsi = alerts.format_lineup(parsed)
+            if farsi:
+                logger.info("Detected lineup, formatting directly")
+                await _send_alert(farsi, event)
+                return
+
+    if text and price_changes.is_price_change(text):
+        parsed = price_changes.parse_price_change(text)
+        if parsed:
+            logger.info(
+                "Detected price change: %s (%d players)",
+                parsed.change_type, len(parsed.players),
+            )
+            combined = price_changes.accumulate(parsed, _post_price_changes)
+            if combined:
+                await _post_price_changes(combined)
+            return
 
     link_url = None
     if text:
@@ -245,6 +318,11 @@ async def main():
     await asyncio.gather(
         _start_health_server(),
         client.run_until_disconnected(),
+        deadlines.run_deadline_loop(
+            client=client,
+            target_channel=settings.target_channel_id,
+            league_code=settings.league_code,
+        ),
     )
 
 
