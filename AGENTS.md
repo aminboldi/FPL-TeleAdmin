@@ -10,7 +10,7 @@ Must run from `teleadmin_project/` (not repo root) because the Telethon session 
 
 ## Parse mode: HTML only
 
-Telethon supports `"md"`, `"markdown"`, `"html"`, `"htm"` — but NOT `"md2"` or `"markdownv2"`. The repo uses `parse_mode="html"` everywhere (`bot.py:142,161,182`).
+Telethon supports `"md"`, `"markdown"`, `"html"`, `"htm"` — but NOT `"md2"` or `"markdownv2"`. The repo uses `parse_mode="html"` everywhere.
 
 Telethon's legacy markdown parser does NOT consume `\` as an escape character; it passes backslashes through literally. Do not reintroduce markdown escaping or markdown parse mode.
 
@@ -21,12 +21,12 @@ HTML formatting conventions used in the code:
 
 ## Media must preserve file extension
 
-When downloading and re-uploading media, the temp file must include the original extension from `event.message.file.ext` (`bot.py:106-109`). Without it, Telethon falls back to sending as a generic document attachment instead of an inline photo/video.
+When downloading and re-uploading media, the temp file must include the original extension from `event.message.file.ext` (`bot.py:_media_suffix()`). Without it, Telethon falls back to sending as a generic document attachment instead of an inline photo/video.
 
 ## Config and session layout
 
 - `.env` lives at repo root. `config.py` loads it from `Path(__file__).parent.parent / ".env"`.
-- Telethon session is resolved at `bot.py:31-36`: if `TELETHON_SESSION_STRING` env var is set, a `StringSession` is used (cloud deployment). Otherwise it falls back to the local file `teleadmin_project/translation_session.session`.
+- Telethon session: if `TELETHON_SESSION_STRING` env var is set, a `StringSession` is used (cloud deployment). Otherwise it falls back to the local file `teleadmin_project/translation_session.session`.
 - First run locally prompts for phone number + verification code. After login, run `python export_session.py` to export the session as a string for cloud deployment.
 - Keep `.env` out of git. The session file is committed as a convenience, but `TELETHON_SESSION_STRING` takes priority.
 - The env var is `OPEN_ROUTER_API_KEY` (with underscore between OPEN and ROUTER). The old specs.md uses `OPENROUTER_API_KEY` (no underscore) — that's wrong.
@@ -34,13 +34,13 @@ When downloading and re-uploading media, the temp file must include the original
 ## Deployment
 
 - Deployed on a Coolify-managed VPS. The Procfile at root (`web: cd teleadmin_project && python bot.py`) is used as the start command.
-- **Health server**: `bot.py:248-261` runs a minimal async HTTP server on `PORT` env var. This enables uptime monitoring on any platform.
+- **Health server**: `bot.py:_start_health_server()` runs a minimal async HTTP server on `PORT` env var. This enables uptime monitoring on any platform.
 - **StringSession**: Export with `python export_session.py`, add as `TELETHON_SESSION_STRING` env var. The committed `.session` file won't work reliably across deployment machines.
 - **Root `requirements.txt`**: points to `teleadmin_project/requirements.txt`. Required for buildpack-based deployment that runs `pip install -r requirements.txt`.
 
 ## URL extraction from messages
 
-URLs come from two sources (`bot.py:81-90`):
+URLs come from two sources (`bot.py:_extract_urls()`):
 1. Raw text regex: `(?:https?://|t\.me/)\S+`
 2. Message entities: `MessageEntityTextUrl` (link text + hidden URL) — accessed via `getattr(entity, "url", None)`
 
@@ -58,6 +58,8 @@ Returns `limit`, `usage`, `is_free_tier`, and `limit_remaining` fields.
 ## Translation prompt
 
 The LLM prompt lives in `teleadmin_project/prompt.txt` (not hardcoded). `{text}` placeholder is replaced at runtime. The model and fallback model are configured in `.env` (`OPEN_ROUTER_MODEL`) and `config.py` (`fallback_model`) respectively.
+
+For article translations, `article_prompt.txt` asks the LLM for structured JSON output (`title`, `summary`, `body`). `translator.translate_article()` parses the JSON with fallback to regular translation + auto-generated title/summary.
 
 ## Git push
 
@@ -131,3 +133,27 @@ When a source message contains a Premier League article URL (`premierleague.com/
 - Promotional cards (`.articleWidget`, `.embeddable-article`) are stripped
 - Content is formatted as HTML with bold title and a "پست اصلی" link to the original article
 - The translated HTML is posted directly (no scheduling, no signature appended)
+
+## Telegraph articles
+
+Long-form content (>350 source chars) and merged text chunks are published as Telegraph articles via `articles.publish_to_telegraph()`.
+
+- `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله:` header, title, divider, summary, and `متن کامل مقاله: 👇👇👇` linked to the Telegraph URL
+- `translator.translate_article()` uses `article_prompt.txt` for structured JSON output (`title`/`summary`/`body`), falling back to regular translation if JSON parsing fails
+
+## Text chunk merging
+
+Telegram splits long messages into chunks for non-premium accounts. `bot.py` buffers sent text messages from the same chat for 3 seconds (`_CHUNK_TIMEOUT`), merges them, then processes as a single message through the full pipeline.
+
+## Rich formatting preservation
+
+`_message_to_html()` converts Telegram message entities to HTML before translation. Currently handles:
+- `MessageEntityBlockquote` → `<blockquote>`
+- `MessageEntityTextUrl` → `<a href="...">`
+- All other formatting (bold, italic, etc.) is stripped — unnecessary for the LLM
+
+Post-processing: `_strip_quotes()` removes 11 Unicode quote variants, `_fix_unclosed_tags()` ensures blockquotes are properly closed.
+
+## Playwright scraper
+
+`scraper.py` uses Playwright + Chromium to screenshot DOM elements. `screenshot_element(url, selector)` returns PNG bytes. Browser reuses a single instance across calls. Requires: `pip install playwright && python -m playwright install chromium`.
