@@ -50,11 +50,16 @@ _SOURCE_CHANNELS = [
 ]
 
 SIGNATURE = "@EPL_Fantasy"
-_ALBUM_TIMEOUT = 5  # seconds to wait for all album parts
+_ALBUM_TIMEOUT = 5
+_ARTICLE_SOURCE_THRESHOLD = 350
+_CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
 
 _album_buffer: dict[int, list] = {}
 _album_tasks: dict[int, asyncio.Task] = {}
 _album_caption: dict[int, str] = {}
+
+_chunk_buffer: dict[int, list] = {}
+_chunk_tasks: dict[int, asyncio.Task] = {}
 
 
 def _get_reply_to(event) -> int | None:
@@ -74,6 +79,20 @@ def _strip_quotes(text: str) -> str:
     for ch in "\u201c\u201d\u201e\u201f\u2033\u2036\"\u00ab\u00bb\u2039\u203a":
         text = text.replace(ch, "")
     return text
+
+
+def _strip_html_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
+def _format_telegraph_post(title: str, summary: str, telegraph_url: str) -> str:
+    return (
+        f"<b>✍ مقاله:</b>\n\n"
+        f"<b>{title}</b>\n\n"
+        f"- - - - - - - - -\n\n"
+        f"{summary}\n\n"
+        f'<a href="{telegraph_url}">متن کامل مقاله: 👇👇👇</a>'
+    )
 
 
 def _message_to_html(text: str, entities: list | None) -> str:
@@ -407,6 +426,18 @@ async def handle_new_message(event):
     if not text and not media:
         return
 
+    # Merge text chunks split by Telegram's character limit
+    if text and not event.message.media and not event.message.grouped_id:
+        chat_id = event.chat_id
+        if chat_id not in _chunk_buffer:
+            _chunk_buffer[chat_id] = []
+        _chunk_buffer[chat_id].append(event)
+
+        if chat_id in _chunk_tasks:
+            _chunk_tasks[chat_id].cancel()
+        _chunk_tasks[chat_id] = asyncio.create_task(_finish_chunks(chat_id))
+        return
+
     # Album messages: buffer and process together
     if grouped_id:
         if grouped_id not in _album_buffer:
@@ -463,7 +494,23 @@ async def handle_new_message(event):
     translated = None
     if html:
         try:
-            translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
+            if len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
+                result = await translator.translate_article(html)
+                title = result.get("title", "")
+                summary = result.get("summary", "")
+                body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+                telegraph_url = articles.publish_to_telegraph(title, body)
+                if telegraph_url:
+                    caption = _format_telegraph_post(title, summary, telegraph_url)
+                    await _send_to_target(caption, event=event)
+                    await _send_notification(event, caption)
+                    logger.info("Published Telegraph article (%d chars)", len(body))
+                else:
+                    caption = _build_caption(body, link_url=link_url, html=True)
+                    await _forward_message(caption, event)
+                    logger.info("Telegraph failed, posted inline")
+            else:
+                translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
         except TranslationError as e:
             logger.error("Translation error: %s", e)
             return
@@ -471,13 +518,58 @@ async def handle_new_message(event):
             logger.error("Unexpected translation error: %s", e)
             return
 
-    caption = _build_caption(translated, link_url=link_url, html=True)
-
-    await _forward_message(caption, event)
-    logger.info("Forwarded message to %s", settings.target_channel_id)
-    await _send_notification(event, caption)
+    if translated:
+        caption = _build_caption(translated, link_url=link_url, html=True)
+        await _forward_message(caption, event)
+        logger.info("Forwarded message to %s", settings.target_channel_id)
+        await _send_notification(event, caption)
 
     await _maybe_post_article(text or "", event)
+
+
+async def _finish_chunks(chat_id: int):
+    await asyncio.sleep(_CHUNK_TIMEOUT)
+    chunks = _chunk_buffer.pop(chat_id, [])
+    _chunk_tasks.pop(chat_id, None)
+    if not chunks:
+        return
+
+    merged_text = "\n".join(evt.message.text for evt in chunks if evt.message.text)
+    first_evt = chunks[0]
+    logger.info("Merged %d text chunks from chat %d (%d chars)", len(chunks), chat_id, len(merged_text))
+
+    html = _message_to_html(merged_text, first_evt.message.entities)
+    html = _strip_hashtags(html)
+    html = _strip_quotes(html)
+    links = _extract_urls(first_evt)
+    link_url = links[0] if links else None
+    for url in links:
+        html = html.replace(url, "")
+    html = html.strip()
+
+    translated = None
+    if html:
+        try:
+            result = await translator.translate_article(html)
+            title = result.get("title", "")
+            summary = result.get("summary", "")
+            body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+            telegraph_url = articles.publish_to_telegraph(title, body)
+            if telegraph_url:
+                caption = _format_telegraph_post(title, summary, telegraph_url)
+                await _send_to_target(caption, event=first_evt)
+                await _send_notification(first_evt, caption)
+            else:
+                caption = _build_caption(body, link_url=link_url, html=True)
+                await _forward_message(caption, first_evt)
+        except TranslationError as e:
+            logger.error("Translation error for chunks: %s", e)
+            return
+        except Exception as e:
+            logger.error("Unexpected translation error for chunks: %s", e)
+            return
+
+    await _maybe_post_article(merged_text, first_evt)
 
 
 async def _maybe_post_article(text: str, event):
@@ -515,8 +607,17 @@ async def _maybe_post_article(text: str, event):
         )
         telegraph_url = articles.publish_to_telegraph(article["title"], translated)
         if telegraph_url:
-            await _send_to_target(telegraph_url, event=event)
-            await _send_notification(event, telegraph_url)
+            summary = article.get("summary", "")
+            if not summary and article.get("parts"):
+                for p in article["parts"]:
+                    if p["type"] == "p":
+                        summary = p["text"][:300]
+                        break
+            caption = _format_telegraph_post(
+                article["title"], _strip_html_tags(summary), telegraph_url
+            )
+            await _send_to_target(caption, event=event)
+            await _send_notification(event, caption)
     except Exception as e:
         logger.error("Article post-processing error: %s", e)
 

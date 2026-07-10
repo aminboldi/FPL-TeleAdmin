@@ -1,5 +1,6 @@
 """Fetch and extract Premier League article content for translation."""
 import logging
+import os
 import re
 
 import requests
@@ -32,12 +33,29 @@ _telegraph: Telegraph | None = None
 
 def _get_telegraph() -> Telegraph:
     global _telegraph
-    if _telegraph is None:
-        _telegraph = Telegraph()
-        try:
-            _telegraph.create_account(short_name="TeleAdmin")
-        except Exception:
-            pass
+    if _telegraph is not None:
+        return _telegraph
+
+    token = os.getenv("TELEGRAPH_ACCESS_TOKEN")
+    if token:
+        _telegraph = Telegraph(access_token=token)
+        logger.info("Using existing Telegraph account")
+        return _telegraph
+
+    _telegraph = Telegraph()
+    try:
+        result = _telegraph.create_account(short_name="TeleAdmin")
+        token = result.get("access_token", "")
+        if token:
+            logger.info(
+                "New Telegraph account created. "
+                "To manage articles manually, set TELEGRAPH_ACCESS_TOKEN=%s in .env",
+                token,
+            )
+        else:
+            logger.warning("Telegraph account created but no token returned")
+    except Exception:
+        pass
     return _telegraph
 
 
