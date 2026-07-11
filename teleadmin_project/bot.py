@@ -21,6 +21,7 @@ import price_changes
 import deadlines
 import articles
 import database as db
+import scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +51,8 @@ _SOURCE_CHANNELS = [
 ]
 
 SIGNATURE = "@EPL_Fantasy"
+AI_SIGNATURE = "@EPL_Fantasy | \u2728AI"
+SCHEDULE_DELAY_MINUTES = 10
 _ALBUM_TIMEOUT = 5
 _ARTICLE_SOURCE_THRESHOLD = 350
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
@@ -92,6 +95,7 @@ def _format_telegraph_post(title: str, summary: str, telegraph_url: str) -> str:
         f"- - - - - - - - -\n\n"
         f"{summary}\n\n"
         f'<a href="{telegraph_url}">متن کامل مقاله: 👇👇👇</a>'
+        f"\n\n{AI_SIGNATURE}"
     )
 
 
@@ -216,8 +220,8 @@ def _build_caption(
     if link_url:
         parts.append(f'<a href="{link_url}">لینک</a>')
     if not parts:
-        return SIGNATURE
-    return "\n\n".join(parts + [SIGNATURE])
+        return AI_SIGNATURE
+    return "\n\n".join(parts + [AI_SIGNATURE])
 
 
 def _media_suffix(event) -> str:
@@ -254,8 +258,9 @@ async def _send_notification(event, caption: str):
     )
 
 
-async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=None, is_album=False):
+async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=None, is_album=False, schedule_minutes: int = 0):
     reply_to = _get_reply_to(event) if event else None
+    schedule_time = datetime.now(tz=timezone.utc) + timedelta(minutes=schedule_minutes) if schedule_minutes else None
     try:
         if album_paths:
             msg = await client.send_file(
@@ -264,6 +269,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 caption=text,
                 reply_to=reply_to,
                 parse_mode="html",
+                schedule=schedule_time,
             )
         elif file_path:
             msg = await client.send_file(
@@ -272,6 +278,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 caption=text,
                 reply_to=reply_to,
                 parse_mode="html",
+                schedule=schedule_time,
             )
         else:
             msg = await client.send_message(
@@ -279,6 +286,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 text,
                 reply_to=reply_to,
                 parse_mode="html",
+                schedule=schedule_time,
             )
         if event:
             _save_mapping(event, msg.id)
@@ -293,6 +301,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 caption=text,
                 reply_to=reply_to,
                 parse_mode="html",
+                schedule=schedule_time,
             )
         elif file_path:
             msg = await client.send_file(
@@ -301,6 +310,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 caption=text,
                 reply_to=reply_to,
                 parse_mode="html",
+                schedule=schedule_time,
             )
         else:
             msg = await client.send_message(
@@ -308,6 +318,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 text,
                 reply_to=reply_to,
                 parse_mode="html",
+                schedule=schedule_time,
             )
         if event:
             _save_mapping(event, msg.id)
@@ -330,7 +341,7 @@ async def _forward_message(caption: str, event):
     if media:
         await _forward_media(caption, event)
     else:
-        await _send_to_target(caption, event=event)
+        await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
 
 
 async def _forward_media(caption: str, event):
@@ -340,7 +351,7 @@ async def _forward_media(caption: str, event):
         try:
             temp.close()
             await event.message.download_media(file=temp.name)
-            await _send_to_target(caption, file_path=temp.name, event=event)
+            await _send_to_target(caption, file_path=temp.name, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
         finally:
             os.unlink(temp.name)
 
@@ -361,9 +372,9 @@ async def _forward_album(caption: str, events: list):
             return
 
         if len(temps) == 1:
-            await _send_to_target(caption, file_path=temps[0], event=events[0])
+            await _send_to_target(caption, file_path=temps[0], event=events[0], schedule_minutes=SCHEDULE_DELAY_MINUTES)
         else:
-            await _send_to_target(caption, album_paths=temps, event=events[0])
+            await _send_to_target(caption, album_paths=temps, event=events[0], schedule_minutes=SCHEDULE_DELAY_MINUTES)
     finally:
         for path in temps:
             try:
@@ -502,7 +513,7 @@ async def handle_new_message(event):
                 telegraph_url = articles.publish_to_telegraph(title, body)
                 if telegraph_url:
                     caption = _format_telegraph_post(title, summary, telegraph_url)
-                    await _send_to_target(caption, event=event)
+                    await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
                     await _send_notification(event, caption)
                     logger.info("Published Telegraph article (%d chars)", len(body))
                 else:
@@ -557,7 +568,7 @@ async def _finish_chunks(chat_id: int):
             telegraph_url = articles.publish_to_telegraph(title, body)
             if telegraph_url:
                 caption = _format_telegraph_post(title, summary, telegraph_url)
-                await _send_to_target(caption, event=first_evt)
+                await _send_to_target(caption, event=first_evt, schedule_minutes=SCHEDULE_DELAY_MINUTES)
                 await _send_notification(first_evt, caption)
             else:
                 caption = _build_caption(body, link_url=link_url, html=True)
@@ -616,8 +627,7 @@ async def _maybe_post_article(text: str, event):
             caption = _format_telegraph_post(
                 article["title"], _strip_html_tags(summary), telegraph_url
             )
-            await _send_to_target(caption, event=event)
-            await _send_notification(event, caption)
+            await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
     except Exception as e:
         logger.error("Article post-processing error: %s", e)
 
@@ -653,6 +663,11 @@ async def main():
         _start_health_server(),
         client.run_until_disconnected(),
         deadlines.run_deadline_loop(
+            client=client,
+            target_channel=settings.target_channel_id,
+            league_code=settings.league_code,
+        ),
+        scheduler.run_scheduler(
             client=client,
             target_channel=settings.target_channel_id,
             league_code=settings.league_code,

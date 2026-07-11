@@ -30,6 +30,8 @@ When downloading and re-uploading media, the temp file must include the original
 - First run locally prompts for phone number + verification code. After login, run `python export_session.py` to export the session as a string for cloud deployment.
 - Keep `.env` out of git. The session file is committed as a convenience, but `TELETHON_SESSION_STRING` takes priority.
 - The env var is `OPEN_ROUTER_API_KEY` (with underscore between OPEN and ROUTER). The old specs.md uses `OPENROUTER_API_KEY` (no underscore) — that's wrong.
+- `TELEGRAPH_ACCESS_TOKEN` (optional): set this to keep all Telegraph articles under a single account. Without it, a new account is created on every bot restart.
+- The Python venv lives at `teleadmin_project/.venv/` (not repo root).
 
 ## Deployment
 
@@ -78,6 +80,7 @@ SQLite database at `teleadmin_project/fpl.db`. Schema and query helpers in `data
 - Team Farsi names live in `teams.name_fa` / `teams.short_name_fa`
 - Player Farsi names in `players.first_name_fa`, `second_name_fa`, `web_name_fa` (populated by `translate_names.py`)
 - Player community aliases in `players.alias` (populated by `generate_aliases.py`)
+- Country flags stored in `players.flag` — resolved from `regions.json` at DB import time via `database._region_to_flag()`
 
 ## Game-action alerts
 
@@ -113,26 +116,78 @@ An event-driven loop in `deadlines.py` that posts a deadline-passed message at e
 
 The FPL league code is stored in `LEAGUE_CODE` env var (default `433b70`). The full link is `https://fantasy.premierleague.com/leagues/auto-join/{code}`.
 
-### Number formatting (all automated posts)
+## LiveFPL API integration (`livefpl.py`)
+
+The bot fetches data from `livefpl.us` APIs — **no Playwright needed**. Two API endpoints:
+
+- `https://livefpl.us/api/games.json` — per-game player points, EO%, stats, events. Data structure: `[home_team, away_team, home_score, away_score, status, ..., goals, assists, ..., home_players: [web_name, eo%, ?, points, [stats], element_id, ...], away_players: [...], ..., events, kickoff_time]`
+- `https://livefpl.us/api/prices.json` — player price change predictions. Key fields: `name`, `team`, `type`, `cost`, `progress` (decimal where 1.0 = 100%), `progress_tonight`
+
+Key functions:
+- `build_game_text(fixture)` — per-game player points table (Farsi names, prices, stat emojis, sorted by EO% descending per team)
+- `build_eo_text()` — global EO leaderboard (players with ≥10% EO, sorted descending)
+- `build_price_changes_text()` — predicted price risers/fallers for tonight
+- `get_finished_fixtures(gameweek_id)` — DB query for finished fixtures
+
+Player matching uses `search_name` (ASCII-normalized) + `alias` + `web_name` against the DB — same as alerts.
+
+## Scheduler (`scheduler.py`)
+
+Runs alongside the bot in `asyncio.gather()`. Automated posts:
+
+| Post | Trigger | Source |
+|---|---|---|
+| Price predictions | 23:30 Iran time nightly (or 30min after last live game ends) | `livefpl.build_price_changes_text()` |
+| EO leaderboard | 75 minutes after each deadline | `livefpl.build_eo_text()` |
+| Game points | When game status becomes "Done" in API (polled every 60s) | `livefpl.build_game_text()` |
+| Deadline-passed | At deadline time | `deadlines.py` (unchanged) |
+
+Deduplication uses the `last_updated` DB table (same as deadline posts).
+
+## Translated post delay
+
+All messages that go through LLM translation (forwarded from source channels) are **scheduled 10 minutes ahead** via Telethon's `schedule` parameter (`SCHEDULE_DELAY_MINUTES = 10`). This gives admins time to review before publication.
+
+Exceptions (sent immediately, no delay):
+- Game-action alerts (`alerts.py`)
+- Price-change alerts from source channels (`price_changes.py`)
+- Lineups (`alerts.py`)
+- All scheduler/automated posts
+
+## Translated post signature
+
+Translated posts append `@EPL_Fantasy | ✨AI` (`AI_SIGNATURE`). Automated posts (alerts, price changes, deadlines, scheduler) use plain `@EPL_Fantasy` (`SIGNATURE`).
+
+Telegraph article posts now also include the AI signature in `_format_telegraph_post()`.
+
+## Number formatting (all automated posts)
 
 All numbers in automated posts use English digits and are wrapped in `<b>` tags. Prices show one decimal + position letter (e.g., `<b>6.5M</b>`).
 
-### Iran timezone
+## Iran timezone
 
 UTC+3:30 year-round (Iran does not observe DST). All times from the FPL API (GMT/UTC) are converted to Iran time.
 
-### Reply chain preservation
+## Reply chain preservation
 
 If a source post is a reply to another source post, the target post replies to the corresponding translated post. The `message_map` table stores source→target message ID pairs. `_get_reply_to()` resolves the target reply ID, `_save_mapping()` records it after each post.
 
 ## Article translation
 
-When a source message contains a Premier League article URL (`premierleague.com/en/news/...` or short link `preml.ge/...`), the bot fetches the page, extracts the article content, and posts a full translation.
+The bot has two separate article processing pipelines:
 
-- `articles.py` uses BeautifulSoup to extract the title, publish date, summary, and body paragraphs from the `.article__content` div
+### 1. Inline article handling (premierleague.com URLs)
+
+When a source message contains a Premier League article URL (`premierleague.com/en/news/...`, short link `preml.ge/...`, or `t.co/...`), `_maybe_post_article()` runs **after** the main message translation pipeline. It fetches the article page, extracts content, translates the full HTML, and publishes to Telegraph.
+
+- `articles.is_pl_article_url()` detects Premier League article URLs
+- `articles.fetch_article()` uses BeautifulSoup to extract title, publish date, summary, and body paragraphs from the `.article__content` div
 - Promotional cards (`.articleWidget`, `.embeddable-article`) are stripped
-- Content is formatted as HTML with bold title and a "پست اصلی" link to the original article
-- The translated HTML is posted directly (no scheduling, no signature appended)
+- The translated HTML is published to Telegraph; the Telegram post links to it
+
+### 2. Long-text / merged-chunk articles (>350 chars)
+
+When a single text message or merged chunks exceed 350 source characters (`_ARTICLE_SOURCE_THRESHOLD`), `translator.translate_article()` is used for structured JSON output, then published to Telegraph.
 
 ## Telegraph articles
 
@@ -140,6 +195,7 @@ Long-form content (>350 source chars) and merged text chunks are published as Te
 
 - `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله:` header, title, divider, summary, and `متن کامل مقاله: 👇👇👇` linked to the Telegraph URL
 - `translator.translate_article()` uses `article_prompt.txt` for structured JSON output (`title`/`summary`/`body`), falling back to regular translation if JSON parsing fails
+- Set `TELEGRAPH_ACCESS_TOKEN` env var to keep articles under a single Telegraph account; without it a new account is created on every restart
 
 ## Text chunk merging
 
@@ -153,7 +209,4 @@ Telegram splits long messages into chunks for non-premium accounts. `bot.py` buf
 - All other formatting (bold, italic, etc.) is stripped — unnecessary for the LLM
 
 Post-processing: `_strip_quotes()` removes 11 Unicode quote variants, `_fix_unclosed_tags()` ensures blockquotes are properly closed.
-
-## Playwright scraper
-
-`scraper.py` uses Playwright + Chromium to screenshot DOM elements. `screenshot_element(url, selector)` returns PNG bytes. Browser reuses a single instance across calls. Requires: `pip install playwright && python -m playwright install chromium`.
+`_strip_html_tags()` strips all HTML to measure raw text length for the article threshold.
