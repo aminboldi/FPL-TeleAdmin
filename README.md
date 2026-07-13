@@ -53,7 +53,7 @@ TeleAdmin/
 ### 1. Clone and install
 
 ```bash
-git clone git@github.com:aminboldi/TeleAdmin.git
+git clone git@github.com:aminboldi/FPL-TeleAdmin.git
 cd TeleAdmin
 python3 -m venv .venv
 source .venv/bin/activate

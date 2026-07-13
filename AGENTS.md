@@ -65,7 +65,7 @@ For article translations, `article_prompt.txt` asks the LLM for structured JSON 
 
 ## Git push
 
-Git remote is HTTPS (`https://github.com/aminboldi/TeleAdmin.git`). SSH was tested and failed — do not switch to SSH URLs. `gh auth` is configured and uses HTTPS.
+Git remote is HTTPS (`https://github.com/aminboldi/FPL-TeleAdmin.git`). SSH was tested and failed — do not switch to SSH URLs. `gh auth` is configured and uses HTTPS.
 
 ## No test/lint/typecheck infrastructure
 
