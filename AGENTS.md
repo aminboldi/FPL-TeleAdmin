@@ -182,8 +182,9 @@ When a source message contains a Premier League article URL (`premierleague.com/
 
 - `articles.is_pl_article_url()` detects Premier League article URLs
 - `articles.fetch_article()` uses BeautifulSoup to extract title, publish date, summary, and body paragraphs from the `.article__content` div
-- Promotional cards (`.articleWidget`, `.embeddable-article`) are stripped
+- Widgets stripped: `.articleWidget`, `.embeddable-article`, `.article-related-content`, `.media-actions`, `.article__share-container`
 - The translated HTML is published to Telegraph; the Telegram post links to it
+- **Bug**: `bot.py:_maybe_post_article()` calls `articles.fetch_article(url)` twice (lines 603 and 606) — the second call overwrites the first result. Remove the first call if fixing.
 
 ### 2. Long-text / merged-chunk articles (>350 chars)
 
@@ -199,7 +200,9 @@ Long-form content (>350 source chars) and merged text chunks are published as Te
 
 ## Text chunk merging
 
-Telegram splits long messages into chunks for non-premium accounts. `bot.py` buffers sent text messages from the same chat for 3 seconds (`_CHUNK_TIMEOUT`), merges them, then processes as a single message through the full pipeline.
+Telegram splits long messages into chunks for non-premium accounts. `bot.py` buffers sent text messages from the same chat for 3 seconds (`_CHUNK_TIMEOUT`), merges them, then processes as a single message.
+
+**Important**: Merged chunks ALWAYS go through `translate_article()` → Telegraph (no length threshold). The 350-char `_ARTICLE_SOURCE_THRESHOLD` only applies to single messages, not chunks.
 
 ## Rich formatting preservation
 
@@ -210,3 +213,18 @@ Telegram splits long messages into chunks for non-premium accounts. `bot.py` buf
 
 Post-processing: `_strip_quotes()` removes 11 Unicode quote variants, `_fix_unclosed_tags()` ensures blockquotes are properly closed.
 `_strip_html_tags()` strips all HTML to measure raw text length for the article threshold.
+
+## Utility/test scripts
+
+All run from `teleadmin_project/`:
+
+| Script | Purpose |
+|---|---|
+| `send_livefpl.py` | Manually post game points/EOLB/price predictions (CLI args: `--all` or GW number) |
+| `send_test_deadline.py` | Send a test deadline-passed post (GW39) with `deadline.jpg` |
+| `send_test_reminder.py` | **Broken** — imports `deadline_scheduled_text` from `deadlines.py` which doesn't define that function |
+| `export_session.py` | Export the local `.session` file as a `TELETHON_SESSION_STRING` for cloud deployment |
+| `generate_aliases.py` | Populate `players.alias` column — community nicknames for player matching |
+| `translate_names.py` | Populate `players.*_fa` columns — Farsi name translations |
+| `translate_teams.py` | Populate `teams.*_fa` columns — Farsi team name translations |
+| `database.py` (standalone) | Rebuild `fpl.db` from `/tmp/fpl_bootstrap.json` and `/tmp/fpl_fixtures.json` |
