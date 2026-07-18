@@ -671,6 +671,7 @@ async def main():
             client=client,
             target_channel=settings.target_channel_id,
             league_code=settings.league_code,
+            price_predictions_enabled=settings.price_predictions_enabled,
         ),
     )
 

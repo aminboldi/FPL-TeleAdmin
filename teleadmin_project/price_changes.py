@@ -142,9 +142,9 @@ def format_price_changes_farsi(risers: list[PriceChange], fallers: list[PriceCha
                     (pc.team_code,),
                 )
                 team_str = team["short_name_fa"] if team else pc.team_code
-                lines.append(f"⬆️ {name}{flag}{price} ({team_str})")
+                lines.append(f"<blockquote>⬆️ {name}{flag}{price} ({team_str})</blockquote>")
             else:
-                lines.append(f"⬆️ {pc.player_name} £{pc.new_price_raw}m ({pc.team_code})")
+                lines.append(f"<blockquote>⬆️ {pc.player_name} £{pc.new_price_raw}m ({pc.team_code})</blockquote>")
         lines.append("")
 
     if fallers:
@@ -161,9 +161,9 @@ def format_price_changes_farsi(risers: list[PriceChange], fallers: list[PriceCha
                     (pc.team_code,),
                 )
                 team_str = team["short_name_fa"] if team else pc.team_code
-                lines.append(f"⬇️ {name}{flag}{price} ({team_str})")
+                lines.append(f"<blockquote>⬇️ {name}{flag}{price} ({team_str})</blockquote>")
             else:
-                lines.append(f"⬇️ {pc.player_name} £{pc.new_price_raw}m ({pc.team_code})")
+                lines.append(f"<blockquote>⬇️ {pc.player_name} £{pc.new_price_raw}m ({pc.team_code})</blockquote>")
         lines.append("")
 
     lines.append("@EPL_Fantasy")

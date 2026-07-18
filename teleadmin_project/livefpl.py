@@ -21,7 +21,7 @@ _EO_THRESHOLD = 10
 _STAT_EMOJI = {
     "goals_scored": "\u26bd\ufe0f",
     "assists": "\U0001f170\ufe0f",
-    "clean_sheets": "\U0001f6eb",
+    "clean_sheets": "\U0001f6ab",
     "yellow_cards": "\U0001f538",
     "red_cards": "\u2666\ufe0f",
     "own_goals": "\U0001f17e",
@@ -113,6 +113,20 @@ def _build_stat_emojis(stats: list, element_id: int, events: list, db_player: di
     return " ".join(emojis)
 
 
+_CIRCLE_MAP: dict[tuple[int, int], str] = {
+    (5, 999): "\U0001f7e2",
+    (3, 4): "\u26aa",
+    (-999, 2): "\U0001f534",
+}
+
+
+def _pts_circle(pts: int) -> str:
+    for (lo, hi), circle in _CIRCLE_MAP.items():
+        if lo <= pts <= hi:
+            return circle
+    return ""
+
+
 def _game_player_line(
     player: dict | None, name: str, eo: float, pts: int,
     stats: list, element_id: int, events: list, is_bold: bool,
@@ -134,13 +148,15 @@ def _game_player_line(
     stat_emojis = _build_stat_emojis(stats, element_id, events, player)
     emoji_str = f" {stat_emojis}" if stat_emojis else ""
 
+    circle = _pts_circle(pts)
+
     display = f"{name_part} {price_part}" if price_part else name_part
     line = f"{display} \u0628\u0627 {eo_part} | \u0627\u0645\u062a\u06cc\u0627\u0632 {pts_part}{emoji_str}"
 
     if is_bold:
         line = f"<b>{line}</b>"
 
-    return line
+    return f"{circle} {line}"
 
 
 def _build_team_section(players: list, events: list) -> str:
@@ -150,18 +166,47 @@ def _build_team_section(players: list, events: list) -> str:
     names = [r[1] for r in rows]
     db_players = _resolve_players(names)
 
-    high, low = [], []
+    player_data = []
     for eo, p_name, p_pts, p_stats, p_element_id in rows:
+        mins = 0
+        for stat in p_stats:
+            if stat[0] == "minutes":
+                mins = stat[1]
+                break
+        player_data.append((eo, p_name, p_pts, p_stats, p_element_id, mins))
+
+    by_mins = sorted(player_data, key=lambda x: x[5], reverse=True)
+    starters = by_mins[:11]
+    subs = by_mins[11:]
+
+    starters.sort(key=lambda x: x[0], reverse=True)
+    subs.sort(key=lambda x: x[0], reverse=True)
+
+    high, low = [], []
+    for eo, p_name, p_pts, p_stats, p_element_id, mins in starters:
         player = db_players.get(p_name)
         is_bold = round(eo) >= _EO_THRESHOLD
         line = _game_player_line(player, p_name, eo, p_pts, p_stats, p_element_id, events, is_bold)
-        (high if is_bold else low).append(line)
+        (high if is_bold else low).append(f"<blockquote>{line}</blockquote>")
 
     result = high[:]
     if high and low:
         result.append("")
     result.extend(low)
+
+    if subs:
+        sub_lines = []
+        for eo, p_name, p_pts, p_stats, p_element_id, mins in subs:
+            player = db_players.get(p_name)
+            is_bold = round(eo) >= _EO_THRESHOLD
+            line = _game_player_line(player, p_name, eo, p_pts, p_stats, p_element_id, events, is_bold)
+            sub_lines.append(line)
+        result.append(f"\n<blockquote>\n{'\n'.join(sub_lines)}\n</blockquote>")
+
     return "\n".join(result)
+
+
+_DIVIDER = "\u2796 \u2796 \u2796"
 
 
 def build_game_text(fixture: dict) -> str | None:
@@ -195,7 +240,7 @@ def build_game_text(fixture: dict) -> str | None:
         "",
         _build_team_section(game[12], game[18]),
         "",
-        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+        _DIVIDER,
         "",
         _build_team_section(game[13], game[18]),
         "",
@@ -358,7 +403,7 @@ def _price_player_line(player: dict | None, name: str, team: str, progress: floa
 
     prog_pct = round(progress * 100)
     line = f"{name_part} {price_part} \u0628\u0627 <b>{prog_pct}%</b>"
-    return line
+    return f"<blockquote>{line}</blockquote>"
 
 
 def get_finished_fixtures(gameweek_id: int | None = None) -> list[dict]:

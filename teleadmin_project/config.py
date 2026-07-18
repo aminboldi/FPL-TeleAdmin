@@ -20,6 +20,7 @@ class Settings:
     target_channel_id: str
     notif_channel_id: str | None
     league_code: str
+    price_predictions_enabled: bool
 
 
 def load_config() -> Settings:
@@ -55,4 +56,5 @@ def load_config() -> Settings:
         target_channel_id=os.getenv("TARGET_CHANNEL_ID"),
         notif_channel_id=os.getenv("NOTIF_CHANNEL_ID") or None,
         league_code=os.getenv("LEAGUE_CODE", "433b70"),
+        price_predictions_enabled=os.getenv("PRICE_PREDICTIONS_ENABLED", "true").lower() != "false",
     )

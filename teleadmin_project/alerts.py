@@ -366,9 +366,9 @@ def format_lineup(parsed: dict) -> str | None:
             if player:
                 player_name = player["web_name_fa"] or player["web_name"]
                 price = _price_display(player)
-                lines.append(f"{player_name} {price}")
+                lines.append(f"<blockquote>{player_name} {price}</blockquote>")
             else:
-                lines.append(f"{name}")
+                lines.append(f"<blockquote>{name}</blockquote>")
 
         if idx < len(parsed["teams"]) - 1:
             lines.append("")

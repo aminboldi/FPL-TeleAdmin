@@ -18,7 +18,7 @@ def _now_iran() -> datetime:
     return datetime.now(tz=timezone.utc) + _IRAN_OFFSET
 
 
-async def run_scheduler(client, target_channel: str, league_code: str):
+async def run_scheduler(client, target_channel: str, league_code: str, price_predictions_enabled: bool = True):
     logger.info("Scheduler started")
     await asyncio.sleep(5)
 
@@ -35,7 +35,8 @@ async def run_scheduler(client, target_channel: str, league_code: str):
 
             await _check_eo_post(client, target_channel)
 
-            await _check_price_post(client, target_channel, games, now_iran)
+            if price_predictions_enabled:
+                await _check_price_post(client, target_channel, games, now_iran)
 
         except Exception as e:
             logger.error("Scheduler error: %s", e)
