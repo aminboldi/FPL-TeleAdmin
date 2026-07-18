@@ -116,7 +116,8 @@ def _build_stat_emojis(stats: list, element_id: int, events: list, db_player: di
 _CIRCLE_MAP: dict[tuple[int, int], str] = {
     (5, 999): "\U0001f7e2",
     (3, 4): "\u26aa",
-    (-999, 2): "\U0001f534",
+    (0, 2): "\U0001f7e1",
+    (-999, -1): "\U0001f534",
 }
 
 
