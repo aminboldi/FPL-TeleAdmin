@@ -53,10 +53,10 @@ TeleAdmin/
 ### 1. Clone and install
 
 ```bash
-git clone git@github.com:aminboldi/FPL-TeleAdmin.git
+git clone https://github.com/aminboldi/FPL-TeleAdmin.git
 cd TeleAdmin
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv teleadmin_project/.venv
+source teleadmin_project/.venv/bin/activate
 pip install -r teleadmin_project/requirements.txt
 ```
 
@@ -103,6 +103,9 @@ The bot is a long-lived process. Run it with a process manager (systemd, supervi
 | `SOURCE_CHANNEL2_ID` | No       | Secondary source channel                       |
 | `NOTIF_CHANNEL_ID`   | No       | Channel for admin scheduling notifications     |
 | `OPEN_ROUTER_MODEL`  | No       | LLM model (default: gemini-2.5-flash-lite)     |
+| `TELEGRAPH_ACCESS_TOKEN`  | No   | Telegraph API token for unified article account |
+| `PRICE_PREDICTIONS_ENABLED` | No  | Set to `false` to pause nightly price predictions |
+| `LEAGUE_CODE`         | No       | FPL league code (default: 433b70)              |
 
 ## How It Works
 
@@ -154,3 +157,4 @@ Edit `teleadmin_project/prompt.txt` to tune translation quality. The `{text}` pl
 - **Change signature**: Edit `SIGNATURE` in `bot.py`
 - **Change model**: Set `OPEN_ROUTER_MODEL` in `.env`
 - **Tune translation**: Edit `prompt.txt`
+- **Pause price predictions**: Set `PRICE_PREDICTIONS_ENABLED=false` in `.env`

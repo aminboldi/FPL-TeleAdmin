@@ -31,7 +31,9 @@ When downloading and re-uploading media, the temp file must include the original
 - Keep `.env` out of git. The session file is committed as a convenience, but `TELETHON_SESSION_STRING` takes priority.
 - The env var is `OPEN_ROUTER_API_KEY` (with underscore between OPEN and ROUTER). The old specs.md uses `OPENROUTER_API_KEY` (no underscore) — that's wrong.
 - `TELEGRAPH_ACCESS_TOKEN` (optional): set this to keep all Telegraph articles under a single account. Without it, a new account is created on every bot restart.
-- The Python venv lives at `teleadmin_project/.venv/` (not repo root).
+- `PRICE_PREDICTIONS_ENABLED` (optional, default `true`): set to `false` to pause the nightly price prediction scheduler post (useful during FPL off-season).
+- `LEAGUE_CODE` (optional, default `433b70`): FPL league code for the invite link in deadline posts.
+- The Python venv lives at `teleadmin_project/.venv/` (not repo root). If missing, create with `python3 -m venv teleadmin_project/.venv`.
 
 ## Deployment
 
@@ -99,14 +101,14 @@ Source channels post price changes in two separate messages (one for risers, one
 Detection: `price_changes.is_price_change()` checks for "Price Risers!" or "Price Fallers!" headers.
 Parsing: `price_changes.parse_price_change()` extracts player name, team code, and new price.
 Buffering: `price_changes.accumulate()` collects risers + fallers using today's date as key. Posts immediately when both arrive, or after a 120s timeout with whatever was received.
-Formatting: `price_changes.format_price_changes_farsi()` outputs Farsi format with day-of-week header, risers section, fallers section, and `@EPL_Fantasy` signature.
+Formatting: `price_changes.format_price_changes_farsi()` outputs Farsi format with day-of-week header, risers section, fallers section, and `@EPL_Fantasy` signature. Each player row is wrapped in `<blockquote>`.
 
 ## Lineups
 
 Source channels post lineups in English format (`LINE-UPS | #TOTEVE`). The bot parses and resolves each player to Farsi name + price/position, grouped by team with a separator.
 
 Detection: `alerts.is_lineup()` checks for `LINE-UPS | #TEAMA_TEAMB` header.
-Formatting: `alerts.format_lineup()` includes kickoff time (converted to Iran time, UTC+3:30).
+Formatting: `alerts.format_lineup()` includes kickoff time (converted to Iran time, UTC+3:30). Each player row is wrapped in `<blockquote>`.
 
 ## Deadline automation
 
@@ -120,16 +122,57 @@ The FPL league code is stored in `LEAGUE_CODE` env var (default `433b70`). The f
 
 The bot fetches data from `livefpl.us` APIs — **no Playwright needed**. Two API endpoints:
 
-- `https://livefpl.us/api/games.json` — per-game player points, EO%, stats, events. Data structure: `[home_team, away_team, home_score, away_score, status, ..., goals, assists, ..., home_players: [web_name, eo%, ?, points, [stats], element_id, ...], away_players: [...], ..., events, kickoff_time]`
+- `https://livefpl.us/api/games.json` — per-game player points, EO%, stats, events. Each player entry: `[web_name, eo%, ?, points, [[stat_name, value, points], ...], element_id, name, pos_code]`. The `minutes` stat in `p[4]` determines who started.
 - `https://livefpl.us/api/prices.json` — player price change predictions. Key fields: `name`, `team`, `type`, `cost`, `progress` (decimal where 1.0 = 100%), `progress_tonight`
 
 Key functions:
-- `build_game_text(fixture)` — per-game player points table (Farsi names, prices, stat emojis, sorted by EO% descending per team)
+- `build_game_text(fixture)` — per-game player points with blockquote formatting, color circles, and starter/sub split
 - `build_eo_text()` — global EO leaderboard (players with ≥10% EO, sorted descending)
 - `build_price_changes_text()` — predicted price risers/fallers for tonight
 - `get_finished_fixtures(gameweek_id)` — DB query for finished fixtures
 
 Player matching uses `search_name` (ASCII-normalized) + `alias` + `web_name` against the DB — same as alerts.
+
+### Blockquote formatting for game points
+
+Telegram limits blockquotes to ~25 per message. Game points use this layout:
+
+- **Top 11 players per team by minutes** → individual `<blockquote>` rows, sorted by **EO descending**
+- **Remaining players (subs)** → grouped into a single `<blockquote>`, sorted by EO descending
+- Within the starters group, high-EO (≥10%) players appear first in **bold**, then low-EO players
+
+### Color circles (points indicator)
+
+Per-player emoji prefix in game points:
+
+| Points | Circle |
+|---|---|
+| 5+ | 🟢 |
+| 3-4 | ⚪ |
+| 0-2 | 🟡 |
+| Negative | 🔴 |
+
+### Stat emojis
+
+Helper: `_build_stat_emojis()` in livefpl.py. Emojis:
+
+| Stat | Emoji |
+|---|---|
+| goals_scored | ⚽ |
+| assists | 🅰️ |
+| clean_sheets | 🚫 |
+| yellow_cards | 🔸 |
+| red_cards | ♦️ |
+| own_goals | 🅾 |
+| defensive_contribution | ✅ |
+| penalty_saved | 📛 |
+| penalty_missed | ❌ |
+
+Divider between team sections: `➖ ➖ ➖` (`_DIVIDER` in livefpl.py).
+
+### HTML escaping
+
+`_esc(text)` exists in `livefpl.py`, `price_changes.py`, and `alerts.py` — each has its own copy. Always use before interpolating untrusted text into HTML.
 
 ## Scheduler (`scheduler.py`)
 
@@ -143,6 +186,8 @@ Runs alongside the bot in `asyncio.gather()`. Automated posts:
 | Deadline-passed | At deadline time | `deadlines.py` (unchanged) |
 
 Deduplication uses the `last_updated` DB table (same as deadline posts).
+
+Price predictions can be paused by setting `PRICE_PREDICTIONS_ENABLED=false` in `.env`. The scheduler loop still runs, but `_check_price_post()` is skipped.
 
 ## Translated post delay
 
