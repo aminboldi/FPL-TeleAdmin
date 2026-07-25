@@ -4,3 +4,4 @@ test.session
 .env
 *.pyc
 fpl.db-*
+manual_data.json

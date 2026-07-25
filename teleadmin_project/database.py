@@ -354,9 +354,70 @@ def lookup_target_msg(source_chat_id: int, source_msg_id: int) -> int | None:
     )
 
 
+_MANUAL_BACKUP = DB_PATH.parent / "manual_data.json"
+
+
+def backup_manual_data() -> None:
+    """Export manually-entered columns before a DB rebuild, so they survive a wipe."""
+    players = query(
+        "SELECT id, alias, first_name_fa, second_name_fa, web_name_fa FROM players "
+        "WHERE alias IS NOT NULL OR first_name_fa IS NOT NULL "
+        "   OR second_name_fa IS NOT NULL OR web_name_fa IS NOT NULL"
+    )
+    teams = query(
+        "SELECT id, name_fa, short_name_fa FROM teams "
+        "WHERE name_fa IS NOT NULL OR short_name_fa IS NOT NULL"
+    )
+    data = {"players": players, "teams": teams}
+    with open(_MANUAL_BACKUP, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    logger.info(
+        "Backed up %d players and %d teams manual data to %s",
+        len(players), len(teams), _MANUAL_BACKUP,
+    )
+
+
+def restore_manual_data() -> None:
+    """Re-apply previously backed-up manual data after a DB rebuild."""
+    if not _MANUAL_BACKUP.exists():
+        logger.info("No manual data backup found, skipping restore")
+        return
+
+    try:
+        with open(_MANUAL_BACKUP, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read manual data backup: %s", e)
+        return
+
+    restored_players = 0
+    with _connect() as conn:
+        for p in data.get("players", []):
+            conn.execute(
+                """UPDATE players SET alias=?, first_name_fa=?, second_name_fa=?, web_name_fa=?
+                   WHERE id=?""",
+                (p.get("alias"), p.get("first_name_fa"), p.get("second_name_fa"),
+                 p.get("web_name_fa"), p["id"]),
+            )
+            restored_players += 1
+
+        for t in data.get("teams", []):
+            conn.execute(
+                "UPDATE teams SET name_fa=?, short_name_fa=? WHERE id=?",
+                (t.get("name_fa"), t.get("short_name_fa"), t["id"]),
+            )
+
+    logger.info(
+        "Restored manual data for %d players and %d teams",
+        restored_players, len(data.get("teams", [])),
+    )
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    backup_manual_data()
     init_db()
     import_bootstrap("/tmp/fpl_bootstrap.json")
     import_fixtures("/tmp/fpl_fixtures.json")
+    restore_manual_data()
     logger.info("Import complete. DB at %s", get_db_path())

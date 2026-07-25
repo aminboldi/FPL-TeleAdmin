@@ -77,12 +77,33 @@ There are no tests, no CI, no pre-commit hooks, and no typechecker config. Verif
 
 SQLite database at `teleadmin_project/fpl.db`. Schema and query helpers in `database.py`. Populated from FPL API at `https://fantasy.premierleague.com/api/`.
 
-- `python database.py` rebuilds from FPL API JSON (expects files at `/tmp/fpl_bootstrap.json` and `/tmp/fpl_fixtures.json`)
 - Player name quirks: `search_name` column stores ASCII-normalized `second_name` (strips diacritics). Use this for lookups, not raw `second_name`.
 - Team Farsi names live in `teams.name_fa` / `teams.short_name_fa`
 - Player Farsi names in `players.first_name_fa`, `second_name_fa`, `web_name_fa` (populated by `translate_names.py`)
 - Player community aliases in `players.alias` (populated by `generate_aliases.py`)
 - Country flags stored in `players.flag` — resolved from `regions.json` at DB import time via `database._region_to_flag()`
+
+### DB rebuild procedure
+
+To refresh the DB with the latest FPL API data while preserving manual edits:
+
+```bash
+# 1. Fetch fresh data
+curl -s "https://fantasy.premierleague.com/api/bootstrap-static/" -o /tmp/fpl_bootstrap.json
+curl -s "https://fantasy.premierleague.com/api/fixtures/" -o /tmp/fpl_fixtures.json
+
+# 2. Rebuild (backup_manual_data → import → restore_manual_data)
+python database.py
+
+# 3. Re-populate auto-generated columns (only fills NULLs — won't overwrite manual edits)
+python translate_teams.py
+python translate_names.py
+python generate_aliases.py
+```
+
+`database.py` automatically backs up `alias`, `*_fa` player columns and `*_fa` team columns to `manual_data.json` before import, then restores them after. Manual data survives normal `python database.py` reruns.
+
+`generate_aliases.py` adapts to fresh seasons (where `total_points = 0` for all players) by processing all players instead of only active ones.
 
 ## Game-action alerts
 
@@ -169,6 +190,8 @@ Helper: `_build_stat_emojis()` in livefpl.py. Emojis:
 | penalty_missed | ❌ |
 
 Divider between team sections: `➖ ➖ ➖` (`_DIVIDER` in livefpl.py).
+
+**Known issue**: The EO leaderboard heading is hardcoded to "GW38" in `livefpl.py:303` (`build_eo_text()`). It doesn't reflect the actual gameweek. Fix by reading the current GW from the DB.
 
 ### HTML escaping
 
@@ -258,6 +281,14 @@ Telegram splits long messages into chunks for non-premium accounts. `bot.py` buf
 
 Post-processing: `_strip_quotes()` removes 11 Unicode quote variants, `_fix_unclosed_tags()` ensures blockquotes are properly closed.
 `_strip_html_tags()` strips all HTML to measure raw text length for the article threshold.
+
+## Notification system
+
+When `NOTIF_CHANNEL_ID` is set, every translated post generates a preview notification (first 300 chars, truncated with `...`). Includes source channel name and media/text label. Sent immediately after the translated post.
+
+## Media album handling
+
+Telegram groups multiple media files into albums. `bot.py` buffers album messages for 5 seconds (`_ALBUM_TIMEOUT`), processes them together through a single translation cycle, then forwards as a single album post to the target channel.
 
 ## Utility/test scripts
 

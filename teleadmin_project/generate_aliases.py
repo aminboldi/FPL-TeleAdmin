@@ -90,9 +90,19 @@ async def main():
         default_headers={"X-Title": "TeleAdmin"},
     )
 
-    total = query_scalar(
+    total_with_points = query_scalar(
         "SELECT count(*) FROM players WHERE alias IS NULL AND total_points > 0"
     )
+
+    if total_with_points > 0:
+        # Mid-season: only process players with points (actively owned)
+        total = total_with_points
+        where_clause = "WHERE alias IS NULL AND total_points > 0"
+    else:
+        # Fresh season / no one has points yet: process all players
+        total = query_scalar("SELECT count(*) FROM players WHERE alias IS NULL")
+        where_clause = "WHERE alias IS NULL"
+
     if total == 0:
         logger.info("All players already have aliases. Nothing to do.")
         return
@@ -105,8 +115,8 @@ async def main():
             zip([col[0] for col in c.description], r)
         )
         rows = conn.execute(
-            "SELECT id, first_name, second_name, web_name FROM players "
-            "WHERE alias IS NULL AND total_points > 0 "
+            f"SELECT id, first_name, second_name, web_name FROM players "
+            f"{where_clause} "
             "ORDER BY selected_by_percent DESC LIMIT ?",
             (limit,),
         ).fetchall()
