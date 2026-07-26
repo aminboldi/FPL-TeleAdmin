@@ -5,6 +5,10 @@ import re
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
@@ -22,6 +26,9 @@ import deadlines
 import articles
 import database as db
 import scheduler
+import runtime_config
+import x_posts
+from admin_dashboard import AdminDashboard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("TeleAdmin")
 
 settings = load_config()
+runtime_config.init()
 
 translator = Translator(
     api_key=settings.openrouter_api_key,
@@ -47,7 +55,7 @@ client = TelegramClient(
 
 
 _SOURCE_CHANNELS = [
-    c for c in (settings.source_channel_id, settings.source_channel2_id) if c
+    c for c in (runtime_config.get("SOURCE_CHANNEL_ID"), runtime_config.get("SOURCE_CHANNEL2_ID")) if c
 ]
 
 SIGNATURE = "@EPL_Fantasy"
@@ -63,6 +71,36 @@ _album_caption: dict[int, str] = {}
 
 _chunk_buffer: dict[int, list] = {}
 _chunk_tasks: dict[int, asyncio.Task] = {}
+_pending_x_posts: list[tuple[x_posts.Post, str]] = []
+
+
+def _target_channel() -> str:
+    return runtime_config.get("TARGET_CHANNEL_ID")
+
+
+def _notification_channel() -> str:
+    return runtime_config.get("NOTIF_CHANNEL_ID")
+
+
+def _source_channels() -> set[str]:
+    return {
+        value.lstrip("@").lower()
+        for value in (runtime_config.get("SOURCE_CHANNEL_ID"), runtime_config.get("SOURCE_CHANNEL2_ID"))
+        if value
+    }
+
+
+def _is_source_event(event) -> bool:
+    configured = _source_channels()
+    if not configured:
+        return False
+    chat = event.chat
+    username = getattr(chat, "username", "") or ""
+    return str(event.chat_id) in configured or username.lower() in configured
+
+
+def _refresh_translator_model() -> None:
+    translator.model = runtime_config.get("OPEN_ROUTER_MODEL")
 
 
 def _get_reply_to(event) -> int | None:
@@ -231,7 +269,8 @@ def _media_suffix(event) -> str:
 
 
 async def _send_notification(event, caption: str):
-    if not settings.notif_channel_id:
+    notification_channel = _notification_channel()
+    if not notification_channel:
         return
 
     source = (
@@ -252,19 +291,22 @@ async def _send_notification(event, caption: str):
     )
 
     await client.send_message(
-        settings.notif_channel_id,
+        notification_channel,
         notif,
         parse_mode="html",
     )
 
 
 async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=None, is_album=False, schedule_minutes: int = 0):
+    target_channel = _target_channel()
+    if not target_channel:
+        raise RuntimeError("TARGET_CHANNEL_ID is not configured")
     reply_to = _get_reply_to(event) if event else None
     schedule_time = datetime.now(tz=timezone.utc) + timedelta(minutes=schedule_minutes) if schedule_minutes else None
     try:
         if album_paths:
             msg = await client.send_file(
-                settings.target_channel_id,
+                target_channel,
                 album_paths,
                 caption=text,
                 reply_to=reply_to,
@@ -273,7 +315,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
             )
         elif file_path:
             msg = await client.send_file(
-                settings.target_channel_id,
+                target_channel,
                 file_path,
                 caption=text,
                 reply_to=reply_to,
@@ -282,7 +324,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
             )
         else:
             msg = await client.send_message(
-                settings.target_channel_id,
+                target_channel,
                 text,
                 reply_to=reply_to,
                 parse_mode="html",
@@ -296,7 +338,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
         await asyncio.sleep(e.seconds)
         if album_paths:
             msg = await client.send_file(
-                settings.target_channel_id,
+                target_channel,
                 album_paths,
                 caption=text,
                 reply_to=reply_to,
@@ -305,7 +347,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
             )
         elif file_path:
             msg = await client.send_file(
-                settings.target_channel_id,
+                target_channel,
                 file_path,
                 caption=text,
                 reply_to=reply_to,
@@ -314,7 +356,7 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
             )
         else:
             msg = await client.send_message(
-                settings.target_channel_id,
+                target_channel,
                 text,
                 reply_to=reply_to,
                 parse_mode="html",
@@ -327,12 +369,12 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
 
 async def _post_price_changes(farsi_text: str):
     await _send_to_target(farsi_text)
-    logger.info("Posted price changes to %s", settings.target_channel_id)
+    logger.info("Posted price changes to %s", _target_channel())
 
 
 async def _send_alert(farsi_text: str, event):
     await _send_to_target(farsi_text, event=event)
-    logger.info("Sent game alert to %s", settings.target_channel_id)
+    logger.info("Sent game alert to %s", _target_channel())
     await _send_notification(event, farsi_text)
 
 
@@ -392,6 +434,8 @@ async def _finish_album(gid: int):
     if not events:
         return
 
+    _refresh_translator_model()
+
     caption = raw_text
     if raw_text:
         if alerts.is_game_alert(raw_text):
@@ -428,8 +472,11 @@ async def _finish_album(gid: int):
     await _send_notification(events[0], caption)
 
 
-@client.on(events.NewMessage(chats=_SOURCE_CHANNELS))
+@client.on(events.NewMessage())
 async def handle_new_message(event):
+    if not _is_source_event(event):
+        return
+    _refresh_translator_model()
     text = event.message.text
     media = event.message.media
     grouped_id = event.message.grouped_id
@@ -532,7 +579,7 @@ async def handle_new_message(event):
     if translated:
         caption = _build_caption(translated, link_url=link_url, html=True)
         await _forward_message(caption, event)
-        logger.info("Forwarded message to %s", settings.target_channel_id)
+        logger.info("Forwarded message to %s", _target_channel())
         await _send_notification(event, caption)
 
     await _maybe_post_article(text or "", event)
@@ -544,6 +591,8 @@ async def _finish_chunks(chat_id: int):
     _chunk_tasks.pop(chat_id, None)
     if not chunks:
         return
+
+    _refresh_translator_model()
 
     merged_text = "\n".join(evt.message.text for evt in chunks if evt.message.text)
     first_evt = chunks[0]
@@ -632,6 +681,100 @@ async def _maybe_post_article(text: str, event):
         logger.error("Article post-processing error: %s", e)
 
 
+async def _prepare_x_post(url: str) -> str:
+    """Fetch an X post/thread and translate captions for an admin preview."""
+    global _pending_x_posts
+    if not settings.x_bearer_token:
+        raise RuntimeError("X_BEARER_TOKEN is not configured.")
+    posts = await asyncio.to_thread(
+        x_posts.fetch_post_and_thread, url, settings.x_bearer_token
+    )
+    _refresh_translator_model()
+    prepared = []
+    preview = [f"<b>پیش‌نمایش X: {len(posts)} پست</b>"]
+    for index, post in enumerate(posts, start=1):
+        translated = ""
+        if post.text:
+            translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(_escape_html(post.text))))
+        caption = _build_caption(translated, html=True)
+        prepared.append((post, caption))
+        short = _strip_html_tags(translated).replace("\n", " ")[:180]
+        preview.append(
+            f"\n<b>{index}.</b> @{_escape_html(post.author)} — "
+            f"{len(post.media)} رسانه\n<blockquote>{_escape_html(short or 'بدون متن')}</blockquote>"
+        )
+    _pending_x_posts = prepared
+    return "\n".join(preview) + "\n\nانتشار فقط پس از تأیید انجام می‌شود."
+
+
+def _download_x_media(media: x_posts.Media) -> str:
+    response = requests.get(media.url, timeout=60)
+    response.raise_for_status()
+    suffix = Path(urlparse(media.url).path).suffix
+    if not suffix:
+        suffix = ".mp4" if media.kind in {"video", "animated_gif"} else ".jpg"
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        temp.write(response.content)
+    finally:
+        temp.close()
+    return temp.name
+
+
+async def _publish_x_post() -> str:
+    global _pending_x_posts
+    if not _pending_x_posts:
+        raise RuntimeError("پیش‌نمایش فعالی برای انتشار وجود ندارد.")
+    prepared = _pending_x_posts
+    _pending_x_posts = []
+    sent = 0
+    for post, caption in prepared:
+        paths = []
+        try:
+            paths = [await asyncio.to_thread(_download_x_media, media) for media in post.media]
+            if len(paths) > 1:
+                await _send_to_target(caption, album_paths=paths)
+            elif paths:
+                await _send_to_target(caption, file_path=paths[0])
+            else:
+                await _send_to_target(caption)
+            sent += 1
+        finally:
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    return f"✅ {sent} پست در کانال منتشر شد."
+
+
+def _fetch_openrouter_balance() -> dict:
+    response = requests.get(
+        "https://openrouter.ai/api/v1/auth/key",
+        headers={"Authorization": f"Bearer {settings.openrouter_api_key}"},
+        timeout=25,
+    )
+    response.raise_for_status()
+    return response.json().get("data", response.json())
+
+
+async def _openrouter_balance() -> str:
+    data = await asyncio.to_thread(_fetch_openrouter_balance)
+    limit = data.get("limit")
+    usage = data.get("usage")
+    remaining = data.get("limit_remaining")
+    def display(value):
+        return "نامحدود" if value is None else str(value)
+    tier = "رایگان" if data.get("is_free_tier") else "اعتباری"
+    return (
+        "<b>💳 اعتبار OpenRouter</b>\n\n"
+        f"نوع حساب: <b>{tier}</b>\n"
+        f"سقف: <b>{display(limit)}</b>\n"
+        f"مصرف: <b>{display(usage)}</b>\n"
+        f"مانده: <b>{display(remaining)}</b>"
+    )
+
+
 async def _health_handler(reader, writer):
     try:
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
@@ -650,30 +793,50 @@ async def _start_health_server():
 
 async def main():
     logger.info("Starting TeleAdmin bot...")
-    logger.info("  Sources: %s", ", ".join(_SOURCE_CHANNELS))
-    logger.info("  Target : %s", settings.target_channel_id)
-    if settings.notif_channel_id:
-        logger.info("  Notif  : %s", settings.notif_channel_id)
-    logger.info("  Model  : %s", settings.openrouter_model)
+    logger.info("  Sources: %s", ", ".join(_source_channels()))
+    logger.info("  Target : %s", _target_channel())
+    if _notification_channel():
+        logger.info("  Notif  : %s", _notification_channel())
+    logger.info("  Model  : %s", runtime_config.get("OPEN_ROUTER_MODEL"))
 
     await client.start()
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
-    await asyncio.gather(
+    admin_client = None
+    if settings.telegram_bot_token and settings.admin_user_ids:
+        admin_client = TelegramClient(
+            StringSession(), settings.telegram_api_id, settings.telegram_api_hash
+        )
+        await admin_client.start(bot_token=settings.telegram_bot_token)
+        AdminDashboard(
+            admin_client,
+            settings.admin_user_ids,
+            _prepare_x_post,
+            _publish_x_post,
+            _openrouter_balance,
+        )
+        logger.info("Admin dashboard enabled for %d user(s)", len(settings.admin_user_ids))
+    else:
+        logger.warning("Admin dashboard disabled: set TELEGRAM_BOT_TOKEN and ADMIN_USER_IDS")
+
+    tasks = [
         _start_health_server(),
         client.run_until_disconnected(),
         deadlines.run_deadline_loop(
             client=client,
-            target_channel=settings.target_channel_id,
-            league_code=settings.league_code,
+            target_channel=_target_channel(),
+            league_code=runtime_config.get("EPL_LEAGUE_CODE"),
         ),
         scheduler.run_scheduler(
             client=client,
-            target_channel=settings.target_channel_id,
-            league_code=settings.league_code,
-            price_predictions_enabled=settings.price_predictions_enabled,
+            target_channel=_target_channel(),
+            league_code=runtime_config.get("EPL_LEAGUE_CODE"),
+            price_predictions_enabled=runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"),
         ),
-    )
+    ]
+    if admin_client:
+        tasks.append(admin_client.run_until_disconnected())
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

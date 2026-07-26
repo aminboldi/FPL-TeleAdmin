@@ -5,3 +5,4 @@ test.session
 *.pyc
 fpl.db-*
 manual_data.json
+runtime_config.db

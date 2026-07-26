@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import database as db
 import livefpl
+import runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,11 @@ async def run_scheduler(client, target_channel: str, league_code: str, price_pre
     while True:
         try:
             now_iran = _now_iran()
+            target_channel = runtime_config.get("TARGET_CHANNEL_ID") or target_channel
+            price_predictions_enabled = runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED")
+            if not target_channel:
+                await asyncio.sleep(60)
+                continue
 
             games = livefpl._fetch_games() if livefpl._games_cache is None else None
             if games is None:

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import database as db
+import runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,8 @@ async def run_deadline_loop(client, target_channel: str, league_code: str):
     logger.info("Deadline loop started")
 
     while True:
+        target_channel = runtime_config.get("TARGET_CHANNEL_ID") or target_channel
+        league_code = runtime_config.get("EPL_LEAGUE_CODE") or league_code
         now = datetime.now(tz=timezone.utc)
 
         gw = db.query_one(
@@ -54,6 +57,8 @@ async def run_deadline_loop(client, target_channel: str, league_code: str):
         )
         await asyncio.sleep(max(1, wait))
 
+        target_channel = runtime_config.get("TARGET_CHANNEL_ID") or target_channel
+        league_code = runtime_config.get("EPL_LEAGUE_CODE") or league_code
         await _post_deadline_passed(client, target_channel, gw, league_code)
         _advance_gw(gw_id)
 

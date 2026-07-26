@@ -69,13 +69,16 @@ Copy and fill in `.env` at the project root:
 TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=your_api_hash_here
 OPEN_ROUTER_API_KEY=sk-or-v1-...
-SOURCE_CHANNEL_ID=@sourcechannel
-TARGET_CHANNEL_ID=@targetchannel
 
 # Optional
+SOURCE_CHANNEL_ID=@sourcechannel
+TARGET_CHANNEL_ID=@targetchannel
 SOURCE_CHANNEL2_ID=@second_source
 NOTIF_CHANNEL_ID=@admin_notifications
 OPEN_ROUTER_MODEL=google/gemini-2.5-flash-lite
+TELEGRAM_BOT_TOKEN=123456:botfather-token
+ADMIN_USER_IDS=123456789
+X_BEARER_TOKEN=your_x_app_bearer_token
 ```
 
 ### 3. First run (authenticates with Telegram)
@@ -98,14 +101,47 @@ The bot is a long-lived process. Run it with a process manager (systemd, supervi
 | `TELEGRAM_API_ID`    | Yes      | Telegram app API ID (integer)                  |
 | `TELEGRAM_API_HASH`  | Yes      | Telegram app API hash                          |
 | `OPEN_ROUTER_API_KEY`| Yes      | OpenRouter API key                             |
-| `SOURCE_CHANNEL_ID`  | Yes      | Primary source channel (e.g. `@channelname`)   |
-| `TARGET_CHANNEL_ID`  | Yes      | Target channel for translated posts            |
+| `SOURCE_CHANNEL_ID`  | No       | Initial primary source channel (dashboard-editable) |
+| `TARGET_CHANNEL_ID`  | No       | Initial target channel (dashboard-editable)    |
 | `SOURCE_CHANNEL2_ID` | No       | Secondary source channel                       |
 | `NOTIF_CHANNEL_ID`   | No       | Channel for admin scheduling notifications     |
 | `OPEN_ROUTER_MODEL`  | No       | LLM model (default: gemini-2.5-flash-lite)     |
 | `TELEGRAPH_ACCESS_TOKEN`  | No   | Telegraph API token for unified article account |
 | `PRICE_PREDICTIONS_ENABLED` | No  | Set to `false` to pause nightly price predictions |
 | `LEAGUE_CODE`         | No       | FPL league code (default: 433b70)              |
+| `TELEGRAM_BOT_TOKEN` | No | BotFather token for the private admin dashboard |
+| `ADMIN_USER_IDS` | No | Comma-separated Telegram numeric IDs allowed to use the dashboard |
+| `X_BEARER_TOKEN` | No | App-only X API token for public X post imports |
+
+## Admin dashboard
+
+When both `TELEGRAM_BOT_TOKEN` and `ADMIN_USER_IDS` are set, TeleAdmin starts a
+second, admin-only BotFather client. Use it in a private chat:
+
+```text
+/dashboard
+/channels
+/target @targetchannel
+/source add @sourcechannel
+/source remove @sourcechannel
+/league epl
+/league iran
+/activity epl
+/balance
+/x https://x.com/account/status/1234567890
+```
+
+Channel changes require an explicit confirmation and are stored with an audit
+trail. The dashboard's editable operational settings are persisted in
+`runtime_config.db`; it intentionally contains no tokens or API keys. In
+Coolify, mount the directory containing this file as persistent storage (or set
+`RUNTIME_CONFIG_PATH` to a database path inside a persistent volume), otherwise
+dashboard changes will be lost on redeploy.
+
+The X importer uses the official app-only X API, translates captions only, and
+always shows a preview before publishing. Public-thread expansion is best effort:
+it depends on the X API plan allowing recent search and on the thread being in
+that endpoint's retention window.
 
 ## How It Works
 

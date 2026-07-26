@@ -21,6 +21,9 @@ class Settings:
     notif_channel_id: str | None
     league_code: str
     price_predictions_enabled: bool
+    telegram_bot_token: str | None
+    admin_user_ids: set[int]
+    x_bearer_token: str | None
 
 
 def load_config() -> Settings:
@@ -28,8 +31,6 @@ def load_config() -> Settings:
         "TELEGRAM_API_ID": int,
         "TELEGRAM_API_HASH": str,
         "OPEN_ROUTER_API_KEY": str,
-        "SOURCE_CHANNEL_ID": str,
-        "TARGET_CHANNEL_ID": str,
     }
 
     missing = []
@@ -51,10 +52,17 @@ def load_config() -> Settings:
             "OPEN_ROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
         ),
         fallback_model="google/gemini-2.5-flash-lite",
-        source_channel_id=os.getenv("SOURCE_CHANNEL_ID"),
+        source_channel_id=os.getenv("SOURCE_CHANNEL_ID", ""),
         source_channel2_id=os.getenv("SOURCE_CHANNEL2_ID") or None,
-        target_channel_id=os.getenv("TARGET_CHANNEL_ID"),
+        target_channel_id=os.getenv("TARGET_CHANNEL_ID", ""),
         notif_channel_id=os.getenv("NOTIF_CHANNEL_ID") or None,
         league_code=os.getenv("LEAGUE_CODE", "433b70"),
         price_predictions_enabled=os.getenv("PRICE_PREDICTIONS_ENABLED", "true").lower() != "false",
+        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
+        admin_user_ids={
+            int(value.strip())
+            for value in os.getenv("ADMIN_USER_IDS", "").split(",")
+            if value.strip().isdigit()
+        },
+        x_bearer_token=os.getenv("X_BEARER_TOKEN") or None,
     )
