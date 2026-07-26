@@ -249,7 +249,8 @@ def _clean_text(text: str, event=None) -> tuple[str | None, str | None]:
 
 
 def _build_caption(
-    translated: str | None, *, link_url: str | None = None, html: bool = False
+    translated: str | None, *, link_url: str | None = None, html: bool = False,
+    link_label: str = "لینک",
 ) -> str:
     parts = []
     if translated:
@@ -258,7 +259,7 @@ def _build_caption(
         else:
             parts.append(_format_numbers(translated))
     if link_url:
-        parts.append(f'<a href="{link_url}">لینک</a>')
+        parts.append(f'<a href="{link_url}">{link_label}</a>')
     if not parts:
         return AI_SIGNATURE
     return "\n\n".join(parts + [AI_SIGNATURE])
@@ -686,10 +687,10 @@ async def _maybe_post_article(text: str, event):
 async def _prepare_x_post(url: str) -> str:
     """Fetch an X post/thread and translate captions for an admin preview."""
     global _pending_x_posts
-    if not settings.x_bearer_token:
-        raise RuntimeError("X_BEARER_TOKEN is not configured.")
+    if not settings.x_bearer_token and not settings.x_rapidapi_key:
+        raise RuntimeError("Set X_RAPIDAPI_KEY or X_BEARER_TOKEN to import X posts.")
     posts = await asyncio.to_thread(
-        x_posts.fetch_post_and_thread, url, settings.x_bearer_token
+        x_posts.fetch_post_and_thread, url, settings.x_bearer_token, settings.x_rapidapi_key
     )
     _refresh_translator_model()
     prepared = []
@@ -697,8 +698,14 @@ async def _prepare_x_post(url: str) -> str:
     for index, post in enumerate(posts, start=1):
         translated = ""
         if post.text:
-            translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(_escape_html(post.text))))
-        caption = _build_caption(translated, html=True)
+            x_text = re.sub(r"(?<!\w)#\w+", "", post.text)
+            x_text = re.sub(r"[ \t]{2,}", " ", x_text)
+            x_text = re.sub(r" *\n *", "\n", x_text).strip()
+            translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(_escape_html(x_text))))
+        source_url = f"https://x.com/{post.author}/status/{post.id}"
+        caption = _build_caption(
+            translated, link_url=source_url, html=True, link_label="لینک منبع"
+        )
         prepared.append((post, caption))
         short = _strip_html_tags(translated).replace("\n", " ")[:180]
         preview.append(

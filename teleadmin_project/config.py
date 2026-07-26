@@ -24,6 +24,7 @@ class Settings:
     telegram_bot_token: str | None
     admin_user_ids: set[int]
     x_bearer_token: str | None
+    x_rapidapi_key: str | None
 
 
 def load_config() -> Settings:
@@ -65,4 +66,5 @@ def load_config() -> Settings:
             if value.strip().isdigit()
         },
         x_bearer_token=os.getenv("X_BEARER_TOKEN") or None,
+        x_rapidapi_key=os.getenv("X_RAPIDAPI_KEY") or None,
     )

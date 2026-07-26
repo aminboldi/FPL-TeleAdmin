@@ -112,6 +112,7 @@ The bot is a long-lived process. Run it with a process manager (systemd, supervi
 | `TELEGRAM_BOT_TOKEN` | No | BotFather token for the private admin dashboard |
 | `ADMIN_USER_IDS` | No | Comma-separated Telegram numeric IDs allowed to use the dashboard |
 | `X_BEARER_TOKEN` | No | App-only X API token for public X post imports |
+| `X_RAPIDAPI_KEY` | No | RapidAPI key for the `x-com2` public X importer (preferred when set) |
 
 ## Admin dashboard
 
@@ -143,10 +144,9 @@ Coolify, mount the directory containing this file as persistent storage (or set
 `RUNTIME_CONFIG_PATH` to a database path inside a persistent volume), otherwise
 dashboard changes will be lost on redeploy.
 
-The X importer uses the official app-only X API, translates captions only, and
-always shows a preview before publishing. Public-thread expansion is best effort:
-it depends on the X API plan allowing recent search and on the thread being in
-that endpoint's retention window.
+The X importer translates captions only and always shows a preview before
+publishing. When `X_RAPIDAPI_KEY` is configured it uses the subscribed `x-com2`
+RapidAPI service; otherwise it falls back to the official app-only X API.
 
 ## How It Works
 

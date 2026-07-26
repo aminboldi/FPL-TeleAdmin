@@ -8,6 +8,8 @@ import requests
 
 API_BASE = "https://api.x.com/2"
 _POST_ID_RE = re.compile(r"(?:x\.com|twitter\.com)/[^/]+/status/(\d+)", re.IGNORECASE)
+_POST_URL_RE = re.compile(r"(?:x\.com|twitter\.com)/([^/?#]+)/status/(\d+)", re.IGNORECASE)
+_RAPID_HOST = "x-com2.p.rapidapi.com"
 
 
 class XPostError(Exception):
@@ -30,6 +32,13 @@ class Post:
 
 def extract_post_id(url: str) -> str:
     match = _POST_ID_RE.search(url.strip())
+    if not match:
+        raise XPostError("Please send a public x.com/.../status/... link.")
+    return match.group(1)
+
+
+def _extract_username(url: str) -> str:
+    match = _POST_URL_RE.search(url.strip())
     if not match:
         raise XPostError("Please send a public x.com/.../status/... link.")
     return match.group(1)
@@ -78,8 +87,91 @@ def _to_post(tweet: dict, includes: dict) -> Post:
     )
 
 
-def fetch_post_and_thread(url: str, token: str) -> list[Post]:
+def _rapid_request(path: str, key: str, params: dict) -> dict:
+    response = requests.get(
+        f"https://{_RAPID_HOST}{path}", params=params,
+        headers={"x-rapidapi-host": _RAPID_HOST, "x-rapidapi-key": key}, timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise XPostError(f"RapidAPI X request failed: {exc}") from exc
+    return response.json()
+
+
+def _walk(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk(child)
+
+
+def _rapid_post(tweet: dict, author: str) -> Post:
+    legacy = tweet.get("legacy", {})
+    media_rows = legacy.get("extended_entities", legacy.get("entities", {})).get("media", [])
+    media = []
+    for item in media_rows:
+        url = item.get("media_url_https")
+        kind = item.get("type", "photo")
+        variants = item.get("video_info", {}).get("variants", [])
+        mp4 = [variant for variant in variants if variant.get("content_type") == "video/mp4" and variant.get("url")]
+        if mp4:
+            url = max(mp4, key=lambda variant: variant.get("bitrate", 0))["url"]
+        if url:
+            media.append(Media(url=url, kind=kind))
+    text = legacy.get("full_text", "").strip()
+    # The source appends a t.co URL for attached media; Telegram gets the media
+    # separately, so remove that redundant tail from the translated caption.
+    text = re.sub(r"\s+https://t\.co/\S+$", "", text)
+    return Post(id=tweet["rest_id"], text=text, author=author, media=media)
+
+
+def _fetch_rapid_post_and_thread(url: str, key: str) -> list[Post]:
+    username = _extract_username(url)
+    post_id = extract_post_id(url)
+    timeline = _rapid_request("/TweetDetail/", key, {"tweetId": post_id})
+    tweets = {}
+    for row in _walk(timeline):
+        tweet_id = row.get("rest_id")
+        legacy = row.get("legacy")
+        if not tweet_id or not isinstance(legacy, dict) or not legacy.get("full_text"):
+            continue
+        previous = tweets.get(tweet_id)
+        # GraphQL responses contain duplicate Tweet objects. Keep the version
+        # with the richest media payload rather than a later shallow wrapper.
+        media_count = len(legacy.get("extended_entities", {}).get("media", []))
+        previous_count = len((previous or {}).get("legacy", {}).get("extended_entities", {}).get("media", []))
+        if previous is None or media_count > previous_count:
+            tweets[tweet_id] = row
+    root = tweets.get(post_id)
+    if not root:
+        raise XPostError("RapidAPI returned no readable post for this link.")
+    conversation = root["legacy"].get("conversation_id_str", post_id)
+
+    def tweet_author(tweet: dict) -> str:
+        return (
+            tweet.get("core", {}).get("user_results", {}).get("result", {})
+            .get("legacy", {}).get("screen_name", "")
+        )
+
+    thread = [
+        _rapid_post(tweet, username)
+        for tweet in tweets.values()
+        if tweet["legacy"].get("conversation_id_str") == conversation
+        and tweet_author(tweet).lower() == username.lower()
+    ]
+    return sorted(thread, key=lambda post: int(post.id))
+
+
+def fetch_post_and_thread(url: str, token: str | None = None, rapidapi_key: str | None = None) -> list[Post]:
     """Fetch a post and, when the API tier permits it, its recent thread replies."""
+    if rapidapi_key:
+        return _fetch_rapid_post_and_thread(url, rapidapi_key)
+    if not token:
+        raise XPostError("No X API credential is configured.")
     post_id = extract_post_id(url)
     params = {
         "expansions": "author_id,attachments.media_keys",
