@@ -130,7 +130,6 @@ def _rapid_post(tweet: dict, author: str) -> Post:
 
 
 def _fetch_rapid_post_and_thread(url: str, key: str) -> list[Post]:
-    username = _extract_username(url)
     post_id = extract_post_id(url)
     timeline = _rapid_request("/TweetDetail/", key, {"tweetId": post_id})
     tweets = {}
@@ -146,23 +145,25 @@ def _fetch_rapid_post_and_thread(url: str, key: str) -> list[Post]:
         previous_count = len((previous or {}).get("legacy", {}).get("extended_entities", {}).get("media", []))
         if previous is None or media_count > previous_count:
             tweets[tweet_id] = row
-    root = tweets.get(post_id)
-    if not root:
-        raise XPostError("RapidAPI returned no readable post for this link.")
-    conversation = root["legacy"].get("conversation_id_str", post_id)
-
     def tweet_author(tweet: dict) -> str:
         return (
             tweet.get("core", {}).get("user_results", {}).get("result", {})
             .get("legacy", {}).get("screen_name", "")
         )
 
+    root = tweets.get(post_id)
+    if not root:
+        raise XPostError("RapidAPI returned no readable post for this link.")
+    conversation = root["legacy"].get("conversation_id_str", post_id)
+    author = tweet_author(root) or _extract_username(url)
     thread = [
-        _rapid_post(tweet, username)
+        _rapid_post(tweet, author)
         for tweet in tweets.values()
         if tweet["legacy"].get("conversation_id_str") == conversation
-        and tweet_author(tweet).lower() == username.lower()
+        and tweet_author(tweet).lower() == author.lower()
     ]
+    if not thread:
+        raise XPostError("RapidAPI returned the post but no publishable thread content.")
     return sorted(thread, key=lambda post: int(post.id))
 
 
