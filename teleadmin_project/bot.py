@@ -28,6 +28,7 @@ import database as db
 import scheduler
 import runtime_config
 import x_posts
+import livefpl
 from admin_dashboard import AdminDashboard
 
 logging.basicConfig(
@@ -72,6 +73,7 @@ _album_caption: dict[int, str] = {}
 _chunk_buffer: dict[int, list] = {}
 _chunk_tasks: dict[int, asyncio.Task] = {}
 _pending_x_posts: list[tuple[x_posts.Post, str]] = []
+_pending_dashboard_content: str | None = None
 
 
 def _target_channel() -> str:
@@ -775,6 +777,84 @@ async def _openrouter_balance() -> str:
     )
 
 
+def _fixtures_text() -> str:
+    gameweek = db.query_one(
+        "SELECT id, name FROM gameweeks WHERE is_current=1 OR is_next=1 "
+        "ORDER BY CASE WHEN is_current=1 THEN 0 ELSE 1 END, id LIMIT 1"
+    )
+    if not gameweek:
+        raise RuntimeError("گیم‌ویک فعلی یا بعدی پیدا نشد.")
+    fixtures = db.query(
+        """SELECT f.kickoff_time, ht.short_name_fa AS home_fa, ht.short_name AS home_en,
+                  at.short_name_fa AS away_fa, at.short_name AS away_en
+           FROM fixtures f
+           JOIN teams ht ON ht.id=f.team_h JOIN teams at ON at.id=f.team_a
+           WHERE f.gameweek_id=? ORDER BY f.kickoff_time""",
+        (gameweek["id"],),
+    )
+    if not fixtures:
+        raise RuntimeError("بازی‌ای برای این گیم‌ویک پیدا نشد.")
+    iran_offset = timedelta(hours=3, minutes=30)
+    lines = [f"<b>📅 برنامهٔ {gameweek['name']}</b>", ""]
+    current_day = None
+    for fixture in fixtures:
+        kickoff = datetime.strptime(fixture["kickoff_time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) + iran_offset
+        day = kickoff.strftime("%Y/%m/%d")
+        if day != current_day:
+            current_day = day
+            lines.extend([f"<b>{day}</b>", ""])
+        home = fixture["home_fa"] or fixture["home_en"]
+        away = fixture["away_fa"] or fixture["away_en"]
+        lines.append(f"<blockquote>{home} - {away} | <b>{kickoff.strftime('%H:%M')}</b></blockquote>")
+    lines.extend(["", "@EPL_Fantasy"])
+    return "\n".join(lines)
+
+
+async def _prepare_dashboard_content(kind: str) -> str:
+    global _pending_dashboard_content
+    _pending_dashboard_content = None
+    if kind == "fixtures":
+        text = _fixtures_text()
+    elif kind == "points":
+        livefpl._games_cache = None
+        fixtures = livefpl.get_finished_fixtures()
+        if not fixtures:
+            raise RuntimeError("هنوز بازی تمام‌شده‌ای برای امتیازات وجود ندارد.")
+        fixture = max(fixtures, key=lambda item: item.get("kickoff_time", ""))
+        text = await asyncio.to_thread(livefpl.build_game_text, fixture)
+        if not text:
+            raise RuntimeError("دادهٔ امتیازات این بازی از LiveFPL در دسترس نیست.")
+    elif kind == "eo":
+        livefpl._games_cache = None
+        text = await asyncio.to_thread(livefpl.build_eo_text)
+        if not text:
+            raise RuntimeError("دادهٔ EO از LiveFPL در دسترس نیست.")
+    elif kind == "prices":
+        text = await asyncio.to_thread(livefpl.build_price_changes_text)
+        if not text:
+            raise RuntimeError("پیش‌بینی قیمت LiveFPL در دسترس نیست.")
+    elif kind == "lineups":
+        return (
+            "<b>📋 ترکیب‌ها</b>\n\n"
+            "ترکیب‌ها به‌صورت خودکار از کانال‌های منبع دریافت، با نام و قیمت فارسی "
+            "فرمت و بدون تأخیر منتشر می‌شوند. برای این بخش انتشار دستی لازم نیست."
+        )
+    else:
+        raise RuntimeError("نوع محتوا پشتیبانی نمی‌شود.")
+    _pending_dashboard_content = text
+    return f"<b>پیش‌نمایش</b>\n\n{text}"
+
+
+async def _publish_dashboard_content() -> str:
+    global _pending_dashboard_content
+    if not _pending_dashboard_content:
+        raise RuntimeError("پیش‌نمایش قابل انتشار وجود ندارد.")
+    text = _pending_dashboard_content
+    _pending_dashboard_content = None
+    await _send_to_target(text)
+    return "✅ محتوا در کانال منتشر شد."
+
+
 async def _health_handler(reader, writer):
     try:
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
@@ -814,6 +894,8 @@ async def main():
             _prepare_x_post,
             _publish_x_post,
             _openrouter_balance,
+            _prepare_dashboard_content,
+            _publish_dashboard_content,
         )
         logger.info("Admin dashboard enabled for %d user(s)", len(settings.admin_user_ids))
     else:

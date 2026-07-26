@@ -17,12 +17,16 @@ class AdminDashboard:
         x_preview: Callable[[str], Awaitable[str]],
         x_publish: Callable[[], Awaitable[str]],
         openrouter_status: Callable[[], Awaitable[str]],
+        content_preview: Callable[[str], Awaitable[str]],
+        content_publish: Callable[[], Awaitable[str]],
     ):
         self.client = client
         self.admin_ids = admin_ids
         self.x_preview = x_preview
         self.x_publish = x_publish
         self.openrouter_status = openrouter_status
+        self.content_preview = content_preview
+        self.content_publish = content_publish
         self.pending: dict[str, tuple[str, str, int]] = {}
         self._register_handlers()
 
@@ -46,14 +50,25 @@ class AdminDashboard:
     @staticmethod
     def _dashboard_buttons():
         return [
-            [Button.inline("🏆 لیگ کانال", b"league:epl"), Button.inline("🇮🇷 لیگ ایران", b"league:iran")],
-            [Button.inline("📈 فعالیت لیگ کانال", b"activity:epl"), Button.inline("📈 فعالیت لیگ ایران", b"activity:iran")],
-            [Button.inline("📡 کانال‌ها", b"channels"), Button.inline("🧾 تغییرات اخیر", b"audit")],
-            [Button.inline("📤 X post", b"xhelp"), Button.inline("💳 اعتبار OpenRouter", b"openrouter")],
+            [Button.inline("📊 لیگ‌ها", b"menu:leagues"), Button.inline("⚽ محتوا", b"menu:content")],
+            [Button.inline("⚙️ مدیریت", b"menu:settings"), Button.inline("📤 X post", b"xhelp")],
+            [Button.inline("💳 اعتبار OpenRouter", b"openrouter"), Button.inline("❔ راهنما", b"guide")],
         ]
+
+    @staticmethod
+    def _back_button():
+        return [[Button.inline("‹ بازگشت", b"back")]]
+
+    @staticmethod
+    def _main_text() -> str:
+        return "<b>پنل مدیریت TeleAdmin</b>\nاز گزینه‌های زیر استفاده کنید."
 
     async def _handle_command(self, event) -> None:
         text = (event.raw_text or "").strip()
+        # Accept the compact dashboard form as well as the standard Telegram
+        # command form: x/https://x.com/... and /x https://x.com/...
+        if text.lower().startswith("x/http://") or text.lower().startswith("x/https://"):
+            text = "/x " + text[2:]
         if not text.startswith("/"):
             return
         command, _, arg = text.partition(" ")
@@ -62,11 +77,11 @@ class AdminDashboard:
 
         if command in {"/start", "/dashboard", "/help"}:
             await event.reply(
-                "<b>پنل مدیریت TeleAdmin</b>\n"
-                "دستورها: /channels، /target @channel، /source add|remove @channel، "
-                "/league epl|iran، /activity epl|iran، /balance، /set KEY VALUE، /x لینک_پست",
+                self._main_text(),
                 buttons=self._dashboard_buttons(), parse_mode="html",
             )
+        elif command == "/guide":
+            await event.reply(self._guide_text(), buttons=self._back_button(), parse_mode="html")
         elif command == "/channels":
             await event.reply(self._channels_text(), buttons=[[Button.inline("تغییر مقصد", b"targethelp")]], parse_mode="html")
         elif command == "/target":
@@ -82,6 +97,8 @@ class AdminDashboard:
             await self._activity(event, arg or "epl")
         elif command in {"/balance", "/openrouter"}:
             await self._openrouter(event)
+        elif command in {"/fixtures", "/points", "/eo", "/prices", "/lineups"}:
+            await self._content(event, command[1:])
         elif command == "/set":
             key, _, value = arg.partition(" ")
             await self._set_command(event, key.upper(), value)
@@ -105,6 +122,34 @@ class AdminDashboard:
             await event.answer("از /target @channel استفاده کنید.", alert=True)
         elif data == "xhelp":
             await event.answer("لینک را با /x ارسال کنید.", alert=True)
+        elif data == "back":
+            await event.edit(self._main_text(), buttons=self._dashboard_buttons(), parse_mode="html")
+        elif data == "guide":
+            await event.edit(self._guide_text(), buttons=self._back_button(), parse_mode="html")
+        elif data == "menu:leagues":
+            await event.edit(
+                "<b>📊 گزارش لیگ‌ها</b>",
+                buttons=[
+                    [Button.inline("🏆 جدول لیگ کانال", b"league:epl"), Button.inline("🇮🇷 جدول لیگ ایران", b"league:iran")],
+                    [Button.inline("📈 فعالیت لیگ کانال", b"activity:epl"), Button.inline("📈 فعالیت لیگ ایران", b"activity:iran")],
+                    *self._back_button(),
+                ], parse_mode="html",
+            )
+        elif data == "menu:content":
+            await event.edit(
+                "<b>⚽ تولید محتوا</b>\nهمهٔ گزینه‌ها بدون OpenRouter ساخته می‌شوند.",
+                buttons=[
+                    [Button.inline("📅 بازی‌های هفته", b"content:fixtures"), Button.inline("📊 امتیازات آخرین بازی", b"content:points")],
+                    [Button.inline("👥 EO", b"content:eo"), Button.inline("💷 پیش‌بینی قیمت", b"content:prices")],
+                    [Button.inline("📋 وضعیت ترکیب‌ها", b"content:lineups")],
+                    *self._back_button(),
+                ], parse_mode="html",
+            )
+        elif data == "menu:settings":
+            await event.edit(
+                self._channels_text() + "\n\nبرای سایر تنظیمات: <code>/set KEY VALUE</code>",
+                buttons=[[Button.inline("تغییر مقصد", b"targethelp")], *self._back_button()], parse_mode="html",
+            )
         elif data == "openrouter":
             await event.edit("در حال بررسی اعتبار OpenRouter…")
             try:
@@ -126,6 +171,19 @@ class AdminDashboard:
             except Exception as exc:
                 text = f"❌ {exc}"
             await event.edit(text, buttons=self._dashboard_buttons(), parse_mode="html")
+        elif data.startswith("content:"):
+            await event.edit("در حال ساخت پیش‌نمایش…")
+            kind = data.split(":", 1)[1]
+            try:
+                text = await self.content_preview(kind)
+            except Exception as exc:
+                text = f"❌ {exc}"
+                buttons = self._back_button()
+            else:
+                buttons = self._back_button() if kind == "lineups" else [
+                    [Button.inline("انتشار در کانال", b"contentpublish")], *self._back_button()
+                ]
+            await event.edit(text, buttons=buttons, parse_mode="html")
         elif data == "audit":
             rows = runtime_config.recent_audit()
             text = "<b>🧾 تغییرات اخیر</b>\n\n" + ("\n".join(
@@ -151,6 +209,13 @@ class AdminDashboard:
                 await event.edit(f"❌ {exc}")
             else:
                 await event.edit(result)
+        elif data == "contentpublish":
+            try:
+                result = await self.content_publish()
+            except Exception as exc:
+                await event.edit(f"❌ {exc}", buttons=self._back_button())
+            else:
+                await event.edit(result, buttons=self._back_button())
         elif data == "xcancel":
             await event.edit("لغو شد.")
 
@@ -248,3 +313,25 @@ class AdminDashboard:
             await event.reply(await self.openrouter_status(), parse_mode="html")
         except Exception as exc:
             await event.reply(f"❌ {exc}")
+
+    async def _content(self, event, kind: str) -> None:
+        await event.reply("در حال ساخت پیش‌نمایش…")
+        try:
+            text = await self.content_preview(kind)
+        except Exception as exc:
+            await event.reply(f"❌ {exc}")
+            return
+        buttons = self._back_button() if kind == "lineups" else [[Button.inline("انتشار در کانال", b"contentpublish")]]
+        await event.reply(text, buttons=buttons, parse_mode="html")
+
+    @staticmethod
+    def _guide_text() -> str:
+        return (
+            "<b>❔ راهنمای دستورات</b>\n\n"
+            "<b>منو</b>\n/dashboard — پنل اصلی\n/guide — همین راهنما\n/balance — اعتبار OpenRouter\n\n"
+            "<b>لیگ‌ها</b>\n/league epl یا /league iran\n/activity epl یا /activity iran\n\n"
+            "<b>محتوا (بدون AI)</b>\n/fixtures — برنامهٔ بازی‌های هفته\n/points — امتیازات آخرین بازی تمام‌شده\n/eo — مالکیت مؤثر\n/prices — پیش‌بینی قیمت LiveFPL\n/lineups — وضعیت دریافت خودکار ترکیب‌ها\n\n"
+            "<b>انتشار از X</b>\n/x https://x.com/account/status/123\nیا x/https://x.com/account/status/123\n\n"
+            "<b>تنظیمات</b>\n/channels\n/target @channel\n/source add @channel\n/source remove @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
+            "تمام تغییرات و انتشارها نیاز به تأیید دارند."
+        )

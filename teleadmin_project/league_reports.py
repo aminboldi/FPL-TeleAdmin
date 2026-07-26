@@ -20,12 +20,13 @@ def _fetch_all(league_id: str) -> dict:
         return cached[1]
 
     rows = []
-    page = 1
+    new_entries = []
     league = None
+    page = 1
     while True:
         response = requests.get(
             f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/",
-            params={"page_standings": page}, timeout=25,
+            params={"page_standings": page, "page_new_entries": 1}, timeout=25,
         )
         if response.status_code == 404:
             raise LeagueError("League not found or its ID is not accessible.")
@@ -43,7 +44,37 @@ def _fetch_all(league_id: str) -> dict:
         if page > 200:  # defensive bound against an unexpected API response
             raise LeagueError("League is too large to summarise safely in one request.")
 
-    result = {"league": league or {}, "rows": rows}
+    # Before GW1, FPL puts every joined manager in ``new_entries`` while the
+    # standings list is empty. It is independently paginated from standings.
+    page = 1
+    while True:
+        response = requests.get(
+            f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/",
+            params={"page_standings": 1, "page_new_entries": page}, timeout=25,
+        )
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise LeagueError(f"Could not fetch league members: {exc}") from exc
+        payload = response.json()
+        league = league or payload.get("league", {})
+        entries = payload.get("new_entries", {})
+        new_entries.extend(entries.get("results", []))
+        if not entries.get("has_next"):
+            break
+        page += 1
+        if page > 200:
+            raise LeagueError("League is too large to count safely in one request.")
+
+    member_entries = {
+        row["entry"] for row in rows + new_entries if row.get("entry")
+    }
+    result = {
+        "league": league or {},
+        "rows": rows,
+        "member_entries": member_entries,
+        "preseason_entries": new_entries,
+    }
     _CACHE[league_id] = (time.monotonic(), result)
     return result
 
@@ -54,7 +85,11 @@ def build_summary(league_id: str, top_n: int = 10) -> str:
     league_name = data["league"].get("name", "لیگ")
     top = sorted(rows, key=lambda row: row.get("rank", 10**9))[:top_n]
     weekly = sorted(rows, key=lambda row: row.get("event_total", 0), reverse=True)[:3]
-    lines = [f"<b>📊 {league_name}</b>", f"تعداد اعضا: <b>{len(rows)}</b>", "", "<b>🏆 جدول</b>"]
+    lines = [f"<b>📊 {league_name}</b>", f"تعداد اعضا: <b>{len(data['member_entries'])}</b>", ""]
+    if not rows and data["preseason_entries"]:
+        lines.append("<i>جدول پس از شروع GW1 نمایش داده می‌شود.</i>")
+        return "\n".join(lines)
+    lines.append("<b>🏆 جدول</b>")
     for row in top:
         movement = row.get("last_rank", row.get("rank", 0)) - row.get("rank", 0)
         arrow = "🟢" if movement > 0 else "🔴" if movement < 0 else "⚪"
@@ -104,7 +139,7 @@ def build_activity(league_id: str) -> str:
     if not event_id:
         raise LeagueError("هنوز گیم‌ویک فعالی در FPL وجود ندارد.")
     data = _fetch_all(league_id)
-    entries = [row.get("entry") for row in data["rows"] if row.get("entry")]
+    entries = list(data["member_entries"])
     if not entries:
         raise LeagueError("No league members were returned.")
     engaged = 0

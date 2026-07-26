@@ -128,6 +128,11 @@ second, admin-only BotFather client. Use it in a private chat:
 /league iran
 /activity epl
 /balance
+/guide
+/fixtures
+/points
+/eo
+/prices
 /x https://x.com/account/status/1234567890
 ```
 
