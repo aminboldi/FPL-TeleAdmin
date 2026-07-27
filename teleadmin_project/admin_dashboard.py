@@ -119,7 +119,7 @@ class AdminDashboard:
             if not arg:
                 await event.reply("نمونه: <code>y/https://youtube.com/watch?v=...</code>", parse_mode="html")
             else:
-                await event.reply("در حال دریافت ویدیو از یوتیوب…")
+                await event.reply("در حال دریافت ویدیو و آماده‌سازی مقاله از زیرنویس YouTube…")
                 try:
                     result = await self.youtube_import(arg)
                 except Exception as exc:
