@@ -72,7 +72,6 @@ _album_caption: dict[int, str] = {}
 
 _chunk_buffer: dict[int, list] = {}
 _chunk_tasks: dict[int, asyncio.Task] = {}
-_pending_x_posts: list[tuple[x_posts.Post, str]] = []
 _pending_dashboard_content: str | None = None
 
 
@@ -685,8 +684,7 @@ async def _maybe_post_article(text: str, event):
 
 
 async def _prepare_x_post(url: str) -> str:
-    """Fetch an X post/thread and translate captions for an admin preview."""
-    global _pending_x_posts
+    """Fetch, translate, and put an X post/thread in Telegram's scheduled queue."""
     if not settings.x_bearer_token and not settings.x_rapidapi_key:
         raise RuntimeError("Set X_RAPIDAPI_KEY or X_BEARER_TOKEN to import X posts.")
     posts = await asyncio.to_thread(
@@ -694,26 +692,39 @@ async def _prepare_x_post(url: str) -> str:
     )
     _refresh_translator_model()
     prepared = []
-    preview = [f"<b>پیش‌نمایش X: {len(posts)} پست</b>"]
-    for index, post in enumerate(posts, start=1):
+    for post in posts:
         translated = ""
         if post.text:
             x_text = re.sub(r"(?<!\w)#\w+", "", post.text)
             x_text = re.sub(r"[ \t]{2,}", " ", x_text)
             x_text = re.sub(r" *\n *", "\n", x_text).strip()
-            translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(_escape_html(x_text))))
+            translated_source = _x_text_to_html(x_text)
+            translated = _fix_unclosed_tags(
+                _strip_quotes(await translator.translate(translated_source))
+            )
         source_url = f"https://x.com/{post.author}/status/{post.id}"
         caption = _build_caption(
             translated, link_url=source_url, html=True, link_label="لینک منبع"
         )
         prepared.append((post, caption))
-        short = _strip_html_tags(translated).replace("\n", " ")[:180]
-        preview.append(
-            f"\n<b>{index}.</b> @{_escape_html(post.author)} — "
-            f"{len(post.media)} رسانه\n<blockquote>{_escape_html(short or 'بدون متن')}</blockquote>"
-        )
-    _pending_x_posts = prepared
-    return "\n".join(preview) + "\n\nانتشار فقط پس از تأیید انجام می‌شود."
+    await _schedule_x_posts(prepared)
+    return f"✅ {len(prepared)} پست X برای بررسی، با تأخیر {SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+
+
+_X_MENTION_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9_-]+)")
+
+
+def _x_text_to_html(text: str) -> str:
+    """Escape X text while making mentions point back to the X profile."""
+    result = []
+    pos = 0
+    for match in _X_MENTION_RE.finditer(text):
+        result.append(_escape_html(text[pos:match.start()]))
+        handle = match.group(1)
+        result.append(f'<a href="https://x.com/{handle}">{handle}</a>')
+        pos = match.end()
+    result.append(_escape_html(text[pos:]))
+    return "".join(result)
 
 
 def _download_x_media(media: x_posts.Media) -> str:
@@ -730,31 +741,23 @@ def _download_x_media(media: x_posts.Media) -> str:
     return temp.name
 
 
-async def _publish_x_post() -> str:
-    global _pending_x_posts
-    if not _pending_x_posts:
-        raise RuntimeError("پیش‌نمایش فعالی برای انتشار وجود ندارد.")
-    prepared = _pending_x_posts
-    _pending_x_posts = []
-    sent = 0
+async def _schedule_x_posts(prepared: list[tuple[x_posts.Post, str]]) -> None:
     for post, caption in prepared:
         paths = []
         try:
             paths = [await asyncio.to_thread(_download_x_media, media) for media in post.media]
             if len(paths) > 1:
-                await _send_to_target(caption, album_paths=paths)
+                await _send_to_target(caption, album_paths=paths, schedule_minutes=SCHEDULE_DELAY_MINUTES)
             elif paths:
-                await _send_to_target(caption, file_path=paths[0])
+                await _send_to_target(caption, file_path=paths[0], schedule_minutes=SCHEDULE_DELAY_MINUTES)
             else:
-                await _send_to_target(caption)
-            sent += 1
+                await _send_to_target(caption, schedule_minutes=SCHEDULE_DELAY_MINUTES)
         finally:
             for path in paths:
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
-    return f"✅ {sent} پست در کانال منتشر شد."
 
 
 def _fetch_openrouter_balance() -> dict:
@@ -899,7 +902,6 @@ async def main():
             admin_client,
             settings.admin_user_ids,
             _prepare_x_post,
-            _publish_x_post,
             _openrouter_balance,
             _prepare_dashboard_content,
             _publish_dashboard_content,

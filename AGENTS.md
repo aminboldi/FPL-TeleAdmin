@@ -28,11 +28,32 @@ When downloading and re-uploading media, the temp file must include the original
 - `.env` lives at repo root. `config.py` loads it from `Path(__file__).parent.parent / ".env"`.
 - Telethon session: if `TELETHON_SESSION_STRING` env var is set, a `StringSession` is used (cloud deployment). Otherwise it falls back to the local file `teleadmin_project/translation_session.session`.
 - First run locally prompts for phone number + verification code. After login, run `python export_session.py` to export the session as a string for cloud deployment.
+- **Never use the same Telethon user session concurrently from local development and the cloud VPS.** Telegram invalidates it with `AuthKeyDuplicatedError`. For deployment, create a fresh local login, export it, set `TELETHON_SESSION_STRING` only in Coolify, then do not run that same session locally while the VPS is running.
 - Keep `.env` out of git. The session file is committed as a convenience, but `TELETHON_SESSION_STRING` takes priority.
 - The env var is `OPEN_ROUTER_API_KEY` (with underscore between OPEN and ROUTER). The old specs.md uses `OPENROUTER_API_KEY` (no underscore) — that's wrong.
 - `TELEGRAPH_ACCESS_TOKEN` (optional): set this to keep all Telegraph articles under a single account. Without it, a new account is created on every bot restart.
 - `PRICE_PREDICTIONS_ENABLED` (optional, default `true`): set to `false` to pause the nightly price prediction scheduler post (useful during FPL off-season).
 - `LEAGUE_CODE` (optional, default `433b70`): FPL league code for the invite link in deadline posts.
+- Secrets and identities stay in `.env` / Coolify environment variables: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELETHON_SESSION_STRING`, `TELEGRAM_BOT_TOKEN`, `ADMIN_USER_IDS`, `OPEN_ROUTER_API_KEY`, `TELEGRAPH_ACCESS_TOKEN`, `X_BEARER_TOKEN`, and `X_RAPIDAPI_KEY`.
+
+## Runtime configuration and admin dashboard
+
+Operational settings are dashboard-editable and persist in `runtime_config.db`, not `.env`:
+
+- `OPEN_ROUTER_MODEL`, source/target/notification channels, `PRICE_PREDICTIONS_ENABLED`, `EPL_LEAGUE_CODE`, `EPL_LEAGUE_ID`, `IRAN_LEAGUE_ID`
+- The database has an audit log and every setting change requires a Telegram confirmation.
+- `runtime_config.db` is ignored by git. In Coolify it must live in persistent storage: mount a volume at `/app/teleadmin_project/data` and set `RUNTIME_CONFIG_PATH=/app/teleadmin_project/data/runtime_config.db`.
+- Without `RUNTIME_CONFIG_PATH`, the bot still runs using a non-persistent DB beside the code; settings reset after a redeploy.
+- The BotFather dashboard is enabled only if both `TELEGRAM_BOT_TOKEN` and numeric comma-separated `ADMIN_USER_IDS` are set. It accepts private-chat commands only.
+- Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`.
+- Dashboard-generated content always requires an explicit publish confirmation. Lineups are source-driven and publish automatically when detected.
+
+## X post import
+
+- Admins can submit either `/x https://x.com/.../status/...`, `x/https://...`, or `X/https://...`.
+- Captions are translated through OpenRouter; hashtags are removed before translation. A canonical `<a>` link labelled `لینک منبع` is appended before the AI signature.
+- Prefer `X_RAPIDAPI_KEY` for the subscribed `x-com2` RapidAPI service. `x_posts.py` uses its `TweetDetail/?tweetId=...` endpoint, which supports canonical and `x.com/i/status/...` share URLs, media, and self-authored thread posts. The official `X_BEARER_TOKEN` route is only a fallback.
+- RapidAPI may omit media for some X post formats. Never attach media belonging to replies or unrelated posts just because it appears elsewhere in the API response.
 - The Python venv lives at `teleadmin_project/.venv/` (not repo root). If missing, create with `python3 -m venv teleadmin_project/.venv`.
 
 ## Deployment

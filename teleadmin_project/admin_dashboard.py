@@ -15,7 +15,6 @@ class AdminDashboard:
         client,
         admin_ids: set[int],
         x_preview: Callable[[str], Awaitable[str]],
-        x_publish: Callable[[], Awaitable[str]],
         openrouter_status: Callable[[], Awaitable[str]],
         content_preview: Callable[[str], Awaitable[str]],
         content_publish: Callable[[], Awaitable[str]],
@@ -23,7 +22,6 @@ class AdminDashboard:
         self.client = client
         self.admin_ids = admin_ids
         self.x_preview = x_preview
-        self.x_publish = x_publish
         self.openrouter_status = openrouter_status
         self.content_preview = content_preview
         self.content_publish = content_publish
@@ -112,7 +110,7 @@ class AdminDashboard:
                 except Exception as exc:
                     await event.reply(f"❌ {exc}")
                 else:
-                    await event.reply(preview, buttons=[[Button.inline("انتشار در کانال", b"xpublish")], [Button.inline("لغو", b"xcancel")]], parse_mode="html")
+                    await event.reply(preview, parse_mode="html")
 
     async def _handle_callback(self, event) -> None:
         data = event.data.decode("utf-8")
@@ -202,13 +200,6 @@ class AdminDashboard:
         elif data.startswith("cancel:"):
             self.pending.pop(data.split(":", 1)[1], None)
             await event.edit("لغو شد.")
-        elif data == "xpublish":
-            try:
-                result = await self.x_publish()
-            except Exception as exc:
-                await event.edit(f"❌ {exc}")
-            else:
-                await event.edit(result)
         elif data == "contentpublish":
             try:
                 result = await self.content_publish()
@@ -216,8 +207,6 @@ class AdminDashboard:
                 await event.edit(f"❌ {exc}", buttons=self._back_button())
             else:
                 await event.edit(result, buttons=self._back_button())
-        elif data == "xcancel":
-            await event.edit("لغو شد.")
 
     def _channels_text(self) -> str:
         values = runtime_config.values()
@@ -333,5 +322,5 @@ class AdminDashboard:
             "<b>محتوا (بدون AI)</b>\n/fixtures — برنامهٔ بازی‌های هفته\n/points — امتیازات آخرین بازی تمام‌شده\n/eo — مالکیت مؤثر\n/prices — پیش‌بینی قیمت LiveFPL\n/lineups — وضعیت دریافت خودکار ترکیب‌ها\n\n"
             "<b>انتشار از X</b>\n/x https://x.com/account/status/123\nیا x/https://x.com/account/status/123\n\n"
             "<b>تنظیمات</b>\n/channels\n/target @channel\n/source add @channel\n/source remove @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
-            "تمام تغییرات و انتشارها نیاز به تأیید دارند."
+            "تغییرات تنظیمات و انتشار محتوای داشبورد نیاز به تأیید دارند؛ پست‌های X مستقیماً برای بررسی در صف زمان‌بندی کانال قرار می‌گیرند."
         )

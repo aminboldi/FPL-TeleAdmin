@@ -30,6 +30,22 @@ class Post:
     media: list[Media] = field(default_factory=list)
 
 
+def _tweet_text(tweet: dict) -> str:
+    """Return the expanded text when X stores a long post as a Note Tweet."""
+    note_tweet = tweet.get("note_tweet") or {}
+    result = note_tweet.get("note_tweet_results", {}).get("result", {})
+    text = result.get("text")
+    if text:
+        return text.strip()
+    # Some RapidAPI response variants put the result one level higher.
+    result = tweet.get("note_tweet_results", {}).get("result", {})
+    text = result.get("text")
+    if text:
+        return text.strip()
+    legacy = tweet.get("legacy", {})
+    return (legacy.get("full_text") or tweet.get("text") or "").strip()
+
+
 def extract_post_id(url: str) -> str:
     match = _POST_ID_RE.search(url.strip())
     if not match:
@@ -81,7 +97,7 @@ def _to_post(tweet: dict, includes: dict) -> Post:
     keys = tweet.get("attachments", {}).get("media_keys", [])
     return Post(
         id=tweet["id"],
-        text=tweet.get("text", "").strip(),
+        text=_tweet_text(tweet),
         author=users.get(tweet.get("author_id"), "X"),
         media=[media_by_key[key] for key in keys if key in media_by_key],
     )
@@ -122,7 +138,7 @@ def _rapid_post(tweet: dict, author: str) -> Post:
             url = max(mp4, key=lambda variant: variant.get("bitrate", 0))["url"]
         if url:
             media.append(Media(url=url, kind=kind))
-    text = legacy.get("full_text", "").strip()
+    text = _tweet_text(tweet)
     # The source appends a t.co URL for attached media; Telegram gets the media
     # separately, so remove that redundant tail from the translated caption.
     text = re.sub(r"\s+https://t\.co/\S+$", "", text)
@@ -136,7 +152,7 @@ def _fetch_rapid_post_and_thread(url: str, key: str) -> list[Post]:
     for row in _walk(timeline):
         tweet_id = row.get("rest_id")
         legacy = row.get("legacy")
-        if not tweet_id or not isinstance(legacy, dict) or not legacy.get("full_text"):
+        if not tweet_id or not isinstance(legacy, dict) or not _tweet_text(row):
             continue
         previous = tweets.get(tweet_id)
         # GraphQL responses contain duplicate Tweet objects. Keep the version
@@ -176,7 +192,7 @@ def fetch_post_and_thread(url: str, token: str | None = None, rapidapi_key: str 
     post_id = extract_post_id(url)
     params = {
         "expansions": "author_id,attachments.media_keys",
-        "tweet.fields": "conversation_id,created_at",
+        "tweet.fields": "conversation_id,created_at,note_tweet",
         "user.fields": "username",
         "media.fields": "url,preview_image_url,variants,type",
     }
