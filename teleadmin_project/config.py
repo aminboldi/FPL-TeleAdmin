@@ -15,6 +15,8 @@ class Settings:
     openrouter_api_key: str
     openrouter_model: str
     fallback_model: str
+    google_aistudio_key: str | None
+    google_aistudio_model: str
     source_channel_id: str
     source_channel2_id: str | None
     target_channel_id: str
@@ -53,6 +55,8 @@ def load_config() -> Settings:
             "OPEN_ROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
         ),
         fallback_model="google/gemini-2.5-flash-lite",
+        google_aistudio_key=os.getenv("GOOGLE_AISTUDIO_KEY") or None,
+        google_aistudio_model=os.getenv("GOOGLE_AISTUDIO_MODEL", "gemini-3.1-flash-lite"),
         source_channel_id=os.getenv("SOURCE_CHANNEL_ID", ""),
         source_channel2_id=os.getenv("SOURCE_CHANNEL2_ID") or None,
         target_channel_id=os.getenv("TARGET_CHANNEL_ID", ""),

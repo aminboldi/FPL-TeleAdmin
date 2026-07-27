@@ -16,23 +16,45 @@ class TranslationError(Exception):
 
 
 class Translator:
-    def __init__(self, api_key: str, model: str, fallback_model: str):
-        self.client = AsyncOpenAI(
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        fallback_model: str,
+        google_api_key: str | None = None,
+        google_model: str = "gemini-3.1-flash-lite",
+    ):
+        self.openrouter_client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
             default_headers={
                 "X-Title": "TeleAdmin",
             },
         )
-        self.model = model
+        # Keep the constructor's model argument for compatibility with existing
+        # callers; the two-tier pipeline deliberately uses the configured
+        # fallback_model for OpenRouter.
+        self.openrouter_model = model
         self.fallback_model = fallback_model
+        self.google_client = (
+            AsyncOpenAI(
+                api_key=google_api_key,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
+            if google_api_key else None
+        )
+        self.google_model = google_model
 
     async def translate(self, text: str) -> str:
         try:
-            return await self._call_model(self.model, text)
+            if not self.google_client:
+                raise TranslationError("Google AI Studio is not configured")
+            return await self._call_model(self.google_client, self.google_model, text)
         except Exception:
             try:
-                return await self._call_model(self.fallback_model, text)
+                return await self._call_model(
+                    self.openrouter_client, self.fallback_model, text
+                )
             except Exception:
                 raise TranslationError(
                     "Translation failed with both primary and fallback models"
@@ -40,10 +62,14 @@ class Translator:
 
     async def translate_article(self, text: str) -> dict[str, str]:
         try:
-            return await self._call_article_model(self.model, text)
+            if not self.google_client:
+                raise TranslationError("Google AI Studio is not configured")
+            return await self._call_article_model(self.google_client, self.google_model, text)
         except Exception:
             try:
-                return await self._call_article_model(self.fallback_model, text)
+                return await self._call_article_model(
+                    self.openrouter_client, self.fallback_model, text
+                )
             except Exception:
                 pass
         # Fallback: translate normally and auto-generate title/summary
@@ -55,8 +81,8 @@ class Translator:
         summary = plain[:300].strip()
         return {"title": title, "summary": summary, "body": body}
 
-    async def _call_model(self, model: str, text: str) -> str:
-        response = await self.client.chat.completions.create(
+    async def _call_model(self, client: AsyncOpenAI, model: str, text: str) -> str:
+        response = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "user", "content": TRANSLATION_PROMPT.format(text=text)}
@@ -66,8 +92,10 @@ class Translator:
         )
         return response.choices[0].message.content.strip()
 
-    async def _call_article_model(self, model: str, text: str) -> dict[str, str]:
-        response = await self.client.chat.completions.create(
+    async def _call_article_model(
+        self, client: AsyncOpenAI, model: str, text: str
+    ) -> dict[str, str]:
+        response = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "user", "content": ARTICLE_PROMPT.format(text=text)}

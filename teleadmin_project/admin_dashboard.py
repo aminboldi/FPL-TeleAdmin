@@ -50,7 +50,7 @@ class AdminDashboard:
         return [
             [Button.inline("📊 لیگ‌ها", b"menu:leagues"), Button.inline("⚽ محتوا", b"menu:content")],
             [Button.inline("⚙️ مدیریت", b"menu:settings"), Button.inline("📤 X post", b"xhelp")],
-            [Button.inline("💳 اعتبار OpenRouter", b"openrouter"), Button.inline("❔ راهنما", b"guide")],
+            [Button.inline("💳 اعتبار APIها", b"openrouter"), Button.inline("❔ راهنما", b"guide")],
         ]
 
     @staticmethod

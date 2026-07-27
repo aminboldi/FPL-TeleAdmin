@@ -45,6 +45,8 @@ translator = Translator(
     api_key=settings.openrouter_api_key,
     model=settings.openrouter_model,
     fallback_model=settings.fallback_model,
+    google_api_key=settings.google_aistudio_key,
+    google_model=settings.google_aistudio_model,
 )
 
 _session_string = os.getenv("TELETHON_SESSION_STRING")
@@ -101,7 +103,7 @@ def _is_source_event(event) -> bool:
 
 
 def _refresh_translator_model() -> None:
-    translator.model = runtime_config.get("OPEN_ROUTER_MODEL")
+    translator.openrouter_model = runtime_config.get("OPEN_ROUTER_MODEL")
 
 
 def _get_reply_to(event) -> int | None:
@@ -770,20 +772,69 @@ def _fetch_openrouter_balance() -> dict:
     return response.json().get("data", response.json())
 
 
+def _fetch_google_aistudio_status() -> dict:
+    if not settings.google_aistudio_key:
+        return {"configured": False}
+    try:
+        response = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": settings.google_aistudio_key},
+            params={"pageSize": 100},
+            timeout=25,
+        )
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        return {"configured": True, "available": False, "error": str(exc)}
+    if not response.ok:
+        return {
+            "configured": True,
+            "available": False,
+            "error": data.get("error", {}).get("message", f"HTTP {response.status_code}"),
+        }
+    models = {
+        model.get("name", "").removeprefix("models/")
+        for model in data.get("models", [])
+        if "generateContent" in model.get("supportedGenerationMethods", [])
+    }
+    return {
+        "configured": True,
+        "available": True,
+        "model_available": settings.google_aistudio_model in models,
+    }
+
+
 async def _openrouter_balance() -> str:
-    data = await asyncio.to_thread(_fetch_openrouter_balance)
+    data, google = await asyncio.gather(
+        asyncio.to_thread(_fetch_openrouter_balance),
+        asyncio.to_thread(_fetch_google_aistudio_status),
+    )
     limit = data.get("limit")
     usage = data.get("usage")
     remaining = data.get("limit_remaining")
     def display(value):
         return "نامحدود" if value is None else str(value)
     tier = "رایگان" if data.get("is_free_tier") else "اعتباری"
+    google_status = "تنظیم نشده"
+    if google.get("configured"):
+        if google.get("available"):
+            connection = "متصل"
+            model_status = "فعال" if google.get("model_available") else "مدل پیدا نشد"
+            google_status = (
+                f"اتصال: <b>{connection}</b>\n"
+                f"مدل: <code>{settings.google_aistudio_model}</code> ({model_status})\n"
+                "مصرف/سهمیه: در API عمومی قابل دریافت نیست؛ در AI Studio قابل مشاهده است"
+            )
+        else:
+            google_status = f"خطا: <b>{_escape_html(google.get('error', 'نامشخص'))}</b>"
     return (
         "<b>💳 اعتبار OpenRouter</b>\n\n"
         f"نوع حساب: <b>{tier}</b>\n"
         f"سقف: <b>{display(limit)}</b>\n"
         f"مصرف: <b>{display(usage)}</b>\n"
-        f"مانده: <b>{display(remaining)}</b>"
+        f"مانده: <b>{display(remaining)}</b>\n\n"
+        "<b>🔹 Google AI Studio</b>\n\n"
+        f"{google_status}\n\n"
+        '<a href="https://aistudio.google.com/">مشاهدهٔ سهمیه در Google AI Studio</a>'
     )
 
 
