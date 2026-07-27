@@ -15,6 +15,7 @@ class AdminDashboard:
         client,
         admin_ids: set[int],
         x_preview: Callable[[str], Awaitable[str]],
+        youtube_import: Callable[[str], Awaitable[str]],
         openrouter_status: Callable[[], Awaitable[str]],
         content_preview: Callable[[str], Awaitable[str]],
         content_publish: Callable[[], Awaitable[str]],
@@ -22,6 +23,7 @@ class AdminDashboard:
         self.client = client
         self.admin_ids = admin_ids
         self.x_preview = x_preview
+        self.youtube_import = youtube_import
         self.openrouter_status = openrouter_status
         self.content_preview = content_preview
         self.content_publish = content_publish
@@ -64,9 +66,11 @@ class AdminDashboard:
     async def _handle_command(self, event) -> None:
         text = (event.raw_text or "").strip()
         # Accept the compact dashboard form as well as the standard Telegram
-        # command form: x/https://x.com/... and /x https://x.com/...
+        # Compact forms: x/https://x.com/... and y/https://youtube.com/...
         if text.lower().startswith("x/http://") or text.lower().startswith("x/https://"):
             text = "/x " + text[2:]
+        elif text.lower().startswith("y/http://") or text.lower().startswith("y/https://"):
+            text = "/y " + text[2:]
         if not text.startswith("/"):
             return
         command, _, arg = text.partition(" ")
@@ -111,6 +115,17 @@ class AdminDashboard:
                     await event.reply(f"❌ {exc}")
                 else:
                     await event.reply(preview, parse_mode="html")
+        elif command == "/y":
+            if not arg:
+                await event.reply("نمونه: <code>y/https://youtube.com/watch?v=...</code>", parse_mode="html")
+            else:
+                await event.reply("در حال دریافت ویدیو از یوتیوب…")
+                try:
+                    result = await self.youtube_import(arg)
+                except Exception as exc:
+                    await event.reply(f"❌ {exc}")
+                else:
+                    await event.reply(result, parse_mode="html")
 
     async def _handle_callback(self, event) -> None:
         data = event.data.decode("utf-8")
@@ -321,6 +336,7 @@ class AdminDashboard:
             "<b>لیگ‌ها</b>\n/league epl یا /league iran\n/activity epl یا /activity iran\n\n"
             "<b>محتوا (بدون AI)</b>\n/fixtures — برنامهٔ بازی‌های هفته\n/points — امتیازات آخرین بازی تمام‌شده\n/eo — مالکیت مؤثر\n/prices — پیش‌بینی قیمت LiveFPL\n/lineups — وضعیت دریافت خودکار ترکیب‌ها\n\n"
             "<b>انتشار از X</b>\n/x https://x.com/account/status/123\nیا x/https://x.com/account/status/123\n\n"
+            "<b>انتشار از YouTube</b>\n/y https://youtube.com/watch?v=...\nیا y/https://youtu.be/...\n\n"
             "<b>تنظیمات</b>\n/channels\n/target @channel\n/source add @channel\n/source remove @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
             "تغییرات تنظیمات و انتشار محتوای داشبورد نیاز به تأیید دارند؛ پست‌های X مستقیماً برای بررسی در صف زمان‌بندی کانال قرار می‌گیرند."
         )

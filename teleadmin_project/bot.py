@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+import yt_dlp
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
@@ -743,6 +745,62 @@ def _download_x_media(media: x_posts.Media) -> str:
     return temp.name
 
 
+def _is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+
+
+def _download_youtube_video(url: str) -> tuple[str, str, str]:
+    """Download one compatible YouTube video without requiring ffmpeg."""
+    if not _is_youtube_url(url):
+        raise RuntimeError("فقط لینک‌های YouTube قابل دریافت هستند.")
+    temp_dir = tempfile.mkdtemp(prefix="teleadmin-youtube-")
+    options = {
+        "format": "best[ext=mp4]",
+        "noplaylist": True,
+        "outtmpl": str(Path(temp_dir) / "%(title).150B [%(id)s].%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "restrictfilenames": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(url, download=True)
+            requested = info.get("requested_downloads") or []
+            file_path = requested[0].get("filepath") if requested else downloader.prepare_filename(info)
+        path = Path(file_path)
+        if not path.is_file():
+            raise RuntimeError("فایل دانلودشدهٔ ویدیو پیدا نشد.")
+        return str(path), temp_dir, info.get("title") or "ویدیو یوتیوب"
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+async def _import_youtube_video(url: str) -> str:
+    """Download a manual YouTube link, schedule it for review, then clean up."""
+    file_path = temp_dir = ""
+    try:
+        file_path, temp_dir, title = await asyncio.to_thread(_download_youtube_video, url)
+        _refresh_translator_model()
+        translated_title = _fix_unclosed_tags(
+            _strip_quotes(await translator.translate(_escape_html(title)))
+        )
+        caption = _build_caption(
+            translated_title, link_url=url, html=True, link_label="لینک منبع"
+        )
+        await _send_to_target(
+            caption, file_path=file_path, schedule_minutes=SCHEDULE_DELAY_MINUTES
+        )
+        return (
+            "✅ ویدیو برای بررسی، با تأخیر "
+            f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+        )
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 async def _schedule_x_posts(prepared: list[tuple[x_posts.Post, str]]) -> None:
     for post, caption in prepared:
         paths = []
@@ -953,6 +1011,7 @@ async def main():
             admin_client,
             settings.admin_user_ids,
             _prepare_x_post,
+            _import_youtube_video,
             _openrouter_balance,
             _prepare_dashboard_content,
             _publish_dashboard_content,
