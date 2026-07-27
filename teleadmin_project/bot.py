@@ -745,53 +745,28 @@ def _download_x_media(media: x_posts.Media) -> str:
     return temp.name
 
 
-async def _import_youtube_video(url: str) -> str:
-    """Import one YouTube video and, when possible, a translated caption article."""
-    temp_dir = ""
-    try:
-        details = await asyncio.to_thread(youtube_posts.get_video_details, url, settings.x_rapidapi_key)
-        temp_dir = tempfile.mkdtemp(prefix="teleadmin-youtube-")
-        file_path = await asyncio.to_thread(youtube_posts.download_video, details, Path(temp_dir))
-        logger.info("Downloaded YouTube video at %dp through RapidAPI", details.height)
-        _refresh_translator_model()
-        translated_title = _fix_unclosed_tags(
-            _strip_quotes(await translator.translate(_escape_html(details.title)))
-        )
-        caption = _build_caption(
-            translated_title, link_url=url, html=True, link_label="لینک منبع"
-        )
-        await _send_to_target(
-            caption, file_path=file_path, schedule_minutes=SCHEDULE_DELAY_MINUTES
-        )
-        message = (
-            "✅ ویدیو برای بررسی، با تأخیر "
-            f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
-        )
-        if not details.subtitle_url:
-            return message + "\nℹ️ زیرنویس انگلیسی پیدا نشد؛ مقاله ساخته نشد."
-        try:
-            transcript = await asyncio.to_thread(youtube_posts.download_transcript, details.subtitle_url)
-            article = await translator.translate_article(_escape_html(transcript))
-            article_title = _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
-            article_summary = _fix_unclosed_tags(_strip_quotes(article.get("summary", "")))
-            article_body = _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
-            if not article_body.strip():
-                raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
-            article_body += (
-                f'\n\n<p><a href="{_escape_html(url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a></p>'
-            )
-            telegraph_url = articles.publish_to_telegraph(article_title, article_body)
-            if not telegraph_url:
-                return message + "\nℹ️ ساخت مقاله در Telegraph ناموفق بود؛ فقط ویدیو منتشر می‌شود."
-            article_caption = _format_telegraph_post(article_title, article_summary, telegraph_url)
-            await _send_to_target(article_caption, schedule_minutes=SCHEDULE_DELAY_MINUTES)
-            return message + "\n✅ مقالهٔ فارسی زیرنویس نیز برای بررسی زمان‌بندی شد."
-        except Exception as exc:
-            logger.warning("YouTube caption article failed: %s", exc)
-            return message + "\nℹ️ ساخت مقاله از زیرنویس ناموفق بود؛ فقط ویدیو منتشر می‌شود."
-    finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+async def _import_youtube_transcript(url: str) -> str:
+    """Create a scheduled Persian article from a manual YouTube link's captions."""
+    transcript = await asyncio.to_thread(youtube_posts.fetch_english_transcript, url)
+    _refresh_translator_model()
+    article = await translator.translate_article(_escape_html(transcript))
+    article_title = _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
+    article_summary = _fix_unclosed_tags(_strip_quotes(article.get("summary", "")))
+    article_body = _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
+    if not article_body.strip():
+        raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
+    article_body += (
+        f'\n\n<p><a href="{_escape_html(url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a></p>'
+    )
+    telegraph_url = articles.publish_to_telegraph(article_title, article_body)
+    if not telegraph_url:
+        raise RuntimeError("ساخت مقاله در Telegraph ناموفق بود.")
+    article_caption = _format_telegraph_post(article_title, article_summary, telegraph_url)
+    await _send_to_target(article_caption, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+    return (
+        "✅ مقالهٔ فارسی برای بررسی، با تأخیر "
+        f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+    )
 
 
 async def _schedule_x_posts(prepared: list[tuple[x_posts.Post, str]]) -> None:
@@ -1004,7 +979,7 @@ async def main():
             admin_client,
             settings.admin_user_ids,
             _prepare_x_post,
-            _import_youtube_video,
+            _import_youtube_transcript,
             _openrouter_balance,
             _prepare_dashboard_content,
             _publish_dashboard_content,
