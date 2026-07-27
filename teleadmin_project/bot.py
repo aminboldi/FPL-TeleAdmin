@@ -747,7 +747,9 @@ def _download_x_media(media: x_posts.Media) -> str:
 
 async def _import_youtube_transcript(url: str) -> str:
     """Create a scheduled Persian article from a manual YouTube link's captions."""
-    transcript = await asyncio.to_thread(youtube_posts.fetch_english_transcript, url)
+    transcript = await asyncio.to_thread(
+        youtube_posts.fetch_english_transcript, url, settings.x_rapidapi_key
+    )
     _refresh_translator_model()
     article = await translator.translate_article(_escape_html(transcript))
     article_title = _fix_unclosed_tags(_strip_quotes(article.get("title", "")))

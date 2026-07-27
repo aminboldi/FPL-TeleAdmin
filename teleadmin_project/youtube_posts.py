@@ -1,14 +1,16 @@
-"""Retrieve English YouTube captions for the transcript-to-article import flow."""
+"""Retrieve English YouTube transcripts through the RapidAPI transcript service."""
 from __future__ import annotations
 
 import html
 import re
 from urllib.parse import parse_qs, urlparse
 
-from youtube_transcript_api import YouTubeTranscriptApi
+import requests
 
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_RAPID_HOST = "youtube-transcript3.p.rapidapi.com"
+_TRANSCRIPT_URL = f"https://{_RAPID_HOST}/api/transcript-with-url"
 
 
 class YouTubeImportError(Exception):
@@ -45,25 +47,32 @@ def _clean_lines(lines: list[str]) -> str:
     return "\n".join(result)
 
 
-def fetch_english_transcript(url: str) -> str:
-    """Fetch English manual captions first, then English auto-captions."""
-    video_id = extract_video_id(url)
+def fetch_english_transcript(url: str, rapidapi_key: str | None) -> str:
+    """Fetch a flattened English transcript through RapidAPI."""
+    extract_video_id(url)  # Validate the input before sending it to the provider.
+    if not rapidapi_key:
+        raise YouTubeImportError("برای دریافت زیرنویس، X_RAPIDAPI_KEY را تنظیم کنید.")
     try:
-        tracks = list(YouTubeTranscriptApi().list(video_id))
-        english_tracks = [
-            track for track in tracks
-            if str(getattr(track, "language_code", "")).lower().startswith("en")
-        ]
-        track = next((item for item in english_tracks if not item.is_generated), None)
-        track = track or next((item for item in english_tracks if item.is_generated), None)
-        if not track:
-            raise YouTubeImportError("زیرنویس انگلیسی برای این ویدیو در دسترس نیست.")
-        transcript = track.fetch()
-        text = _clean_lines([snippet.text for snippet in transcript])
-    except YouTubeImportError:
-        raise
-    except Exception as exc:
-        raise YouTubeImportError("دریافت زیرنویس YouTube ناموفق بود یا توسط YouTube مسدود شد.") from exc
+        response = requests.get(
+            _TRANSCRIPT_URL,
+            params={"url": url, "flat_text": "true", "lang": "en"},
+            headers={
+                "x-rapidapi-host": _RAPID_HOST,
+                "x-rapidapi-key": rapidapi_key,
+                "Content-Type": "application/json",
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise YouTubeImportError("دریافت زیرنویس از سرویس RapidAPI ناموفق بود.") from exc
+    if not isinstance(data, dict) or not data.get("success"):
+        raise YouTubeImportError("سرویس RapidAPI برای این ویدیو زیرنویس انگلیسی پیدا نکرد.")
+    transcript = data.get("transcript")
+    if not isinstance(transcript, str):
+        raise YouTubeImportError("سرویس RapidAPI پاسخ زیرنویس قابل استفاده‌ای نداد.")
+    text = _clean_lines(transcript.splitlines())
     if len(text) < 40:
         raise YouTubeImportError("زیرنویس انگلیسی قابل استفاده‌ای برای این ویدیو پیدا نشد.")
     return text
