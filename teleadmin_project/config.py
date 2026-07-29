@@ -27,6 +27,7 @@ class Settings:
     admin_user_ids: set[int]
     x_bearer_token: str | None
     x_rapidapi_key: str | None
+    youtube_api_key: str | None
 
 
 def load_config() -> Settings:
@@ -71,4 +72,5 @@ def load_config() -> Settings:
         },
         x_bearer_token=os.getenv("X_BEARER_TOKEN") or None,
         x_rapidapi_key=os.getenv("X_RAPIDAPI_KEY") or None,
+        youtube_api_key=os.getenv("YOUTUBE_API_KEY") or None,
     )

@@ -67,7 +67,11 @@ SIGNATURE = "@EPL_Fantasy"
 AI_SIGNATURE = "@EPL_Fantasy | \u2728AI"
 SCHEDULE_DELAY_MINUTES = 10
 _ALBUM_TIMEOUT = 5
-_ARTICLE_SOURCE_THRESHOLD = 350
+# Telegram media captions allow 1,024 rendered characters.  The AI signature
+# consumes 20 (including its leading line breaks); 940 leaves at least 58
+# characters for a source→Persian expansion and an optional visible link label.
+# HTML tags and link URLs are not counted after Telegram parses the caption.
+_ARTICLE_SOURCE_THRESHOLD = 940
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
 
 _album_buffer: dict[int, list] = {}
@@ -131,15 +135,19 @@ def _strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
-def _format_telegraph_post(title: str, summary: str, telegraph_url: str) -> str:
-    return (
+def _format_telegraph_post(
+    title: str, summary: str, telegraph_url: str, *, original_url: str | None = None,
+) -> str:
+    post = (
         f"<b>✍ مقاله:</b>\n\n"
         f"<b>{title}</b>\n\n"
         f"- - - - - - - - -\n\n"
         f"{summary}\n\n"
         f'<a href="{telegraph_url}">متن کامل مقاله: 👇👇👇</a>'
-        f"\n\n{AI_SIGNATURE}"
     )
+    if original_url:
+        post += f'\n\n<a href="{original_url}">مشاهدهٔ ویدیوی اصلی در YouTube</a>'
+    return f"{post}\n\n{AI_SIGNATURE}"
 
 
 def _message_to_html(text: str, entities: list | None) -> str:
@@ -731,12 +739,12 @@ def _x_text_to_html(text: str) -> str:
     return "".join(result)
 
 
-def _download_x_media(media: x_posts.Media) -> str:
-    response = requests.get(media.url, timeout=60)
+def _download_remote_media(url: str, kind: str) -> str:
+    response = requests.get(url, timeout=60)
     response.raise_for_status()
-    suffix = Path(urlparse(media.url).path).suffix
+    suffix = Path(urlparse(url).path).suffix
     if not suffix:
-        suffix = ".mp4" if media.kind in {"video", "animated_gif"} else ".jpg"
+        suffix = ".mp4" if kind in {"video", "animated_gif"} else ".jpg"
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         temp.write(response.content)
@@ -745,14 +753,24 @@ def _download_x_media(media: x_posts.Media) -> str:
     return temp.name
 
 
+def _download_x_media(media: x_posts.Media) -> str:
+    return _download_remote_media(media.url, media.kind)
+
+
 async def _import_youtube_transcript(url: str) -> str:
     """Create a scheduled Persian article from a manual YouTube link's captions."""
+    metadata = await asyncio.to_thread(
+        youtube_posts.fetch_video_metadata, url, settings.youtube_api_key
+    )
     transcript = await asyncio.to_thread(
         youtube_posts.fetch_english_transcript, url, settings.x_rapidapi_key
     )
     _refresh_translator_model()
+    translated_title = _fix_unclosed_tags(
+        _strip_quotes(await translator.translate(_escape_html(metadata.title)))
+    )
     article = await translator.translate_article(_escape_html(transcript))
-    article_title = _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
+    article_title = translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
     article_summary = _fix_unclosed_tags(_strip_quotes(article.get("summary", "")))
     article_body = _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
     if not article_body.strip():
@@ -763,8 +781,18 @@ async def _import_youtube_transcript(url: str) -> str:
     telegraph_url = articles.publish_to_telegraph(article_title, article_body)
     if not telegraph_url:
         raise RuntimeError("ساخت مقاله در Telegraph ناموفق بود.")
-    article_caption = _format_telegraph_post(article_title, article_summary, telegraph_url)
-    await _send_to_target(article_caption, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+    article_caption = _format_telegraph_post(
+        article_title, article_summary, telegraph_url, original_url=url,
+    )
+    thumbnail = await asyncio.to_thread(
+        _download_remote_media, metadata.thumbnail_url, "photo"
+    )
+    try:
+        await _send_to_target(
+            article_caption, file_path=thumbnail, schedule_minutes=SCHEDULE_DELAY_MINUTES,
+        )
+    finally:
+        Path(thumbnail).unlink(missing_ok=True)
     return (
         "✅ مقالهٔ فارسی برای بررسی، با تأخیر "
         f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
