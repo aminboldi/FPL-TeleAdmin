@@ -19,6 +19,10 @@ class AdminDashboard:
         openrouter_status: Callable[[], Awaitable[str]],
         content_preview: Callable[[str], Awaitable[str]],
         content_publish: Callable[[], Awaitable[str]],
+        youtube_add: Callable[[str, int], Awaitable[str]],
+        youtube_remove: Callable[[str, int], Awaitable[str]],
+        youtube_list: Callable[[], str],
+        translate_submission: Callable[[object], Awaitable[str]],
     ):
         self.client = client
         self.admin_ids = admin_ids
@@ -27,7 +31,12 @@ class AdminDashboard:
         self.openrouter_status = openrouter_status
         self.content_preview = content_preview
         self.content_publish = content_publish
+        self.youtube_add = youtube_add
+        self.youtube_remove = youtube_remove
+        self.youtube_list = youtube_list
+        self.translate_submission = translate_submission
         self.pending: dict[str, tuple[str, str, int]] = {}
+        self.pending_youtube: dict[str, tuple[str, str, int]] = {}
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -51,7 +60,8 @@ class AdminDashboard:
     def _dashboard_buttons():
         return [
             [Button.inline("📊 لیگ‌ها", b"menu:leagues"), Button.inline("⚽ محتوا", b"menu:content")],
-            [Button.inline("⚙️ مدیریت", b"menu:settings"), Button.inline("📤 X post", b"xhelp")],
+            [Button.inline("📺 پایش YouTube", b"youtube:list"), Button.inline("📤 X post", b"xhelp")],
+            [Button.inline("⚙️ مدیریت", b"menu:settings")],
             [Button.inline("💳 اعتبار APIها", b"openrouter"), Button.inline("❔ راهنما", b"guide")],
         ]
 
@@ -72,6 +82,13 @@ class AdminDashboard:
         elif text.lower().startswith("y/http://") or text.lower().startswith("y/https://"):
             text = "/y " + text[2:]
         if not text.startswith("/"):
+            await event.reply("در حال ترجمه و آماده‌سازی پست…")
+            try:
+                result = await self.translate_submission(event)
+            except Exception as exc:
+                await event.reply(f"❌ {exc}")
+            else:
+                await event.reply(result, parse_mode="html")
             return
         command, _, arg = text.partition(" ")
         command = command.split("@", 1)[0].lower()
@@ -126,6 +143,8 @@ class AdminDashboard:
                     await event.reply(f"❌ {exc}")
                 else:
                     await event.reply(result, parse_mode="html")
+        elif command == "/youtube":
+            await self._youtube_command(event, arg)
 
     async def _handle_callback(self, event) -> None:
         data = event.data.decode("utf-8")
@@ -135,6 +154,8 @@ class AdminDashboard:
             await event.answer("از /target @channel استفاده کنید.", alert=True)
         elif data == "xhelp":
             await event.answer("لینک را با /x ارسال کنید.", alert=True)
+        elif data == "youtube:list":
+            await event.edit(self.youtube_list(), buttons=self._back_button(), parse_mode="html")
         elif data == "back":
             await event.edit(self._main_text(), buttons=self._dashboard_buttons(), parse_mode="html")
         elif data == "guide":
@@ -222,6 +243,21 @@ class AdminDashboard:
                 await event.edit(f"❌ {exc}", buttons=self._back_button())
             else:
                 await event.edit(result, buttons=self._back_button())
+        elif data.startswith("youtubeconfirm:"):
+            token = data.split(":", 1)[1]
+            proposed = self.pending_youtube.pop(token, None)
+            if not proposed or proposed[2] != event.sender_id:
+                await event.answer("این درخواست منقضی شده است.", alert=True)
+                return
+            action, value, actor_id = proposed
+            try:
+                result = await (self.youtube_add(value, actor_id) if action == "add" else self.youtube_remove(value, actor_id))
+            except Exception as exc:
+                result = f"❌ {exc}"
+            await event.edit(result, parse_mode="html")
+        elif data.startswith("youtubecancel:"):
+            self.pending_youtube.pop(data.split(":", 1)[1], None)
+            await event.edit("لغو شد.")
 
     def _channels_text(self) -> str:
         values = runtime_config.values()
@@ -284,6 +320,31 @@ class AdminDashboard:
         else:
             await event.reply("نمونه: <code>/source add @channel</code>", parse_mode="html")
 
+    async def _youtube_command(self, event, arg: str) -> None:
+        action, _, value = arg.partition(" ")
+        value = value.strip()
+        if action in {"list", "ls"} or not action:
+            await event.reply(self.youtube_list(), parse_mode="html")
+            return
+        if action not in {"add", "remove"} or not value:
+            await event.reply(
+                "نمونه: <code>/youtube add https://youtube.com/@channel</code>\n"
+                "یا: <code>/youtube remove UC...</code>",
+                parse_mode="html",
+            )
+            return
+        token = secrets.token_urlsafe(8)
+        self.pending_youtube[token] = (action, value, event.sender_id)
+        verb = "افزودن" if action == "add" else "حذف"
+        await event.reply(
+            f"<b>تأیید {verb} کانال YouTube</b>\n\n<code>{value}</code>",
+            buttons=[[
+                Button.inline("تأیید", f"youtubeconfirm:{token}".encode()),
+                Button.inline("لغو", f"youtubecancel:{token}".encode()),
+            ]],
+            parse_mode="html",
+        )
+
     async def _league_text(self, which: str) -> str:
         key = "EPL_LEAGUE_ID" if which == "epl" else "IRAN_LEAGUE_ID"
         league_id = runtime_config.get(key)
@@ -337,6 +398,8 @@ class AdminDashboard:
             "<b>محتوا (بدون AI)</b>\n/fixtures — برنامهٔ بازی‌های هفته\n/points — امتیازات آخرین بازی تمام‌شده\n/eo — مالکیت مؤثر\n/prices — پیش‌بینی قیمت LiveFPL\n/lineups — وضعیت دریافت خودکار ترکیب‌ها\n\n"
             "<b>انتشار از X</b>\n/x https://x.com/account/status/123\nیا x/https://x.com/account/status/123\n\n"
             "<b>انتشار از YouTube</b>\n/y https://youtube.com/watch?v=...\nیا y/https://youtu.be/...\n\n"
+            "<b>ترجمهٔ مستقیم</b>\nهر متن، پست فورواردشده یا رسانه را بدون دستور ارسال کنید؛ خودکار ترجمه و در صف کانال قرار می‌گیرد.\n\n"
+            "<b>پایش YouTube</b>\n/youtube — فهرست کانال‌ها\n/youtube add https://youtube.com/@channel\n/youtube remove UC...\n\n"
             "<b>تنظیمات</b>\n/channels\n/target @channel\n/source add @channel\n/source remove @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
             "تغییرات تنظیمات و انتشار محتوای داشبورد نیاز به تأیید دارند؛ پست‌های X مستقیماً برای بررسی در صف زمان‌بندی کانال قرار می‌گیرند."
         )

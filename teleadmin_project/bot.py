@@ -30,6 +30,7 @@ import scheduler
 import runtime_config
 import x_posts
 import youtube_posts
+import youtube_monitor
 import livefpl
 from admin_dashboard import AdminDashboard
 
@@ -81,6 +82,7 @@ _album_caption: dict[int, str] = {}
 _chunk_buffer: dict[int, list] = {}
 _chunk_tasks: dict[int, asyncio.Task] = {}
 _pending_dashboard_content: str | None = None
+_admin_bot_client: TelegramClient | None = None
 
 
 def _target_channel() -> str:
@@ -142,11 +144,11 @@ def _format_telegraph_post(
         f"<b>✍ مقاله:</b>\n\n"
         f"<b>{title}</b>\n\n"
         f"- - - - - - - - -\n\n"
-        f"{summary}\n\n"
-        f'<a href="{telegraph_url}">متن کامل مقاله: 👇👇👇</a>'
+        f"{summary}"
     )
     if original_url:
         post += f'\n\n<a href="{original_url}">مشاهدهٔ ویدیوی اصلی در YouTube</a>'
+    post += f'\n\n<a href="{telegraph_url}">متن کامل مقاله: 👇👇👇</a>'
     return f"{post}\n\n{AI_SIGNATURE}"
 
 
@@ -208,6 +210,8 @@ _DIGIT_TRANS = str.maketrans(_PERSIAN_DIGITS, _ENGLISH_DIGITS)
 
 _HASHTAG_RE = re.compile(r"(^|\s)#(?=\w)")
 _URL_RE = re.compile(r"(?:https?://|t\.me/)\S+")
+_TCO_URL_RE = re.compile(r"https?://t\.co/\S+", re.IGNORECASE)
+_TRAILING_URL_PUNCTUATION = ".,!?;:)]}»”"
 
 
 def _escape_html(text: str) -> str:
@@ -249,6 +253,44 @@ def _extract_urls(event) -> list[str]:
     return urls
 
 
+def _canonical_link_url(url: str) -> str:
+    """Expand X's t.co link and use a canonical watch URL for youtu.be links."""
+    url = url.rstrip(_TRAILING_URL_PUNCTUATION)
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host == "youtu.be":
+        try:
+            return f"https://www.youtube.com/watch?v={youtube_posts.extract_video_id(url)}"
+        except youtube_posts.YouTubeImportError:
+            return url
+    if host != "t.co":
+        return url
+
+    try:
+        # t.co is X's redirector. HEAD avoids downloading the destination page;
+        # a small streamed GET covers destinations that do not accept HEAD.
+        response = requests.head(url, allow_redirects=True, timeout=15)
+        if response.status_code >= 400 or response.url == url:
+            response.close()
+            response = requests.get(url, allow_redirects=True, stream=True, timeout=15)
+        final_url = response.url.rstrip(_TRAILING_URL_PUNCTUATION)
+        response.close()
+    except requests.RequestException as exc:
+        logger.warning("Could not expand t.co URL %s: %s", url, exc)
+        return url
+    return _canonical_link_url(final_url) if final_url != url else url
+
+
+async def _display_link_url(urls: list[str]) -> str | None:
+    if not urls:
+        return None
+    return await asyncio.to_thread(_canonical_link_url, urls[0])
+
+
+def _expand_x_short_links(text: str) -> str:
+    return _TCO_URL_RE.sub(lambda match: _canonical_link_url(match.group(0)), text)
+
+
 def _clean_text(text: str, event=None) -> tuple[str | None, str | None]:
     text = _strip_hashtags(text)
     urls = _extract_urls(event) if event else []
@@ -270,7 +312,7 @@ def _build_caption(
         else:
             parts.append(_format_numbers(translated))
     if link_url:
-        parts.append(f'<a href="{link_url}">{link_label}</a>')
+        parts.append(f'<a href="{_escape_html(link_url)}">{link_label}</a>')
     if not parts:
         return AI_SIGNATURE
     return "\n\n".join(parts + [AI_SIGNATURE])
@@ -282,33 +324,38 @@ def _media_suffix(event) -> str:
     return ""
 
 
-async def _send_notification(event, caption: str):
-    notification_channel = _notification_channel()
-    if not notification_channel:
-        return
-
-    source = (
-        getattr(event.chat, "title", None)
-        or getattr(event.chat, "username", None)
-        or str(event.chat_id)
-    )
+async def _send_notification(event, caption: str, *, source: str | None = None, is_media: bool | None = None):
+    if source is None:
+        source = (
+            getattr(event.chat, "title", None)
+            or getattr(event.chat, "username", None)
+            or str(event.chat_id)
+        )
 
     preview = caption
     if len(preview) > 300:
         preview = preview[:300] + "..."
 
-    media_tag = "Media" if event.message.media else "Text"
+    media_tag = "Media" if (event.message.media if is_media is None else is_media) else "Text"
     notif = (
         f"<b>[{media_tag}] New post</b>\n"
         f"<b>Source:</b> {source}\n\n"
         f"{preview}"
     )
 
-    await client.send_message(
-        notification_channel,
-        notif,
-        parse_mode="html",
-    )
+    # The private dashboard bot is the primary notification surface. Keep the
+    # legacy channel as a fallback only when the dashboard is unavailable.
+    if _admin_bot_client:
+        for admin_id in settings.admin_user_ids:
+            try:
+                await _admin_bot_client.send_message(admin_id, notif, parse_mode="html")
+            except Exception as exc:
+                logger.warning("Could not notify admin %s: %s", admin_id, exc)
+        return
+
+    notification_channel = _notification_channel()
+    if notification_channel:
+        await client.send_message(notification_channel, notif, parse_mode="html")
 
 
 async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=None, is_album=False, schedule_minutes: int = 0):
@@ -467,7 +514,7 @@ async def _finish_album(gid: int):
                 html = _strip_hashtags(html)
                 html = _strip_quotes(html)
                 links = _extract_urls(first_evt)
-                link_url = links[0] if links else None
+                link_url = await _display_link_url(links)
                 for url in links:
                     html = html.replace(url, "")
                 html = html.strip()
@@ -558,7 +605,7 @@ async def handle_new_message(event):
     html = _strip_hashtags(html)
     html = _strip_quotes(html)
     links = _extract_urls(event)
-    link_url = links[0] if links else None
+    link_url = await _display_link_url(links)
     for url in links:
         html = html.replace(url, "")
     html = html.strip()
@@ -580,6 +627,7 @@ async def handle_new_message(event):
                 else:
                     caption = _build_caption(body, link_url=link_url, html=True)
                     await _forward_message(caption, event)
+                    await _send_notification(event, caption)
                     logger.info("Telegraph failed, posted inline")
             else:
                 translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
@@ -616,7 +664,7 @@ async def _finish_chunks(chat_id: int):
     html = _strip_hashtags(html)
     html = _strip_quotes(html)
     links = _extract_urls(first_evt)
-    link_url = links[0] if links else None
+    link_url = await _display_link_url(links)
     for url in links:
         html = html.replace(url, "")
     html = html.strip()
@@ -636,6 +684,7 @@ async def _finish_chunks(chat_id: int):
             else:
                 caption = _build_caption(body, link_url=link_url, html=True)
                 await _forward_message(caption, first_evt)
+                await _send_notification(first_evt, caption)
         except TranslationError as e:
             logger.error("Translation error for chunks: %s", e)
             return
@@ -691,6 +740,7 @@ async def _maybe_post_article(text: str, event):
                 article["title"], _strip_html_tags(summary), telegraph_url
             )
             await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+            await _send_notification(event, caption)
     except Exception as e:
         logger.error("Article post-processing error: %s", e)
 
@@ -710,6 +760,7 @@ async def _prepare_x_post(url: str) -> str:
             x_text = re.sub(r"(?<!\w)#\w+", "", post.text)
             x_text = re.sub(r"[ \t]{2,}", " ", x_text)
             x_text = re.sub(r" *\n *", "\n", x_text).strip()
+            x_text = await asyncio.to_thread(_expand_x_short_links, x_text)
             translated_source = _x_text_to_html(x_text)
             translated = _fix_unclosed_tags(
                 _strip_quotes(await translator.translate(translated_source))
@@ -771,7 +822,14 @@ async def _import_youtube_transcript(url: str) -> str:
     )
     article = await translator.translate_article(_escape_html(transcript))
     article_title = translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
-    article_summary = _fix_unclosed_tags(_strip_quotes(article.get("summary", "")))
+    translated_description = ""
+    if metadata.description:
+        translated_description = _fix_unclosed_tags(
+            _strip_quotes(await translator.translate(_escape_html(metadata.description)))
+        )
+    article_summary = translated_description or _fix_unclosed_tags(
+        _strip_quotes(article.get("summary", ""))
+    )
     article_body = _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
     if not article_body.strip():
         raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
@@ -791,10 +849,53 @@ async def _import_youtube_transcript(url: str) -> str:
         await _send_to_target(
             article_caption, file_path=thumbnail, schedule_minutes=SCHEDULE_DELAY_MINUTES,
         )
+        await _send_notification(
+            None, article_caption, source="YouTube", is_media=True,
+        )
     finally:
         Path(thumbnail).unlink(missing_ok=True)
     return (
         "✅ مقالهٔ فارسی برای بررسی، با تأخیر "
+        f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+    )
+
+
+async def _translate_dashboard_submission(event) -> str:
+    """Translate an admin's private bot submission through the normal pipeline."""
+    _refresh_translator_model()
+    text = event.message.text or ""
+    html = _strip_quotes(_strip_hashtags(_message_to_html(text, event.message.entities)))
+    links = _extract_urls(event)
+    link_url = await _display_link_url(links)
+    for url in links:
+        html = html.replace(url, "")
+    html = html.strip()
+
+    if html and len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
+        result = await translator.translate_article(html)
+        title = _fix_unclosed_tags(_strip_quotes(result.get("title", "")))
+        summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
+        body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+        telegraph_url = articles.publish_to_telegraph(title, body)
+        if telegraph_url:
+            caption = _format_telegraph_post(title, summary, telegraph_url)
+            await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+        else:
+            caption = _build_caption(body, link_url=link_url, html=True)
+            await _forward_message(caption, event)
+    elif html:
+        translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
+        caption = _build_caption(translated, link_url=link_url, html=True)
+        await _forward_message(caption, event)
+    elif event.message.media:
+        caption = AI_SIGNATURE
+        await _forward_message(caption, event)
+    else:
+        raise ValueError("متن یا رسانه‌ای برای ترجمه پیدا نشد.")
+
+    await _send_notification(event, caption)
+    return (
+        "✅ ترجمه برای بررسی، با تأخیر "
         f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
     )
 
@@ -810,6 +911,9 @@ async def _schedule_x_posts(prepared: list[tuple[x_posts.Post, str]]) -> None:
                 await _send_to_target(caption, file_path=paths[0], schedule_minutes=SCHEDULE_DELAY_MINUTES)
             else:
                 await _send_to_target(caption, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+            await _send_notification(
+                None, caption, source=f"X: @{post.author}", is_media=bool(post.media)
+            )
         finally:
             for path in paths:
                 try:
@@ -989,6 +1093,7 @@ async def _start_health_server():
 
 
 async def main():
+    global _admin_bot_client
     logger.info("Starting TeleAdmin bot...")
     logger.info("  Sources: %s", ", ".join(_source_channels()))
     logger.info("  Target : %s", _target_channel())
@@ -1013,7 +1118,16 @@ async def main():
             _openrouter_balance,
             _prepare_dashboard_content,
             _publish_dashboard_content,
+            lambda value, actor_id: asyncio.to_thread(
+                youtube_monitor.subscribe, value, settings.youtube_api_key, actor_id
+            ),
+            lambda value, actor_id: asyncio.to_thread(
+                youtube_monitor.unsubscribe, value, settings.youtube_api_key, actor_id
+            ),
+            youtube_monitor.list_channels,
+            _translate_dashboard_submission,
         )
+        _admin_bot_client = admin_client
         logger.info("Admin dashboard enabled for %d user(s)", len(settings.admin_user_ids))
     else:
         logger.warning("Admin dashboard disabled: set TELEGRAM_BOT_TOKEN and ADMIN_USER_IDS")
@@ -1032,6 +1146,7 @@ async def main():
             league_code=runtime_config.get("EPL_LEAGUE_CODE"),
             price_predictions_enabled=runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"),
         ),
+        youtube_monitor.run_monitor(settings.youtube_api_key, _import_youtube_transcript),
     ]
     if admin_client:
         tasks.append(admin_client.run_until_disconnected())

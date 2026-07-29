@@ -24,6 +24,7 @@ class YouTubeImportError(Exception):
 class VideoMetadata:
     title: str
     thumbnail_url: str
+    description: str
 
 
 def extract_video_id(url: str) -> str:
@@ -46,7 +47,7 @@ def extract_video_id(url: str) -> str:
 
 
 def fetch_video_metadata(url: str, youtube_api_key: str | None) -> VideoMetadata:
-    """Fetch a public video's title and best available thumbnail from YouTube."""
+    """Fetch a public video's title, description, and thumbnail from YouTube."""
     if not youtube_api_key:
         raise YouTubeImportError("برای دریافت عنوان و تصویر ویدیو، YOUTUBE_API_KEY را تنظیم کنید.")
     try:
@@ -70,6 +71,7 @@ def fetch_video_metadata(url: str, youtube_api_key: str | None) -> VideoMetadata
         raise YouTubeImportError("اطلاعات عمومی این ویدیوی YouTube پیدا نشد.")
 
     title = str(snippet.get("title") or "").strip()
+    description = str(snippet.get("description") or "").strip()
     thumbnails = snippet.get("thumbnails") or {}
     thumbnail_url = next(
         (
@@ -81,7 +83,11 @@ def fetch_video_metadata(url: str, youtube_api_key: str | None) -> VideoMetadata
     )
     if not title or not thumbnail_url:
         raise YouTubeImportError("عنوان یا تصویر این ویدیوی YouTube در دسترس نیست.")
-    return VideoMetadata(title=title, thumbnail_url=thumbnail_url)
+    return VideoMetadata(
+        title=title,
+        thumbnail_url=thumbnail_url,
+        description=description,
+    )
 
 
 def _clean_lines(lines: list[str]) -> str:

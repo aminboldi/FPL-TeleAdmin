@@ -10,6 +10,15 @@ TRANSLATION_PROMPT = _prompt_path.read_text(encoding="utf-8")
 _article_prompt_path = Path(__file__).parent / "article_prompt.txt"
 ARTICLE_PROMPT = _article_prompt_path.read_text(encoding="utf-8")
 
+# Translation providers occasionally return Persian or Arabic-Indic digits. All
+# bot output uses English digits, so normalize the provider response once here
+# instead of relying on every individual post formatter to remember it.
+_ENGLISH_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _normalize_digits(text: str) -> str:
+    return text.translate(_ENGLISH_DIGITS)
+
 
 class TranslationError(Exception):
     pass
@@ -49,11 +58,15 @@ class Translator:
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
-            return await self._call_model(self.google_client, self.google_model, text)
+            return _normalize_digits(
+                await self._call_model(self.google_client, self.google_model, text)
+            )
         except Exception:
             try:
-                return await self._call_model(
-                    self.openrouter_client, self.fallback_model, text
+                return _normalize_digits(
+                    await self._call_model(
+                        self.openrouter_client, self.fallback_model, text
+                    )
                 )
             except Exception:
                 raise TranslationError(
@@ -64,11 +77,15 @@ class Translator:
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
-            return await self._call_article_model(self.google_client, self.google_model, text)
+            return self._normalize_article(
+                await self._call_article_model(self.google_client, self.google_model, text)
+            )
         except Exception:
             try:
-                return await self._call_article_model(
-                    self.openrouter_client, self.fallback_model, text
+                return self._normalize_article(
+                    await self._call_article_model(
+                        self.openrouter_client, self.fallback_model, text
+                    )
                 )
             except Exception:
                 pass
@@ -80,6 +97,13 @@ class Translator:
         plain = re.sub(r"<[^>]+>", "", body)
         summary = plain[:300].strip()
         return {"title": title, "summary": summary, "body": body}
+
+    @staticmethod
+    def _normalize_article(article: dict[str, str]) -> dict[str, str]:
+        return {
+            key: _normalize_digits(value) if isinstance(value, str) else value
+            for key, value in article.items()
+        }
 
     async def _call_model(self, client: AsyncOpenAI, model: str, text: str) -> str:
         response = await client.chat.completions.create(

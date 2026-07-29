@@ -42,6 +42,19 @@ def init() -> None:
                 new_value TEXT NOT NULL,
                 changed_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS youtube_channels (
+                channel_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                uploads_playlist_id TEXT NOT NULL,
+                added_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS youtube_seen_videos (
+                video_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL REFERENCES youtube_channels(channel_id)
+                    ON DELETE CASCADE,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         now = datetime.now(timezone.utc).isoformat()
@@ -97,3 +110,82 @@ def recent_audit(limit: int = 8) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(zip(("actor_id", "key", "old_value", "new_value", "changed_at"), row)) for row in rows]
+
+
+def youtube_channels() -> list[dict]:
+    init()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT channel_id, title, uploads_playlist_id, added_at "
+            "FROM youtube_channels ORDER BY title COLLATE NOCASE"
+        ).fetchall()
+    return [
+        dict(zip(("channel_id", "title", "uploads_playlist_id", "added_at"), row))
+        for row in rows
+    ]
+
+
+def add_youtube_channel(
+    channel_id: str, title: str, uploads_playlist_id: str, actor_id: int
+) -> bool:
+    """Persist a monitored channel. Returns whether it was newly added."""
+    init()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT title FROM youtube_channels WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            "INSERT INTO youtube_channels "
+            "(channel_id, title, uploads_playlist_id, added_at) VALUES (?, ?, ?, ?)",
+            (channel_id, title, uploads_playlist_id, now),
+        )
+        conn.execute(
+            "INSERT INTO audit_log (actor_id, key, old_value, new_value, changed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (actor_id, "YOUTUBE_CHANNEL", "", f"added: {title} ({channel_id})", now),
+        )
+    return True
+
+
+def remove_youtube_channel(channel_id: str, actor_id: int) -> str | None:
+    """Remove a monitored channel and its remembered videos."""
+    init()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT title FROM youtube_channels WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        if not row:
+            return None
+        title = row[0]
+        conn.execute("DELETE FROM youtube_seen_videos WHERE channel_id=?", (channel_id,))
+        conn.execute("DELETE FROM youtube_channels WHERE channel_id=?", (channel_id,))
+        conn.execute(
+            "INSERT INTO audit_log (actor_id, key, old_value, new_value, changed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (actor_id, "YOUTUBE_CHANNEL", f"removed: {title} ({channel_id})", "", now),
+        )
+    return title
+
+
+def youtube_video_seen(video_id: str) -> bool:
+    init()
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM youtube_seen_videos WHERE video_id=?", (video_id,)
+        ).fetchone() is not None
+
+
+def mark_youtube_video(video_id: str, channel_id: str, state: str) -> None:
+    init()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO youtube_seen_videos (video_id, channel_id, state, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(video_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at",
+            (video_id, channel_id, state, now),
+        )
