@@ -17,10 +17,7 @@ class Settings:
     fallback_model: str
     google_aistudio_key: str | None
     google_aistudio_model: str
-    source_channel_id: str
-    source_channel2_id: str | None
     target_channel_id: str
-    notif_channel_id: str | None
     league_code: str
     price_predictions_enabled: bool
     telegram_bot_token: str | None
@@ -58,10 +55,7 @@ def load_config() -> Settings:
         fallback_model="google/gemini-2.5-flash-lite",
         google_aistudio_key=os.getenv("GOOGLE_AISTUDIO_KEY") or None,
         google_aistudio_model=os.getenv("GOOGLE_AISTUDIO_MODEL", "gemini-3.1-flash-lite"),
-        source_channel_id=os.getenv("SOURCE_CHANNEL_ID", ""),
-        source_channel2_id=os.getenv("SOURCE_CHANNEL2_ID") or None,
         target_channel_id=os.getenv("TARGET_CHANNEL_ID", ""),
-        notif_channel_id=os.getenv("NOTIF_CHANNEL_ID") or None,
         league_code=os.getenv("LEAGUE_CODE", "433b70"),
         price_predictions_enabled=os.getenv("PRICE_PREDICTIONS_ENABLED", "true").lower() != "false",
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,

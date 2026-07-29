@@ -108,8 +108,6 @@ class AdminDashboard:
                 await event.reply("شناسه کانال باید با @ شروع شود یا یک شناسه عددی باشد.")
             else:
                 await self._propose(event, "TARGET_CHANNEL_ID", arg)
-        elif command == "/source":
-            await self._source_command(event, arg)
         elif command == "/league":
             await self._league(event, arg or "epl")
         elif command == "/activity":
@@ -262,11 +260,8 @@ class AdminDashboard:
     def _channels_text(self) -> str:
         values = runtime_config.values()
         return (
-            "<b>📡 کانال‌ها</b>\n\n"
-            f"منبع ۱: <code>{values['SOURCE_CHANNEL_ID'] or '—'}</code>\n"
-            f"منبع ۲: <code>{values['SOURCE_CHANNEL2_ID'] or '—'}</code>\n"
-            f"مقصد: <code>{values['TARGET_CHANNEL_ID'] or '—'}</code>\n"
-            f"اعلان: <code>{values['NOTIF_CHANNEL_ID'] or '—'}</code>"
+            "<b>📡 کانال مقصد</b>\n\n"
+            f"مقصد: <code>{values['TARGET_CHANNEL_ID'] or '—'}</code>"
         )
 
     async def _propose(self, event, key: str, value: str) -> None:
@@ -286,39 +281,17 @@ class AdminDashboard:
         if not value:
             await event.reply("نمونه: <code>/set PRICE_PREDICTIONS_ENABLED false</code>", parse_mode="html")
             return
-        if key in {"SOURCE_CHANNEL_ID", "SOURCE_CHANNEL2_ID", "TARGET_CHANNEL_ID", "NOTIF_CHANNEL_ID"}:
+        if key == "TARGET_CHANNEL_ID":
             if not value.startswith("@") and not value.lstrip("-").isdigit():
                 await event.reply("شناسه کانال باید با @ شروع شود یا یک شناسه عددی باشد.")
                 return
-        if key.endswith("_ID") and key not in {"SOURCE_CHANNEL_ID", "SOURCE_CHANNEL2_ID", "TARGET_CHANNEL_ID", "NOTIF_CHANNEL_ID"} and not value.isdigit():
+        if key.endswith("_ID") and key != "TARGET_CHANNEL_ID" and not value.isdigit():
             await event.reply("شناسه لیگ باید عددی باشد.")
             return
         if key == "PRICE_PREDICTIONS_ENABLED" and value.lower() not in {"true", "false"}:
             await event.reply("مقدار باید true یا false باشد.")
             return
         await self._propose(event, key, value)
-
-    async def _source_command(self, event, arg: str) -> None:
-        action, _, channel = arg.partition(" ")
-        channel = channel.strip()
-        if action == "add":
-            slot = "SOURCE_CHANNEL_ID" if not runtime_config.get("SOURCE_CHANNEL_ID") else "SOURCE_CHANNEL2_ID"
-            if runtime_config.get(slot):
-                await event.reply("هر دو جایگاه منبع پر است؛ ابتدا یکی را حذف کنید.")
-                return
-            if not channel.startswith("@") and not channel.lstrip("-").isdigit():
-                await event.reply("شناسه کانال باید با @ شروع شود یا یک شناسه عددی باشد.")
-                return
-            await self._propose(event, slot, channel)
-        elif action == "remove":
-            if channel == runtime_config.get("SOURCE_CHANNEL_ID"):
-                await self._propose(event, "SOURCE_CHANNEL_ID", "")
-            elif channel == runtime_config.get("SOURCE_CHANNEL2_ID"):
-                await self._propose(event, "SOURCE_CHANNEL2_ID", "")
-            else:
-                await event.reply("این کانال در فهرست منابع نیست.")
-        else:
-            await event.reply("نمونه: <code>/source add @channel</code>", parse_mode="html")
 
     async def _youtube_command(self, event, arg: str) -> None:
         action, _, value = arg.partition(" ")
@@ -400,6 +373,6 @@ class AdminDashboard:
             "<b>انتشار از YouTube</b>\n/y https://youtube.com/watch?v=...\nیا y/https://youtu.be/...\n\n"
             "<b>ترجمهٔ مستقیم</b>\nهر متن، پست فورواردشده یا رسانه را بدون دستور ارسال کنید؛ خودکار ترجمه و در صف کانال قرار می‌گیرد.\n\n"
             "<b>پایش YouTube</b>\n/youtube — فهرست کانال‌ها\n/youtube add https://youtube.com/@channel\n/youtube remove UC...\n\n"
-            "<b>تنظیمات</b>\n/channels\n/target @channel\n/source add @channel\n/source remove @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
+            "<b>تنظیمات</b>\n/channels\n/target @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
             "تغییرات تنظیمات و انتشار محتوای داشبورد نیاز به تأیید دارند؛ پست‌های X مستقیماً برای بررسی در صف زمان‌بندی کانال قرار می‌گیرند."
         )

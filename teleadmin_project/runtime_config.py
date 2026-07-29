@@ -9,10 +9,7 @@ DB_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", Path(__file__).parent / "runtime
 
 DEFAULTS = {
     "OPEN_ROUTER_MODEL": os.getenv("OPEN_ROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
-    "SOURCE_CHANNEL_ID": os.getenv("SOURCE_CHANNEL_ID", ""),
-    "SOURCE_CHANNEL2_ID": os.getenv("SOURCE_CHANNEL2_ID", ""),
     "TARGET_CHANNEL_ID": os.getenv("TARGET_CHANNEL_ID", ""),
-    "NOTIF_CHANNEL_ID": os.getenv("NOTIF_CHANNEL_ID", ""),
     "PRICE_PREDICTIONS_ENABLED": os.getenv("PRICE_PREDICTIONS_ENABLED", "true"),
     "EPL_LEAGUE_CODE": os.getenv("EPL_LEAGUE_CODE", os.getenv("LEAGUE_CODE", "433b70")),
     "EPL_LEAGUE_ID": os.getenv("EPL_LEAGUE_ID", ""),
@@ -58,6 +55,10 @@ def init() -> None:
             """
         )
         now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "DELETE FROM settings WHERE key IN (?, ?, ?)",
+            ("SOURCE_CHANNEL_ID", "SOURCE_CHANNEL2_ID", "NOTIF_CHANNEL_ID"),
+        )
         for key, value in DEFAULTS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",

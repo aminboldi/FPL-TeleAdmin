@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import logging
 import os
 import re
@@ -59,11 +60,6 @@ client = TelegramClient(
     settings.telegram_api_hash,
 )
 
-
-_SOURCE_CHANNELS = [
-    c for c in (runtime_config.get("SOURCE_CHANNEL_ID"), runtime_config.get("SOURCE_CHANNEL2_ID")) if c
-]
-
 SIGNATURE = "@EPL_Fantasy"
 AI_SIGNATURE = "@EPL_Fantasy | \u2728AI"
 SCHEDULE_DELAY_MINUTES = 10
@@ -74,6 +70,7 @@ _ALBUM_TIMEOUT = 5
 # HTML tags and link URLs are not counted after Telegram parses the caption.
 _ARTICLE_SOURCE_THRESHOLD = 940
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
+_YOUTUBE_DESCRIPTION_PREVIEW_LIMIT = 500
 
 _album_buffer: dict[int, list] = {}
 _album_tasks: dict[int, asyncio.Task] = {}
@@ -87,27 +84,6 @@ _admin_bot_client: TelegramClient | None = None
 
 def _target_channel() -> str:
     return runtime_config.get("TARGET_CHANNEL_ID")
-
-
-def _notification_channel() -> str:
-    return runtime_config.get("NOTIF_CHANNEL_ID")
-
-
-def _source_channels() -> set[str]:
-    return {
-        value.lstrip("@").lower()
-        for value in (runtime_config.get("SOURCE_CHANNEL_ID"), runtime_config.get("SOURCE_CHANNEL2_ID"))
-        if value
-    }
-
-
-def _is_source_event(event) -> bool:
-    configured = _source_channels()
-    if not configured:
-        return False
-    chat = event.chat
-    username = getattr(chat, "username", "") or ""
-    return str(event.chat_id) in configured or username.lower() in configured
 
 
 def _refresh_translator_model() -> None:
@@ -137,6 +113,14 @@ def _strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
+def _youtube_description_preview(text: str) -> str:
+    """Return a caption-safe, plain-text preview of a translated description."""
+    text = html_lib.unescape(_strip_html_tags(text)).strip()
+    if len(text) > _YOUTUBE_DESCRIPTION_PREVIEW_LIMIT:
+        text = text[:_YOUTUBE_DESCRIPTION_PREVIEW_LIMIT - 1].rstrip() + "…"
+    return _escape_html(text)
+
+
 def _format_telegraph_post(
     title: str, summary: str, telegraph_url: str, *, original_url: str | None = None,
 ) -> str:
@@ -150,6 +134,20 @@ def _format_telegraph_post(
         post += f'\n\n<a href="{original_url}">مشاهدهٔ ویدیوی اصلی در YouTube</a>'
     post += f'\n\n<a href="{telegraph_url}">متن کامل مقاله: 👇👇👇</a>'
     return f"{post}\n\n{AI_SIGNATURE}"
+
+
+def _format_youtube_telegraph_post(
+    title: str, summary: str, telegraph_url: str, original_url: str, channel_title: str,
+) -> str:
+    return (
+        f"<b>▶️ ویدئوی جدید کانال {_escape_html(channel_title)}</b>\n\n"
+        f"<b>{title}</b>\n\n"
+        f"- - - - - - - - -\n\n"
+        f"{summary}\n\n"
+        f'<a href="{_escape_html(original_url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a>\n\n'
+        f'<a href="{_escape_html(telegraph_url)}">متن صحبت های ویدئو: 👇👇👇</a>\n\n'
+        f"{AI_SIGNATURE}"
+    )
 
 
 def _message_to_html(text: str, entities: list | None) -> str:
@@ -343,19 +341,13 @@ async def _send_notification(event, caption: str, *, source: str | None = None, 
         f"{preview}"
     )
 
-    # The private dashboard bot is the primary notification surface. Keep the
-    # legacy channel as a fallback only when the dashboard is unavailable.
+    # Notifications are delivered directly through the private dashboard bot.
     if _admin_bot_client:
         for admin_id in settings.admin_user_ids:
             try:
                 await _admin_bot_client.send_message(admin_id, notif, parse_mode="html")
             except Exception as exc:
                 logger.warning("Could not notify admin %s: %s", admin_id, exc)
-        return
-
-    notification_channel = _notification_channel()
-    if notification_channel:
-        await client.send_message(notification_channel, notif, parse_mode="html")
 
 
 async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=None, is_album=False, schedule_minutes: int = 0):
@@ -533,10 +525,7 @@ async def _finish_album(gid: int):
     await _send_notification(events[0], caption)
 
 
-@client.on(events.NewMessage())
 async def handle_new_message(event):
-    if not _is_source_event(event):
-        return
     _refresh_translator_model()
     text = event.message.text
     media = event.message.media
@@ -827,7 +816,7 @@ async def _import_youtube_transcript(url: str) -> str:
         translated_description = _fix_unclosed_tags(
             _strip_quotes(await translator.translate(_escape_html(metadata.description)))
         )
-    article_summary = translated_description or _fix_unclosed_tags(
+    article_summary = _youtube_description_preview(translated_description) if translated_description else _fix_unclosed_tags(
         _strip_quotes(article.get("summary", ""))
     )
     article_body = _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
@@ -839,8 +828,12 @@ async def _import_youtube_transcript(url: str) -> str:
     telegraph_url = articles.publish_to_telegraph(article_title, article_body)
     if not telegraph_url:
         raise RuntimeError("ساخت مقاله در Telegraph ناموفق بود.")
-    article_caption = _format_telegraph_post(
-        article_title, article_summary, telegraph_url, original_url=url,
+    article_caption = _format_youtube_telegraph_post(
+        article_title,
+        article_summary,
+        telegraph_url,
+        url,
+        metadata.channel_title,
     )
     thumbnail = await asyncio.to_thread(
         _download_remote_media, metadata.thumbnail_url, "photo"
@@ -1095,10 +1088,7 @@ async def _start_health_server():
 async def main():
     global _admin_bot_client
     logger.info("Starting TeleAdmin bot...")
-    logger.info("  Sources: %s", ", ".join(_source_channels()))
     logger.info("  Target : %s", _target_channel())
-    if _notification_channel():
-        logger.info("  Notif  : %s", _notification_channel())
     logger.info("  Model  : %s", runtime_config.get("OPEN_ROUTER_MODEL"))
 
     await client.start()
