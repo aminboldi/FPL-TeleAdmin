@@ -71,9 +71,7 @@ TELEGRAM_API_HASH=your_api_hash_here
 OPEN_ROUTER_API_KEY=sk-or-v1-...
 
 # Optional
-SOURCE_CHANNEL_ID=@sourcechannel
 TARGET_CHANNEL_ID=@targetchannel
-SOURCE_CHANNEL2_ID=@second_source
 NOTIF_CHANNEL_ID=@admin_notifications
 OPEN_ROUTER_MODEL=google/gemini-2.5-flash-lite
 GOOGLE_AISTUDIO_KEY=your_gemini_api_key
@@ -105,9 +103,7 @@ The bot is a long-lived process. Run it with a process manager (systemd, supervi
 | `OPEN_ROUTER_API_KEY`| Yes      | OpenRouter API key                             |
 | `GOOGLE_AISTUDIO_KEY` | No | Google AI Studio key used as the primary translator |
 | `GOOGLE_AISTUDIO_MODEL` | No | Google model (default: `gemini-3.1-flash-lite`) |
-| `SOURCE_CHANNEL_ID`  | No       | Initial primary source channel (dashboard-editable) |
 | `TARGET_CHANNEL_ID`  | No       | Initial target channel (dashboard-editable)    |
-| `SOURCE_CHANNEL2_ID` | No       | Secondary source channel                       |
 | `NOTIF_CHANNEL_ID`   | No       | Channel for admin scheduling notifications     |
 | `OPEN_ROUTER_MODEL`  | No       | LLM model (default: gemini-2.5-flash-lite)     |
 | `TELEGRAPH_ACCESS_TOKEN`  | No   | Telegraph API token for unified article account |
@@ -147,6 +143,11 @@ trail. The dashboard's editable operational settings are persisted in
 Coolify, mount the directory containing this file as persistent storage (or set
 `RUNTIME_CONFIG_PATH` to a database path inside a persistent volume), otherwise
 dashboard changes will be lost on redeploy.
+
+Telegram sources are also stored there, rather than in `.env`. Add or remove
+them from the dashboard with `/source add @sourcechannel` and
+`/source remove @sourcechannel`; use `/source` to list them. The TeleAdmin user
+account must be able to access a source channel before it can receive its posts.
 
 The X importer translates captions only and always shows a preview before
 publishing. When `X_RAPIDAPI_KEY` is configured it uses the subscribed `x-com2`

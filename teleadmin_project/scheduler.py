@@ -1,7 +1,7 @@
 """Scheduler for automated posts: price predictions, EO leaderboard, game points."""
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import database as db
 import livefpl
@@ -13,6 +13,7 @@ _IRAN_OFFSET = timedelta(hours=3, minutes=30)
 
 _PRICE_POSTED_KEY = "price_prediction_posted"
 _EO_POSTED_KEY = "eo_posted"
+_PRICE_CHANGES_RESUME_DATE = date(2026, 8, 21)
 
 
 def _now_iran() -> datetime:
@@ -111,6 +112,9 @@ async def _check_eo_post(client, target_channel):
 
 
 async def _check_price_post(client, target_channel, games, now_iran):
+    if now_iran.date() < _PRICE_CHANGES_RESUME_DATE:
+        return
+
     # Only post once per day
     today_key = _now_iran().strftime("%Y-%m-%d")
     key = f"{_PRICE_POSTED_KEY}_{today_key}"

@@ -15,9 +15,40 @@ ARTICLE_PROMPT = _article_prompt_path.read_text(encoding="utf-8")
 # instead of relying on every individual post formatter to remember it.
 _ENGLISH_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
+# Models occasionally preserve a fixture/team code despite the prompt.  Apply
+# this deterministic final pass to visible text only; HTML tags and attributes
+# (in particular URLs) must remain byte-for-byte intact.
+_TEAM_ABBREVIATIONS = {
+    "BOU": "بورنموث", "ARS": "آرسنال", "AVL": "استون ویلا", "BRE": "برنتفورد",
+    "BHA": "برایتون", "BUR": "برنلی", "CHE": "چلسی", "CRY": "کریستال پالاس",
+    "EVE": "اورتون", "FUL": "فولام", "LEE": "لیدز", "LIV": "لیورپول",
+    "MCI": "منچستر سیتی", "MUN": "منچستر یونایتد", "NEW": "نیوکاسل",
+    "NFO": "ناتینگهام فارست", "SUN": "ساندرلند", "TOT": "تاتنهام",
+    "WHU": "وست هم", "WOL": "ولوز", "BIR": "بیرمنگام", "BBR": "بلکبرن",
+    "BRC": "بریستول", "CHA": "چارلتون", "COV": "کاونتری", "DER": "داربی",
+    "HUL": "هال سیتی", "IPS": "ایپسویچ", "LEI": "لستر", "MID": "میدلزبرو",
+    "MIL": "میلوال", "NOR": "نوریچ", "OXF": "آکسفورد", "POR": "پورتموث",
+    "PNE": "پرستون", "QPR": "کیو پی آر", "SHU": "شفیلد یونایتد",
+    "SHW": "شفیلد ونزدی", "SOU": "ساوتهمپتون", "STO": "استوک", "SWA": "سوانزی",
+    "WAT": "واتفورد", "WBA": "وست بروم", "WXH": "رکسهم",
+}
+_TEAM_ABBREVIATION_RE = re.compile(
+    r"\b(?:" + "|".join(_TEAM_ABBREVIATIONS) + r")\b"
+)
+
 
 def _normalize_digits(text: str) -> str:
     return text.translate(_ENGLISH_DIGITS)
+
+
+def _translate_team_abbreviations(text: str) -> str:
+    """Replace remaining all-caps team codes without touching HTML markup."""
+    parts = re.split(r"(<[^>]*>)", text)
+    for index in range(0, len(parts), 2):
+        parts[index] = _TEAM_ABBREVIATION_RE.sub(
+            lambda match: _TEAM_ABBREVIATIONS[match.group(0)], parts[index]
+        )
+    return "".join(parts)
 
 
 class TranslationError(Exception):
@@ -58,16 +89,16 @@ class Translator:
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
-            return _normalize_digits(
+            return _translate_team_abbreviations(_normalize_digits(
                 await self._call_model(self.google_client, self.google_model, text)
-            )
+            ))
         except Exception:
             try:
-                return _normalize_digits(
+                return _translate_team_abbreviations(_normalize_digits(
                     await self._call_model(
                         self.openrouter_client, self.fallback_model, text
                     )
-                )
+                ))
             except Exception:
                 raise TranslationError(
                     "Translation failed with both primary and fallback models"
@@ -101,7 +132,8 @@ class Translator:
     @staticmethod
     def _normalize_article(article: dict[str, str]) -> dict[str, str]:
         return {
-            key: _normalize_digits(value) if isinstance(value, str) else value
+            key: _translate_team_abbreviations(_normalize_digits(value))
+            if isinstance(value, str) else value
             for key, value in article.items()
         }
 

@@ -9,8 +9,12 @@ Return your response as a JSON object with exactly three fields:
 }
 
 Constraints for the body:
-- The input may contain HTML formatting tags (<b>, <i>, <s>, <u>, <code>, <pre>, <blockquote>, <a href="...">, <h3>, <img>). Preserve ALL HTML tags and attributes EXACTLY.
-- Maintain all original layout paragraph breaks and emojis exactly.
+- Return valid Telegraph HTML only; never use Markdown. Telegraph supports: <p>, <br>, <h3>, <h4>, <b>, <strong>, <i>, <em>, <blockquote>, <ul>, <ol>, <li>, <hr>, <code>, <pre>, <a href="...">, <img>, and <figure>.
+- The input may contain HTML formatting tags. Preserve every existing tag and every existing attribute EXACTLY. You may add only the supported Telegraph tags above around plain text to make the article readable.
+- Format the body as a real article, never as one continuous block: use <p>...</p> for short, coherent paragraphs (normally 1–3 related sentences) and insert paragraph breaks generously whenever the topic, speaker, or point changes.
+- Use <h3> or <h4> only for genuine section changes that improve scanning. Use <ul>/<ol> with <li> for real enumerations, steps, comparisons, or grouped recommendations; do not turn ordinary prose into a list.
+- When the source clearly contains dialogue, quoted speech, or a speaker attribution, give each distinct quotation its own <blockquote>. Keep the speaker attribution in <b>...</b> when present. Do not invent speakers, quotes, headings, or lists.
+- Preserve emojis and meaningful existing layout, but improve unstructured transcript text into the readable HTML structure above.
 - Do NOT translate or modify HTML tag attributes.
 
 FPL Terminology:

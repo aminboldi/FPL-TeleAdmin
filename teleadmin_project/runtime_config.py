@@ -52,6 +52,12 @@ def init() -> None:
                 state TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS telegram_sources (
+                channel_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                added_at TEXT NOT NULL
+            );
             """
         )
         now = datetime.now(timezone.utc).isoformat()
@@ -190,3 +196,84 @@ def mark_youtube_video(video_id: str, channel_id: str, state: str) -> None:
             "ON CONFLICT(video_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at",
             (video_id, channel_id, state, now),
         )
+
+
+def telegram_sources() -> list[dict]:
+    """Return the persisted Telegram channels that feed the translation flow."""
+    init()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT channel_id, title, source_ref, added_at "
+            "FROM telegram_sources ORDER BY title COLLATE NOCASE"
+        ).fetchall()
+    return [
+        dict(zip(("channel_id", "title", "source_ref", "added_at"), row))
+        for row in rows
+    ]
+
+
+def is_telegram_source(channel_id: int) -> bool:
+    init()
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM telegram_sources WHERE channel_id=?", (channel_id,)
+        ).fetchone() is not None
+
+
+def telegram_source_by_reference(reference: str) -> dict | None:
+    """Look up a source by its saved @username or numeric channel ID."""
+    init()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT channel_id, title, source_ref, added_at FROM telegram_sources "
+            "WHERE source_ref=? OR CAST(channel_id AS TEXT)=?",
+            (reference, reference.lstrip("-")),
+        ).fetchone()
+    if not row:
+        return None
+    return dict(zip(("channel_id", "title", "source_ref", "added_at"), row))
+
+
+def add_telegram_source(
+    channel_id: int, title: str, source_ref: str, actor_id: int,
+) -> bool:
+    """Persist a source channel. Returns whether it was newly added."""
+    init()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT title FROM telegram_sources WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            "INSERT INTO telegram_sources (channel_id, title, source_ref, added_at) "
+            "VALUES (?, ?, ?, ?)",
+            (channel_id, title, source_ref, now),
+        )
+        conn.execute(
+            "INSERT INTO audit_log (actor_id, key, old_value, new_value, changed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (actor_id, "TELEGRAM_SOURCE", "", f"added: {title} ({source_ref})", now),
+        )
+    return True
+
+
+def remove_telegram_source(channel_id: int, actor_id: int) -> str | None:
+    """Remove a source channel and return its title when it existed."""
+    init()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT title, source_ref FROM telegram_sources WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        if not row:
+            return None
+        title, source_ref = row
+        conn.execute("DELETE FROM telegram_sources WHERE channel_id=?", (channel_id,))
+        conn.execute(
+            "INSERT INTO audit_log (actor_id, key, old_value, new_value, changed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (actor_id, "TELEGRAM_SOURCE", f"removed: {title} ({source_ref})", "", now),
+        )
+    return title

@@ -14,6 +14,10 @@ _RAPID_HOST = "youtube-transcript3.p.rapidapi.com"
 _TRANSCRIPT_URL = f"https://{_RAPID_HOST}/api/transcript-with-url"
 _YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 _THUMBNAIL_PREFERENCE = ("maxres", "standard", "high", "medium", "default")
+_DESCRIPTION_LINK_RE = re.compile(
+    r"(?:https?://|www\.)\S+|\b(?:[\w-]+\.)+(?:com|net|org|io|co|me|tv|gg|fm|ly|be|app|ai)(?:/\S*)?",
+    re.IGNORECASE,
+)
 
 
 class YouTubeImportError(Exception):
@@ -26,6 +30,28 @@ class VideoMetadata:
     thumbnail_url: str
     description: str
     channel_title: str
+
+
+def description_before_first_link_sentence(description: str) -> str:
+    """Keep the editorial introduction and remove the link-led promo section.
+
+    YouTube descriptions commonly switch to sponsorship and social links after
+    the first sentence containing a URL.  The first such sentence and all text
+    after it are deliberately excluded from the channel post.
+    """
+    match = _DESCRIPTION_LINK_RE.search(description)
+    if not match:
+        return description.strip()
+
+    # A blank line is also treated as a sentence boundary: creators often put
+    # the promotional link on its own line without ending the preceding copy.
+    starts = [0]
+    starts.extend(
+        boundary.end()
+        for boundary in re.finditer(r"(?<=[.!?])\s+|\n+", description)
+        if boundary.end() <= match.start()
+    )
+    return description[:starts[-1]].strip()
 
 
 def extract_video_id(url: str) -> str:

@@ -2,10 +2,13 @@
 import logging
 import os
 import re
+from html import escape
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 from telegraph import Telegraph
+import trafilatura
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,23 @@ _SHORT_URL_RE = re.compile(
 _TCO_URL_RE = re.compile(
     r"https?://t\.co/\S+"
 )
+
+_GENERAL_ARTICLE_MIN_CHARS = 500
+_PAYWALL_MARKERS = (
+    "subscribe to continue",
+    "subscribe to read",
+    "sign in to continue",
+    "sign in to read",
+    "this content is for subscribers",
+    "this article is for subscribers",
+    "subscriber-only content",
+    "premium content",
+)
+_TELEGRAPH_TAGS = {
+    "a", "b", "blockquote", "br", "code", "em", "figure", "figcaption",
+    "h3", "h4", "hr", "i", "img", "li", "ol", "p", "pre", "s",
+    "strong", "u", "ul",
+}
 
 _telegraph: Telegraph | None = None
 
@@ -98,7 +118,7 @@ def _ensure_https(url: str) -> str:
     return url
 
 
-def fetch_article(url: str) -> dict | None:
+def _fetch_pl_article(url: str) -> dict | None:
     if not url.startswith("http"):
         url = "https://" + url
     try:
@@ -169,6 +189,132 @@ def fetch_article(url: str) -> dict | None:
     }
 
 
+def _metadata_content(soup: BeautifulSoup, *names: str) -> str:
+    for name in names:
+        tag = soup.find("meta", attrs={"property": name}) or soup.find(
+            "meta", attrs={"name": name}
+        )
+        if tag and tag.get("content"):
+            return str(tag["content"]).strip()
+    return ""
+
+
+def _telegraph_safe_article_html(extracted_html: str, base_url: str) -> tuple[str, list[str]]:
+    """Keep reader-mode structure while restricting it to Telegraph-safe HTML."""
+    soup = BeautifulSoup(extracted_html, "html.parser")
+    for tag in soup.find_all(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    images: list[str] = []
+    for tag in soup.find_all(True):
+        if tag.name in {"h1", "h2"}:
+            tag.name = "h3"
+        elif tag.name not in _TELEGRAPH_TAGS:
+            tag.unwrap()
+            continue
+
+        if tag.name == "img":
+            src = str(tag.get("src") or "").strip()
+            src = urljoin(base_url, src)
+            if not src.startswith(("http://", "https://")):
+                tag.decompose()
+                continue
+            tag.attrs = {"src": src}
+            images.append(src)
+        elif tag.name == "a":
+            href = str(tag.get("href") or "").strip()
+            href = urljoin(base_url, href)
+            tag.attrs = {"href": href} if href.startswith(("http://", "https://")) else {}
+        else:
+            tag.attrs = {}
+
+    root = soup.body or soup
+    html = "".join(str(child) for child in root.contents).strip()
+    return html, list(dict.fromkeys(images))
+
+
+def _source_article_images(soup: BeautifulSoup, base_url: str) -> list[str]:
+    """Collect article-local image URLs when reader-mode output omits them."""
+    container = soup.find("article") or soup.find("main") or soup
+    images = []
+    for image in container.find_all("img"):
+        src = image.get("src") or image.get("data-src") or image.get("data-original")
+        if not src:
+            continue
+        src = urljoin(base_url, str(src).strip())
+        if src.startswith(("http://", "https://")):
+            images.append(src)
+    if not images:
+        og_image = _metadata_content(soup, "og:image", "twitter:image")
+        if og_image:
+            images.append(urljoin(base_url, og_image))
+    return list(dict.fromkeys(images))
+
+
+def fetch_general_article(url: str) -> dict | None:
+    """Extract a readable, server-rendered article from an arbitrary web page."""
+    if not url.startswith(("http://", "https://")):
+        return None
+    try:
+        response = requests.get(url, headers=_HEADERS, timeout=20, allow_redirects=True)
+    except requests.RequestException as exc:
+        logger.info("Could not fetch general article %s: %s", url, exc)
+        return None
+
+    if response.status_code in {401, 402, 403, 451}:
+        logger.info("Skipping blocked or paywalled article %s", url)
+        return None
+    if not response.ok or "html" not in response.headers.get("content-type", "").lower():
+        return None
+
+    extracted = trafilatura.extract(
+        response.text,
+        url=response.url,
+        output_format="html",
+        include_comments=False,
+        include_formatting=True,
+        include_links=True,
+        include_images=True,
+        favor_precision=True,
+        deduplicate=True,
+    )
+    if not extracted:
+        return None
+
+    content_html, images = _telegraph_safe_article_html(extracted, response.url)
+    readable_text = BeautifulSoup(content_html, "html.parser").get_text(" ", strip=True)
+    if len(readable_text) < _GENERAL_ARTICLE_MIN_CHARS:
+        return None
+
+    page_lower = response.text.lower()
+    if len(readable_text) < 2000 and any(marker in page_lower for marker in _PAYWALL_MARKERS):
+        logger.info("Skipping likely paywalled article %s", response.url)
+        return None
+
+    page = BeautifulSoup(response.text, "html.parser")
+    if not images:
+        images = _source_article_images(page, response.url)
+    title = _metadata_content(page, "og:title", "twitter:title") or (
+        page.title.get_text(" ", strip=True) if page.title else ""
+    )
+    if not title:
+        return None
+    return {
+        "title": title,
+        "summary": _metadata_content(page, "og:description", "description"),
+        "url": response.url,
+        "html": content_html,
+        "images": images,
+    }
+
+
+def fetch_article(url: str) -> dict | None:
+    """Use the site-specific extractor when available, reader mode otherwise."""
+    if is_pl_article_url(url):
+        return _fetch_pl_article(url)
+    return fetch_general_article(url)
+
+
 def build_article_html(title: str, date: str, summary: str, parts: list[dict], original_url: str, header_image: str = "") -> str:
     result = [f"<h3>{title}</h3>"]
     if date:
@@ -185,6 +331,24 @@ def build_article_html(title: str, date: str, summary: str, parts: list[dict], o
             result.append(f'<img src="{src}">')
     result.append(f'<p><a href="{original_url}">پست اصلی</a></p>')
     return "".join(result)
+
+
+def build_general_article_html(article: dict) -> str:
+    """Wrap reader-mode content with a title and canonical source link."""
+    return (
+        f"<h3>{escape(article['title'])}</h3>"
+        f"{article['html']}"
+        f'<p><a href="{escape(article["url"], quote=True)}">پست اصلی</a></p>'
+    )
+
+
+def restore_missing_images(html_content: str, image_urls: list[str]) -> str:
+    """Append any source images omitted by the model to the Telegraph article."""
+    present = set(re.findall(r'<img[^>]+src=["\']([^"\']+)', html_content, re.IGNORECASE))
+    missing = [url for url in image_urls if url and url not in present]
+    if not missing:
+        return html_content
+    return html_content + "".join(f'<img src="{escape(url, quote=True)}">' for url in missing)
 
 
 def publish_to_telegraph(title: str, html_content: str) -> str | None:

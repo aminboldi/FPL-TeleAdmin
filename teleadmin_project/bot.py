@@ -16,6 +16,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
+    Channel,
     MessageEntityBlockquote,
     MessageEntityTextUrl,
 )
@@ -71,6 +72,9 @@ _ALBUM_TIMEOUT = 5
 _ARTICLE_SOURCE_THRESHOLD = 940
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
 _YOUTUBE_DESCRIPTION_PREVIEW_LIMIT = 500
+# Photo captions are limited to 1,024 rendered characters.  This leaves room
+# for the YouTube header, title, original-video link, and AI signature.
+_YOUTUBE_INLINE_TRANSCRIPT_LIMIT = 800
 
 _album_buffer: dict[int, list] = {}
 _album_tasks: dict[int, asyncio.Task] = {}
@@ -84,6 +88,72 @@ _admin_bot_client: TelegramClient | None = None
 
 def _target_channel() -> str:
     return runtime_config.get("TARGET_CHANNEL_ID")
+
+
+def _telegram_source_list() -> str:
+    sources = runtime_config.telegram_sources()
+    if not sources:
+        return "هیچ کانال تلگرامی به‌عنوان منبع ثبت نشده است."
+    rows = [
+        f"<blockquote><b>{_escape_html(source['title'])}</b>\n<code>{_escape_html(source['source_ref'])}</code></blockquote>"
+        for source in sources
+    ]
+    return "<b>📡 کانال‌های منبع تلگرام</b>\n\n" + "\n".join(rows)
+
+
+def _normalise_source_reference(value: str) -> str:
+    value = value.strip()
+    if value.startswith("@") or value.lstrip("-").isdigit():
+        return value
+    parsed = urlparse(value if "://" in value else f"https://t.me/{value.lstrip('@')}")
+    if (parsed.hostname or "").lower() in {"t.me", "www.t.me", "telegram.me"}:
+        part = parsed.path.strip("/").split("/", 1)[0]
+        if part and not part.startswith("+"):
+            return f"@{part}"
+    raise ValueError("شناسهٔ کانال را به شکل @channel یا لینک t.me ارسال کنید.")
+
+
+async def _resolve_telegram_source(value: str) -> tuple[int, str, str]:
+    reference = _normalise_source_reference(value)
+    try:
+        entity = await client.get_entity(reference)
+    except Exception as exc:
+        raise ValueError("کانال پیدا نشد؛ مطمئن شوید حساب TeleAdmin به آن دسترسی دارد.") from exc
+    if not isinstance(entity, Channel) or not entity.broadcast:
+        raise ValueError("فقط کانال‌های تلگرامی می‌توانند منبع باشند.")
+    title = (entity.title or entity.username or str(entity.id)).strip()
+    source_ref = f"@{entity.username}" if entity.username else str(entity.id)
+    return entity.id, title, source_ref
+
+
+async def _add_telegram_source(value: str, actor_id: int) -> str:
+    channel_id, title, source_ref = await _resolve_telegram_source(value)
+    if not runtime_config.add_telegram_source(channel_id, title, source_ref, actor_id):
+        return f"<b>{_escape_html(title)}</b> از قبل در فهرست منابع است."
+    return f"✅ کانال <b>{_escape_html(title)}</b> به فهرست منابع اضافه شد."
+
+
+async def _remove_telegram_source(value: str, actor_id: int) -> str:
+    reference = _normalise_source_reference(value)
+    try:
+        channel_id, title, _ = await _resolve_telegram_source(reference)
+    except ValueError:
+        stored = runtime_config.telegram_source_by_reference(reference)
+        if not stored:
+            raise
+        channel_id = stored["channel_id"]
+        title = stored["title"]
+    removed = runtime_config.remove_telegram_source(channel_id, actor_id)
+    if not removed:
+        return f"<b>{_escape_html(title)}</b> در فهرست منابع نیست."
+    return f"✅ کانال <b>{_escape_html(removed)}</b> از فهرست منابع حذف شد."
+
+
+async def _handle_configured_source_message(event) -> None:
+    channel_id = getattr(getattr(event.message, "peer_id", None), "channel_id", None)
+    if channel_id is None or not runtime_config.is_telegram_source(channel_id):
+        return
+    await handle_new_message(event)
 
 
 def _refresh_translator_model() -> None:
@@ -145,7 +215,19 @@ def _format_youtube_telegraph_post(
         f"- - - - - - - - -\n\n"
         f"{summary}\n\n"
         f'<a href="{_escape_html(original_url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a>\n\n'
-        f'<a href="{_escape_html(telegraph_url)}">متن صحبت های ویدئو: 👇👇👇</a>\n\n'
+        f'<b><a href="{_escape_html(telegraph_url)}">👈👈متن کامل فارسی ویدئو👉👉</a></b>\n\n'
+        f"{AI_SIGNATURE}"
+    )
+
+
+def _format_youtube_inline_post(
+    title: str, transcript: str, original_url: str, channel_title: str,
+) -> str:
+    return (
+        f"<b>▶️ ویدئوی جدید کانال {_escape_html(channel_title)}</b>\n\n"
+        f"<b>{title}</b>\n\n"
+        f"{transcript}\n\n"
+        f'<a href="{_escape_html(original_url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a>\n\n'
         f"{AI_SIGNATURE}"
     )
 
@@ -420,7 +502,10 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
         return msg
 
 
-async def _post_price_changes(farsi_text: str):
+async def _post_price_changes(farsi_text: str | list, fallers: list | None = None):
+    """Post a complete price update or the partial update released by its timer."""
+    if not isinstance(farsi_text, str):
+        farsi_text = price_changes.format_price_changes_farsi(farsi_text, fallers or [])
     await _send_to_target(farsi_text)
     logger.info("Posted price changes to %s", _target_channel())
 
@@ -429,6 +514,41 @@ async def _send_alert(farsi_text: str, event):
     await _send_to_target(farsi_text, event=event)
     logger.info("Sent game alert to %s", _target_channel())
     await _send_notification(event, farsi_text)
+
+
+async def _try_handle_automatic_content(text: str, event) -> bool:
+    """Format recognised FPL source posts without an LLM or scheduling delay."""
+    if alerts.is_game_alert(text):
+        parsed = alerts.parse(text)
+        if parsed:
+            farsi = alerts.format_farsi(parsed)
+            if farsi:
+                logger.info("Detected game-action alert, formatting directly")
+                await _send_alert(farsi, event)
+                return True
+
+    if alerts.is_lineup(text):
+        parsed = alerts.parse_lineup(text)
+        if parsed:
+            farsi = alerts.format_lineup(parsed)
+            if farsi:
+                logger.info("Detected lineup, formatting directly")
+                await _send_alert(farsi, event)
+                return True
+
+    if price_changes.is_price_change(text):
+        parsed = price_changes.parse_price_change(text)
+        if parsed:
+            logger.info(
+                "Detected price change: %s (%d players)",
+                parsed.change_type, len(parsed.players),
+            )
+            combined = price_changes.accumulate(parsed, _post_price_changes)
+            if combined:
+                await _post_price_changes(combined)
+            return True
+
+    return False
 
 
 async def _forward_message(caption: str, event):
@@ -534,6 +654,12 @@ async def handle_new_message(event):
     if not text and not media:
         return
 
+    # These source formats must stay out of the generic chunk/LLM pipeline:
+    # price risers and fallers arrive as separate messages, while lineups and
+    # live alerts need their database-backed Farsi formatting immediately.
+    if text and not grouped_id and await _try_handle_automatic_content(text, event):
+        return
+
     # Merge text chunks split by Telegram's character limit
     if text and not event.message.media and not event.message.grouped_id:
         chat_id = event.chat_id
@@ -559,36 +685,6 @@ async def handle_new_message(event):
                 _finish_album(grouped_id)
             )
         return
-
-    if text and alerts.is_game_alert(text):
-        parsed = alerts.parse(text)
-        if parsed:
-            farsi = alerts.format_farsi(parsed)
-            if farsi:
-                logger.info("Detected game-action alert, formatting directly")
-                await _send_alert(farsi, event)
-                return
-
-    if text and alerts.is_lineup(text):
-        parsed = alerts.parse_lineup(text)
-        if parsed:
-            farsi = alerts.format_lineup(parsed)
-            if farsi:
-                logger.info("Detected lineup, formatting directly")
-                await _send_alert(farsi, event)
-                return
-
-    if text and price_changes.is_price_change(text):
-        parsed = price_changes.parse_price_change(text)
-        if parsed:
-            logger.info(
-                "Detected price change: %s (%d players)",
-                parsed.change_type, len(parsed.players),
-            )
-            combined = price_changes.accumulate(parsed, _post_price_changes)
-            if combined:
-                await _post_price_changes(combined)
-            return
 
     html = _message_to_html(text or "", event.message.entities)
     html = _strip_hashtags(html)
@@ -649,6 +745,11 @@ async def _finish_chunks(chat_id: int):
     first_evt = chunks[0]
     logger.info("Merged %d text chunks from chat %d (%d chars)", len(chunks), chat_id, len(merged_text))
 
+    # A source could still have split an exceptionally long automatic post.
+    # Try the merged text before translating it as a generic article.
+    if await _try_handle_automatic_content(merged_text, first_evt):
+        return
+
     html = _message_to_html(merged_text, first_evt.message.entities)
     html = _strip_hashtags(html)
     html = _strip_quotes(html)
@@ -685,53 +786,49 @@ async def _finish_chunks(chat_id: int):
 
 
 async def _maybe_post_article(text: str, event):
-    url = None
-    for m in re.finditer(r"(?:https?://)?\S+", text):
-        raw = m.group(0)
-        if articles.is_pl_article_url(raw):
-            url = articles.resolve_url(raw)
-            break
-    if not url and event.message.entities:
-        for e in event.message.entities:
-            u = getattr(e, "url", None)
-            if u and articles.is_pl_article_url(u):
-                url = u
-                break
-    if not url:
-        return
+    urls = []
+    for url in _extract_urls(event):
+        if url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
 
-    logger.info("Post-processing article URL: %s", url)
-    article = articles.fetch_article(url)
+    for url in urls:
+        logger.info("Post-processing possible article URL: %s", url)
+        try:
+            article = await asyncio.to_thread(articles.fetch_article, url)
+        except Exception as exc:
+            logger.info("Skipping unreadable article URL %s: %s", url, exc)
+            continue
+        if not article:
+            continue
 
-    logger.info("Post-processing article URL: %s", url)
-    article = articles.fetch_article(url)
-    if not article or not article.get("parts"):
-        logger.warning("Could not extract article from %s", url)
-        return
-
-    raw_html = articles.build_article_html(
-        article["title"], article["date"], article["summary"],
-        article["parts"], article["url"], article.get("header_image", ""),
-    )
-    try:
-        translated = _fix_unclosed_tags(
-            _strip_quotes(await translator.translate(raw_html))
-        )
-        telegraph_url = articles.publish_to_telegraph(article["title"], translated)
-        if telegraph_url:
-            summary = article.get("summary", "")
-            if not summary and article.get("parts"):
-                for p in article["parts"]:
-                    if p["type"] == "p":
-                        summary = p["text"][:300]
-                        break
-            caption = _format_telegraph_post(
-                article["title"], _strip_html_tags(summary), telegraph_url
+        if article.get("parts"):
+            raw_html = articles.build_article_html(
+                article["title"], article["date"], article["summary"],
+                article["parts"], article["url"], article.get("header_image", ""),
             )
+        else:
+            raw_html = articles.build_general_article_html(article)
+
+        try:
+            result = await translator.translate_article(raw_html)
+            title = _fix_unclosed_tags(_strip_quotes(result.get("title", ""))) or article["title"]
+            summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
+            translated = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+            if not translated.strip():
+                logger.warning("Article translation was empty for %s", url)
+                continue
+            translated = articles.restore_missing_images(
+                translated, article.get("images", [article.get("header_image", "")])
+            )
+            telegraph_url = articles.publish_to_telegraph(title, translated)
+            if not telegraph_url:
+                continue
+            caption = _format_telegraph_post(title, _strip_html_tags(summary), telegraph_url)
             await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
             await _send_notification(event, caption)
-    except Exception as e:
-        logger.error("Article post-processing error: %s", e)
+            return
+        except Exception as e:
+            logger.error("Article post-processing error for %s: %s", url, e)
 
 
 async def _prepare_x_post(url: str) -> str:
@@ -798,7 +895,7 @@ def _download_x_media(media: x_posts.Media) -> str:
 
 
 async def _import_youtube_transcript(url: str) -> str:
-    """Create a scheduled Persian article from a manual YouTube link's captions."""
+    """Schedule a Persian YouTube post, inline for short transcripts."""
     metadata = await asyncio.to_thread(
         youtube_posts.fetch_video_metadata, url, settings.youtube_api_key
     )
@@ -809,12 +906,47 @@ async def _import_youtube_transcript(url: str) -> str:
     translated_title = _fix_unclosed_tags(
         _strip_quotes(await translator.translate(_escape_html(metadata.title)))
     )
+    if len(transcript) <= _YOUTUBE_INLINE_TRANSCRIPT_LIMIT:
+        translated_transcript = _fix_unclosed_tags(
+            _strip_quotes(await translator.translate(_escape_html(transcript)))
+        )
+        if not translated_transcript.strip():
+            raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
+        inline_caption = _format_youtube_inline_post(
+            translated_title,
+            translated_transcript,
+            url,
+            metadata.channel_title,
+        )
+        # Providers can expand text substantially.  Keep the post usable by
+        # falling back to the long-form pipeline instead of exceeding Telegram's
+        # photo-caption limit.
+        if len(_strip_html_tags(inline_caption)) <= 1000:
+            thumbnail = await asyncio.to_thread(
+                _download_remote_media, metadata.thumbnail_url, "photo"
+            )
+            try:
+                await _send_to_target(
+                    inline_caption, file_path=thumbnail,
+                    schedule_minutes=SCHEDULE_DELAY_MINUTES,
+                )
+                await _send_notification(
+                    None, inline_caption, source="YouTube", is_media=True,
+                )
+            finally:
+                Path(thumbnail).unlink(missing_ok=True)
+            return (
+                "✅ متن فارسی کوتاه برای بررسی، با تأخیر "
+                f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+            )
+
     article = await translator.translate_article(_escape_html(transcript))
     article_title = translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
     translated_description = ""
-    if metadata.description:
+    description = youtube_posts.description_before_first_link_sentence(metadata.description)
+    if description:
         translated_description = _fix_unclosed_tags(
-            _strip_quotes(await translator.translate(_escape_html(metadata.description)))
+            _strip_quotes(await translator.translate(_escape_html(description)))
         )
     article_summary = _youtube_description_preview(translated_description) if translated_description else _fix_unclosed_tags(
         _strip_quotes(article.get("summary", ""))
@@ -1092,6 +1224,7 @@ async def main():
     logger.info("  Model  : %s", runtime_config.get("OPEN_ROUTER_MODEL"))
 
     await client.start()
+    client.add_event_handler(_handle_configured_source_message, events.NewMessage(incoming=True))
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
     admin_client = None
@@ -1115,6 +1248,9 @@ async def main():
                 youtube_monitor.unsubscribe, value, settings.youtube_api_key, actor_id
             ),
             youtube_monitor.list_channels,
+            _add_telegram_source,
+            _remove_telegram_source,
+            _telegram_source_list,
             _translate_dashboard_submission,
         )
         _admin_bot_client = admin_client
