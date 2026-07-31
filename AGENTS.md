@@ -34,7 +34,7 @@ When downloading and re-uploading media, the temp file must include the original
 - `TELEGRAPH_ACCESS_TOKEN` (optional): set this to keep all Telegraph articles under a single account. Without it, a new account is created on every bot restart.
 - `PRICE_PREDICTIONS_ENABLED` (optional, default `true`): set to `false` to pause the nightly price prediction scheduler post (useful during FPL off-season).
 - `LEAGUE_CODE` (optional, default `433b70`): FPL league code for the invite link in deadline posts.
-- Secrets and identities stay in `.env` / Coolify environment variables: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELETHON_SESSION_STRING`, `TELEGRAM_BOT_TOKEN`, `ADMIN_USER_IDS`, `OPEN_ROUTER_API_KEY`, `TELEGRAPH_ACCESS_TOKEN`, `X_BEARER_TOKEN`, and `X_RAPIDAPI_KEY`.
+- Secrets and identities stay in `.env` / Coolify environment variables: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELETHON_SESSION_STRING`, `TELEGRAM_BOT_TOKEN`, `ADMIN_USER_IDS`, `OPEN_ROUTER_API_KEY`, `TELEGRAPH_ACCESS_TOKEN`, `YOUTUBE_API_KEY`, `X_BEARER_TOKEN`, and `X_RAPIDAPI_KEY`.
 
 ## Runtime configuration and admin dashboard
 
@@ -45,7 +45,9 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - `runtime_config.db` is ignored by git. In Coolify it must live in persistent storage: mount a volume at `/app/teleadmin_project/data` and set `RUNTIME_CONFIG_PATH=/app/teleadmin_project/data/runtime_config.db`.
 - Without `RUNTIME_CONFIG_PATH`, the bot still runs using a non-persistent DB beside the code; settings reset after a redeploy.
 - The BotFather dashboard is enabled only if both `TELEGRAM_BOT_TOKEN` and numeric comma-separated `ADMIN_USER_IDS` are set. It accepts private-chat commands only.
-- Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`.
+- Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`, `/y`, `/a`, `/edit`.
+- `/a https://...` (or `a/https://...`) extracts an arbitrary article in reader mode, translates it, publishes it to Telegraph, and schedules the channel post after the usual 10-minute review delay.
+- `/edit` sends the requesting trusted admin a one-time Telegraph browser authorization link, valid for five minutes. Opening it permits editing every page under the shared `TELEGRAPH_ACCESS_TOKEN` account; never send the raw access token to admins.
 - Dashboard-generated content always requires an explicit publish confirmation. Lineups are source-driven and publish automatically when detected.
 
 ## X post import
@@ -55,6 +57,13 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - Prefer `X_RAPIDAPI_KEY` for the subscribed `x-com2` RapidAPI service. `x_posts.py` uses its `TweetDetail/?tweetId=...` endpoint, which supports canonical and `x.com/i/status/...` share URLs, media, and self-authored thread posts. The official `X_BEARER_TOKEN` route is only a fallback.
 - RapidAPI may omit media for some X post formats. Never attach media belonging to replies or unrelated posts just because it appears elsewhere in the API response.
 - The Python venv lives at `teleadmin_project/.venv/` (not repo root). If missing, create with `python3 -m venv teleadmin_project/.venv`.
+
+## YouTube import
+
+- Admins can submit `/y https://youtube.com/watch?v=...` or `y/https://youtu.be/...`.
+- `YOUTUBE_API_KEY` is used only for public video metadata and channel monitoring. The official YouTube captions API cannot download transcripts for arbitrary external videos; it requires OAuth permission to edit the video.
+- English transcripts are retrieved through the subscribed RapidAPI service (`youtube-transcript3`) using `X_RAPIDAPI_KEY`.
+- Every transcript uses the structured article translator. It reconstructs raw captions into paragraphs, inferred topic headings, and genuine lists; short inline posts convert that structure into Telegram-safe bold headings, spacing, and bullets, while long posts retain Telegraph HTML.
 
 ## Deployment
 
@@ -265,23 +274,22 @@ If a source post is a reply to another source post, the target post replies to t
 
 The bot has two separate article processing pipelines:
 
-### 1. Inline article handling (premierleague.com URLs)
+### 1. URL article handling
 
-When a source message contains a Premier League article URL (`premierleague.com/en/news/...`, short link `preml.ge/...`, or `t.co/...`), `_maybe_post_article()` runs **after** the main message translation pipeline. It fetches the article page, extracts content, translates the full HTML, and publishes to Telegraph.
+When a source message contains a URL, `_maybe_post_article()` runs **after** the main message translation pipeline. It fetches readable content, translates the full HTML, and publishes to Telegraph. The dashboard exposes the same pipeline through `/a`.
 
-- `articles.is_pl_article_url()` detects Premier League article URLs
-- `articles.fetch_article()` uses BeautifulSoup to extract title, publish date, summary, and body paragraphs from the `.article__content` div
+- `articles.is_pl_article_url()` selects the site-specific Premier League extractor for `premierleague.com/en/news/...`, short `preml.ge/...`, and `t.co/...` links.
+- `articles.fetch_article()` uses BeautifulSoup for Premier League pages and Trafilatura reader mode for other article-like pages. General pages need at least 500 readable characters and are skipped if inaccessible or likely paywalled.
 - Widgets stripped: `.articleWidget`, `.embeddable-article`, `.article-related-content`, `.media-actions`, `.article__share-container`
 - The translated HTML is published to Telegraph; the Telegram post links to it
-- **Bug**: `bot.py:_maybe_post_article()` calls `articles.fetch_article(url)` twice (lines 603 and 606) — the second call overwrites the first result. Remove the first call if fixing.
 
-### 2. Long-text / merged-chunk articles (>350 chars)
+### 2. Long-text / merged-chunk articles (>940 chars)
 
-When a single text message or merged chunks exceed 350 source characters (`_ARTICLE_SOURCE_THRESHOLD`), `translator.translate_article()` is used for structured JSON output, then published to Telegraph.
+When a single text message exceeds 940 source characters (`_ARTICLE_SOURCE_THRESHOLD`), `translator.translate_article()` is used for structured JSON output, then published to Telegraph.
 
 ## Telegraph articles
 
-Long-form content (>350 source chars) and merged text chunks are published as Telegraph articles via `articles.publish_to_telegraph()`.
+Long-form content (>940 source chars) and merged text chunks are published as Telegraph articles via `articles.publish_to_telegraph()`.
 
 - `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله:` header, title, divider, summary, and `متن کامل مقاله: 👇👇👇` linked to the Telegraph URL
 - `translator.translate_article()` uses `article_prompt.txt` for structured JSON output (`title`/`summary`/`body`), falling back to regular translation if JSON parsing fails
@@ -291,7 +299,7 @@ Long-form content (>350 source chars) and merged text chunks are published as Te
 
 Telegram splits long messages into chunks for non-premium accounts. `bot.py` buffers sent text messages from the same chat for 3 seconds (`_CHUNK_TIMEOUT`), merges them, then processes as a single message.
 
-**Important**: Merged chunks ALWAYS go through `translate_article()` → Telegraph (no length threshold). The 350-char `_ARTICLE_SOURCE_THRESHOLD` only applies to single messages, not chunks.
+**Important**: Merged chunks ALWAYS go through `translate_article()` → Telegraph (no length threshold). The 940-char `_ARTICLE_SOURCE_THRESHOLD` only applies to single messages, not chunks.
 
 ## Rich formatting preservation
 

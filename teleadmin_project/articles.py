@@ -79,6 +79,20 @@ def _get_telegraph() -> Telegraph:
     return _telegraph
 
 
+def get_browser_authorization_url() -> str:
+    """Return a short-lived URL that authorizes one browser for this account."""
+    if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
+        raise RuntimeError(
+            "TELEGRAPH_ACCESS_TOKEN is not configured; Telegraph editing is unavailable."
+        )
+
+    account = _get_telegraph().get_account_info(fields=["auth_url"])
+    auth_url = account.get("auth_url", "")
+    if not auth_url:
+        raise RuntimeError("Telegraph did not return a browser authorization link.")
+    return auth_url
+
+
 def is_pl_article_url(text: str, entities: list | None = None) -> bool:
     if text and (_PL_URL_RE.search(text) or _SHORT_URL_RE.search(text) or _TCO_URL_RE.search(text)):
         return True

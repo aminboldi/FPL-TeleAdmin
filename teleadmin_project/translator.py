@@ -9,6 +9,14 @@ TRANSLATION_PROMPT = _prompt_path.read_text(encoding="utf-8")
 
 _article_prompt_path = Path(__file__).parent / "article_prompt.txt"
 ARTICLE_PROMPT = _article_prompt_path.read_text(encoding="utf-8")
+_TRANSCRIPT_FORMATTING_INSTRUCTIONS = """
+
+Additional instructions for this raw YouTube transcript:
+- The source may be one unstructured block with unreliable line breaks. Reconstruct it into a readable Persian article without omitting substantive points.
+- Split it into short, logical <p> paragraphs even where the transcript provides no paragraph boundaries.
+- Detect meaningful topic shifts. When there are two or more, add concise, descriptive <h3> headings that reflect the transcript; do not invent facts, claims, or topics.
+- Turn clearly enumerated advice, options, comparisons, or steps into a <ul> or <ol>. Do not force ordinary prose into a list.
+"""
 
 # Translation providers occasionally return Persian or Arabic-Indic digits. All
 # bot output uses English digits, so normalize the provider response once here
@@ -104,18 +112,21 @@ class Translator:
                     "Translation failed with both primary and fallback models"
                 )
 
-    async def translate_article(self, text: str) -> dict[str, str]:
+    async def translate_article(self, text: str, *, transcript: bool = False) -> dict[str, str]:
+        formatting_instructions = _TRANSCRIPT_FORMATTING_INSTRUCTIONS if transcript else ""
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
             return self._normalize_article(
-                await self._call_article_model(self.google_client, self.google_model, text)
+                await self._call_article_model(
+                    self.google_client, self.google_model, text, formatting_instructions
+                )
             )
         except Exception:
             try:
                 return self._normalize_article(
                     await self._call_article_model(
-                        self.openrouter_client, self.fallback_model, text
+                        self.openrouter_client, self.fallback_model, text, formatting_instructions
                     )
                 )
             except Exception:
@@ -149,12 +160,15 @@ class Translator:
         return response.choices[0].message.content.strip()
 
     async def _call_article_model(
-        self, client: AsyncOpenAI, model: str, text: str
+        self, client: AsyncOpenAI, model: str, text: str, formatting_instructions: str = ""
     ) -> dict[str, str]:
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "user", "content": ARTICLE_PROMPT.format(text=text)}
+                {
+                    "role": "user",
+                    "content": ARTICLE_PROMPT.format(text=text) + formatting_instructions,
+                }
             ],
             temperature=0.3,
             max_tokens=8192,

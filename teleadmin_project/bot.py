@@ -183,6 +183,19 @@ def _strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
+def _telegraph_to_telegram_html(text: str) -> str:
+    """Convert Telegraph article structure into Telegram caption-safe HTML."""
+    text = re.sub(r"<h[34][^>]*>", "<b>", text, flags=re.IGNORECASE)
+    text = re.sub(r"</h[34]>", "</b>\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<p[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<li[^>]*>", "• ", text, flags=re.IGNORECASE)
+    text = re.sub(r"</li>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?(?:ul|ol|figure|figcaption)[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _youtube_description_preview(text: str) -> str:
     """Return a caption-safe, plain-text preview of a translated description."""
     text = html_lib.unescape(_strip_html_tags(text)).strip()
@@ -400,8 +413,19 @@ def _build_caption(
 
 def _media_suffix(event) -> str:
     if event.message.file and event.message.file.ext:
-        return f".{event.message.file.ext}"
+        extension = event.message.file.ext
+        return extension if extension.startswith(".") else f".{extension}"
     return ""
+
+
+def _has_uploadable_media(event) -> bool:
+    """Return whether a message contains a file Telegram can re-upload.
+
+    Link previews populate ``message.media`` as well, but they are webpage
+    metadata rather than a photo or document. Downloading one leaves an empty
+    temporary file, which Telegram rejects with ``SendMediaRequest``.
+    """
+    return bool(event.message.photo or event.message.document)
 
 
 async def _send_notification(event, caption: str, *, source: str | None = None, is_media: bool | None = None):
@@ -552,16 +576,14 @@ async def _try_handle_automatic_content(text: str, event) -> bool:
 
 
 async def _forward_message(caption: str, event):
-    media = event.message.media
-    if media:
+    if _has_uploadable_media(event):
         await _forward_media(caption, event)
     else:
         await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
 
 
 async def _forward_media(caption: str, event):
-    media = event.message.media
-    if media:
+    if _has_uploadable_media(event):
         temp = tempfile.NamedTemporaryFile(delete=False, suffix=_media_suffix(event))
         try:
             temp.close()
@@ -575,7 +597,7 @@ async def _forward_album(caption: str, events: list):
     temps = []
     try:
         for evt in events:
-            if evt.message.media:
+            if _has_uploadable_media(evt):
                 temp = tempfile.NamedTemporaryFile(
                     delete=False, suffix=_media_suffix(evt)
                 )
@@ -794,41 +816,49 @@ async def _maybe_post_article(text: str, event):
     for url in urls:
         logger.info("Post-processing possible article URL: %s", url)
         try:
-            article = await asyncio.to_thread(articles.fetch_article, url)
+            posted = await _publish_article_from_url(url, event=event)
         except Exception as exc:
-            logger.info("Skipping unreadable article URL %s: %s", url, exc)
+            logger.info("Article post-processing error for %s: %s", url, exc)
             continue
-        if not article:
-            continue
-
-        if article.get("parts"):
-            raw_html = articles.build_article_html(
-                article["title"], article["date"], article["summary"],
-                article["parts"], article["url"], article.get("header_image", ""),
-            )
-        else:
-            raw_html = articles.build_general_article_html(article)
-
-        try:
-            result = await translator.translate_article(raw_html)
-            title = _fix_unclosed_tags(_strip_quotes(result.get("title", ""))) or article["title"]
-            summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
-            translated = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
-            if not translated.strip():
-                logger.warning("Article translation was empty for %s", url)
-                continue
-            translated = articles.restore_missing_images(
-                translated, article.get("images", [article.get("header_image", "")])
-            )
-            telegraph_url = articles.publish_to_telegraph(title, translated)
-            if not telegraph_url:
-                continue
-            caption = _format_telegraph_post(title, _strip_html_tags(summary), telegraph_url)
-            await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
-            await _send_notification(event, caption)
+        if posted:
             return
-        except Exception as e:
-            logger.error("Article post-processing error for %s: %s", url, e)
+
+
+async def _publish_article_from_url(url: str, *, event=None) -> bool:
+    """Extract, translate, and schedule a readable article from a web URL."""
+    article = await asyncio.to_thread(articles.fetch_article, url)
+    if not article:
+        return False
+
+    if article.get("parts"):
+        raw_html = articles.build_article_html(
+            article["title"], article["date"], article["summary"],
+            article["parts"], article["url"], article.get("header_image", ""),
+        )
+    else:
+        raw_html = articles.build_general_article_html(article)
+
+    result = await translator.translate_article(raw_html)
+    title = _fix_unclosed_tags(_strip_quotes(result.get("title", ""))) or article["title"]
+    summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
+    translated = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+    if not translated.strip():
+        raise RuntimeError("Article translation was empty.")
+    translated = articles.restore_missing_images(
+        translated, article.get("images", [article.get("header_image", "")])
+    )
+    telegraph_url = articles.publish_to_telegraph(title, translated)
+    if not telegraph_url:
+        raise RuntimeError("Telegraph publishing failed.")
+
+    caption = _format_telegraph_post(title, _strip_html_tags(summary), telegraph_url)
+    await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+    if event:
+        await _send_notification(event, caption)
+    else:
+        await _send_notification(None, caption, source="Article", is_media=False)
+    logger.info("Published article from %s", url)
+    return True
 
 
 async def _prepare_x_post(url: str) -> str:
@@ -907,8 +937,11 @@ async def _import_youtube_transcript(url: str) -> str:
         _strip_quotes(await translator.translate(_escape_html(metadata.title)))
     )
     if len(transcript) <= _YOUTUBE_INLINE_TRANSCRIPT_LIMIT:
-        translated_transcript = _fix_unclosed_tags(
-            _strip_quotes(await translator.translate(_escape_html(transcript)))
+        article = await translator.translate_article(
+            _escape_html(transcript), transcript=True
+        )
+        translated_transcript = _telegraph_to_telegram_html(
+            _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
         )
         if not translated_transcript.strip():
             raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
@@ -940,7 +973,7 @@ async def _import_youtube_transcript(url: str) -> str:
                 f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
             )
 
-    article = await translator.translate_article(_escape_html(transcript))
+    article = await translator.translate_article(_escape_html(transcript), transcript=True)
     article_title = translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
     translated_description = ""
     description = youtube_posts.description_before_first_link_sentence(metadata.description)
@@ -1123,6 +1156,23 @@ async def _openrouter_balance() -> str:
     )
 
 
+async def _telegraph_browser_authorization_url() -> str:
+    return await asyncio.to_thread(articles.get_browser_authorization_url)
+
+
+async def _import_article(url: str) -> str:
+    """Publish a general web article requested from the private dashboard."""
+    _refresh_translator_model()
+    if not await _publish_article_from_url(url):
+        raise RuntimeError(
+            "نسخهٔ خواندنی این صفحه پیدا نشد یا صفحه نیاز به ورود/اشتراک دارد."
+        )
+    return (
+        "✅ مقالهٔ فارسی برای بررسی، با تأخیر "
+        f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+    )
+
+
 def _fixtures_text() -> str:
     gameweek = db.query_one(
         "SELECT id, name FROM gameweeks WHERE is_current=1 OR is_next=1 "
@@ -1252,6 +1302,8 @@ async def main():
             _remove_telegram_source,
             _telegram_source_list,
             _translate_dashboard_submission,
+            _telegraph_browser_authorization_url,
+            _import_article,
         )
         _admin_bot_client = admin_client
         logger.info("Admin dashboard enabled for %d user(s)", len(settings.admin_user_ids))

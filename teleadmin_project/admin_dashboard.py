@@ -26,6 +26,8 @@ class AdminDashboard:
         source_remove: Callable[[str, int], Awaitable[str]],
         source_list: Callable[[], str],
         translate_submission: Callable[[object], Awaitable[str]],
+        telegraph_authorize: Callable[[], Awaitable[str]],
+        article_import: Callable[[str], Awaitable[str]],
     ):
         self.client = client
         self.admin_ids = admin_ids
@@ -41,6 +43,8 @@ class AdminDashboard:
         self.source_remove = source_remove
         self.source_list = source_list
         self.translate_submission = translate_submission
+        self.telegraph_authorize = telegraph_authorize
+        self.article_import = article_import
         self.pending: dict[str, tuple[str, str, int]] = {}
         self.pending_youtube: dict[str, tuple[str, str, int]] = {}
         self.pending_source: dict[str, tuple[str, str, int]] = {}
@@ -89,6 +93,8 @@ class AdminDashboard:
             text = "/x " + text[2:]
         elif text.lower().startswith("y/http://") or text.lower().startswith("y/https://"):
             text = "/y " + text[2:]
+        elif text.lower().startswith("a/http://") or text.lower().startswith("a/https://"):
+            text = "/a " + text[2:]
         if not text.startswith("/"):
             await event.reply("در حال ترجمه و آماده‌سازی پست…")
             try:
@@ -109,6 +115,19 @@ class AdminDashboard:
             )
         elif command == "/guide":
             await event.reply(self._guide_text(), buttons=self._back_button(), parse_mode="html")
+        elif command == "/edit":
+            await self._telegraph_edit(event)
+        elif command == "/a":
+            if not arg.startswith(("http://", "https://")):
+                await event.reply("نمونه: <code>/a https://example.com/article</code>", parse_mode="html")
+            else:
+                await event.reply("در حال استخراج نسخهٔ خواندنی و ترجمهٔ مقاله…")
+                try:
+                    result = await self.article_import(arg)
+                except Exception as exc:
+                    await event.reply(f"❌ {exc}")
+                else:
+                    await event.reply(result, parse_mode="html")
         elif command == "/channels":
             await event.reply(self._channels_text(), buttons=[[Button.inline("تغییر مقصد", b"targethelp")]], parse_mode="html")
         elif command == "/target":
@@ -414,11 +433,25 @@ class AdminDashboard:
         buttons = self._back_button() if kind == "lineups" else [[Button.inline("انتشار در کانال", b"contentpublish")]]
         await event.reply(text, buttons=buttons, parse_mode="html")
 
+    async def _telegraph_edit(self, event) -> None:
+        try:
+            auth_url = await self.telegraph_authorize()
+        except Exception as exc:
+            await event.reply(f"❌ {exc}")
+            return
+        await event.reply(
+            "این لینک فقط برای شماست و تا ۵ دقیقه اعتبار دارد. آن را باز کنید، سپس "
+            "مقالهٔ Telegraph موردنظر را باز کنید و ویرایش کنید.",
+            buttons=[[Button.url("✏️ فعال‌سازی ویرایش Telegraph", auth_url)]],
+        )
+
     @staticmethod
     def _guide_text() -> str:
         return (
             "<b>❔ راهنمای دستورات</b>\n\n"
             "<b>منو</b>\n/dashboard — پنل اصلی\n/guide — همین راهنما\n/balance — اعتبار OpenRouter\n\n"
+            "<b>مقاله‌های Telegraph</b>\n/edit — فعال‌سازی ویرایش در مرورگر (۵ دقیقه)\n\n"
+            "<b>مقاله از لینک</b>\n/a https://example.com/article\nیا a/https://example.com/article — استخراج نسخهٔ خواندنی، ترجمه و انتشار در Telegraph\n\n"
             "<b>لیگ‌ها</b>\n/league epl یا /league iran\n/activity epl یا /activity iran\n\n"
             "<b>محتوا (بدون AI)</b>\n/fixtures — برنامهٔ بازی‌های هفته\n/points — امتیازات آخرین بازی تمام‌شده\n/eo — مالکیت مؤثر\n/prices — پیش‌بینی قیمت LiveFPL\n/lineups — وضعیت دریافت خودکار ترکیب‌ها\n\n"
             "<b>انتشار از X</b>\n/x https://x.com/account/status/123\nیا x/https://x.com/account/status/123\n\n"
