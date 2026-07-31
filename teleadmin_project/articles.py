@@ -93,6 +93,17 @@ def get_browser_authorization_url() -> str:
     return auth_url
 
 
+def get_recent_telegraph_pages(limit: int = 10) -> list[dict]:
+    """Return the newest pages from the configured Telegraph account."""
+    if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
+        raise RuntimeError(
+            "TELEGRAPH_ACCESS_TOKEN is not configured; Telegraph editing is unavailable."
+        )
+    result = _get_telegraph().get_page_list(limit=limit)
+    pages = result.get("pages", [])
+    return pages if isinstance(pages, list) else []
+
+
 def is_pl_article_url(text: str, entities: list | None = None) -> bool:
     if text and (_PL_URL_RE.search(text) or _SHORT_URL_RE.search(text) or _TCO_URL_RE.search(text)):
         return True

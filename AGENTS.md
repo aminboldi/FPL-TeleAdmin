@@ -47,7 +47,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - The BotFather dashboard is enabled only if both `TELEGRAM_BOT_TOKEN` and numeric comma-separated `ADMIN_USER_IDS` are set. It accepts private-chat commands only.
 - Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`, `/y`, `/a`, `/edit`.
 - `/a https://...` (or `a/https://...`) extracts an arbitrary article in reader mode, translates it, publishes it to Telegraph, and schedules the channel post after the usual 10-minute review delay.
-- `/edit` sends the requesting trusted admin a one-time Telegraph browser authorization link, valid for five minutes. Opening it permits editing every page under the shared `TELEGRAPH_ACCESS_TOKEN` account; never send the raw access token to admins.
+- `/edit` lists the ten most recently published pages under the shared Telegraph account. After an admin selects one, it sends a one-time browser authorization link plus the chosen article URL. Open the authorization button first and then the article button in the same browser; the article's `EDIT` button appears at the bottom. The authorization link is valid for five minutes and permits editing every page under the shared `TELEGRAPH_ACCESS_TOKEN` account; never send the raw access token to admins.
 - Dashboard-generated content always requires an explicit publish confirmation. Lineups are source-driven and publish automatically when detected.
 
 ## X post import

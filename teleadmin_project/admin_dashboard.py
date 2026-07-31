@@ -27,6 +27,7 @@ class AdminDashboard:
         source_list: Callable[[], str],
         translate_submission: Callable[[object], Awaitable[str]],
         telegraph_authorize: Callable[[], Awaitable[str]],
+        telegraph_pages: Callable[[], Awaitable[list[dict]]],
         article_import: Callable[[str], Awaitable[str]],
     ):
         self.client = client
@@ -44,10 +45,12 @@ class AdminDashboard:
         self.source_list = source_list
         self.translate_submission = translate_submission
         self.telegraph_authorize = telegraph_authorize
+        self.telegraph_pages = telegraph_pages
         self.article_import = article_import
         self.pending: dict[str, tuple[str, str, int]] = {}
         self.pending_youtube: dict[str, tuple[str, str, int]] = {}
         self.pending_source: dict[str, tuple[str, str, int]] = {}
+        self.pending_telegraph_pages: dict[str, tuple[str, int]] = {}
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -272,6 +275,13 @@ class AdminDashboard:
                 await event.edit(f"❌ {exc}", buttons=self._back_button())
             else:
                 await event.edit(result, buttons=self._back_button())
+        elif data.startswith("telegraphedit:"):
+            token = data.split(":", 1)[1]
+            selected = self.pending_telegraph_pages.pop(token, None)
+            if not selected or selected[1] != event.sender_id:
+                await event.answer("این فهرست منقضی شده است؛ دوباره /edit را بفرستید.", alert=True)
+                return
+            await self._telegraph_edit_selected(event, selected[0])
         elif data.startswith("youtubeconfirm:"):
             token = data.split(":", 1)[1]
             proposed = self.pending_youtube.pop(token, None)
@@ -435,30 +445,58 @@ class AdminDashboard:
 
     async def _telegraph_edit(self, event) -> None:
         try:
-            auth_url = await self.telegraph_authorize()
+            pages = await self.telegraph_pages()
         except Exception as exc:
             await event.reply(f"❌ {exc}")
             return
+        if not pages:
+            await event.reply("هیچ مقاله‌ای در حساب Telegraph مشترک پیدا نشد.")
+            return
+
+        buttons = []
+        for page in pages[:10]:
+            url = str(page.get("url") or "")
+            if not url:
+                continue
+            token = secrets.token_urlsafe(8)
+            self.pending_telegraph_pages[token] = (url, event.sender_id)
+            title = str(page.get("title") or "مقالهٔ بدون عنوان").replace("\n", " ").strip()
+            buttons.append([Button.inline(title[:60], f"telegraphedit:{token}".encode())])
         await event.reply(
-            "این لینک فقط برای شماست و تا ۵ دقیقه اعتبار دارد. آن را باز کنید، سپس "
-            "مقالهٔ Telegraph موردنظر را باز کنید و ویرایش کنید.",
-            buttons=[[Button.url("✏️ فعال‌سازی ویرایش Telegraph", auth_url)]],
+            "<b>۱۰ مقالهٔ اخیر Telegraph</b>\nمقاله‌ای را که می‌خواهید ویرایش کنید انتخاب کنید.",
+            buttons=buttons, parse_mode="html",
+        )
+
+    async def _telegraph_edit_selected(self, event, article_url: str) -> None:
+        try:
+            auth_url = await self.telegraph_authorize()
+        except Exception as exc:
+            await event.edit(f"❌ {exc}")
+            return
+        await event.edit(
+            "ابتدا دکمهٔ ۱ را در همین مرورگر باز کنید، سپس دکمهٔ ۲ را بزنید. "
+            "گزینهٔ <b>EDIT</b> در انتهای مقاله ظاهر می‌شود.",
+            buttons=[
+                [Button.url("۱. فعال‌سازی ویرایش", auth_url)],
+                [Button.url("۲. باز کردن مقالهٔ انتخاب‌شده", article_url)],
+            ],
+            parse_mode="html",
         )
 
     @staticmethod
     def _guide_text() -> str:
         return (
-            "<b>❔ راهنمای دستورات</b>\n\n"
-            "<b>منو</b>\n/dashboard — پنل اصلی\n/guide — همین راهنما\n/balance — اعتبار OpenRouter\n\n"
-            "<b>مقاله‌های Telegraph</b>\n/edit — فعال‌سازی ویرایش در مرورگر (۵ دقیقه)\n\n"
-            "<b>مقاله از لینک</b>\n/a https://example.com/article\nیا a/https://example.com/article — استخراج نسخهٔ خواندنی، ترجمه و انتشار در Telegraph\n\n"
-            "<b>لیگ‌ها</b>\n/league epl یا /league iran\n/activity epl یا /activity iran\n\n"
-            "<b>محتوا (بدون AI)</b>\n/fixtures — برنامهٔ بازی‌های هفته\n/points — امتیازات آخرین بازی تمام‌شده\n/eo — مالکیت مؤثر\n/prices — پیش‌بینی قیمت LiveFPL\n/lineups — وضعیت دریافت خودکار ترکیب‌ها\n\n"
-            "<b>انتشار از X</b>\n/x https://x.com/account/status/123\nیا x/https://x.com/account/status/123\n\n"
-            "<b>انتشار از YouTube</b>\n/y https://youtube.com/watch?v=...\nیا y/https://youtu.be/...\n\n"
-            "<b>ترجمهٔ مستقیم</b>\nهر متن، پست فورواردشده یا رسانه را بدون دستور ارسال کنید؛ خودکار ترجمه و در صف کانال قرار می‌گیرد.\n\n"
-            "<b>پایش YouTube</b>\n/youtube — فهرست کانال‌ها\n/youtube add https://youtube.com/@channel\n/youtube remove UC...\n\n"
-            "<b>منابع تلگرام</b>\n/source — فهرست کانال‌ها\n/source add @sourcechannel\n/source remove @sourcechannel\n\n"
-            "<b>تنظیمات</b>\n/channels\n/target @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
-            "تغییرات تنظیمات و انتشار محتوای داشبورد نیاز به تأیید دارند؛ پست‌های X مستقیماً برای بررسی در صف زمان‌بندی کانال قرار می‌گیرند."
+            "<b>❔ Command Guide</b>\n\n"
+            "<b>Dashboard</b>\n/dashboard — Open the main panel\n/guide — Show this guide\n/balance — Check OpenRouter credit\n\n"
+            "<b>Telegraph Articles</b>\n/edit — Select one of the 10 latest articles to edit\n\n"
+            "<b>Article from Link</b>\n/a https://example.com/article\nor a/https://example.com/article — Extract, translate, and publish a readable article to Telegraph\n\n"
+            "<b>Leagues</b>\n/league epl or /league iran\n/activity epl or /activity iran\n\n"
+            "<b>Content (without AI)</b>\n/fixtures — Gameweek fixtures\n/points — Latest finished-match points\n/eo — Effective ownership\n/prices — LiveFPL price predictions\n/lineups — Automatic lineup status\n\n"
+            "<b>Import from X</b>\n/x https://x.com/account/status/123\nor x/https://x.com/account/status/123\n\n"
+            "<b>Import from YouTube</b>\n/y https://youtube.com/watch?v=...\nor y/https://youtu.be/...\n\n"
+            "<b>Direct Translation</b>\nSend text, forwarded posts, or media without a command to translate it and add it to the channel queue.\n\n"
+            "<b>YouTube Monitoring</b>\n/youtube — List monitored channels\n/youtube add https://youtube.com/@channel\n/youtube remove UC...\n\n"
+            "<b>Telegram Sources</b>\n/source — List source channels\n/source add @sourcechannel\n/source remove @sourcechannel\n\n"
+            "<b>Settings</b>\n/channels\n/target @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
+            "Setting changes and dashboard-content publishing require confirmation. X posts are placed directly in the scheduled channel queue for review."
         )

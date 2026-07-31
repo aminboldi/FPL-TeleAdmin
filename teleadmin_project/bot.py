@@ -183,6 +183,16 @@ def _strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
+def _article_title(text: str, fallback: str = "مقاله فانتزی") -> str:
+    """Return Telegraph-safe plain text for a page title (never HTML)."""
+    heading = re.search(r"<h[1-4][^>]*>(.*?)</h[1-4]>", text, re.IGNORECASE | re.DOTALL)
+    title_source = heading.group(1) if heading else text
+    title = html_lib.unescape(_strip_html_tags(title_source)).strip()
+    if not title:
+        title = html_lib.unescape(_strip_html_tags(fallback)).strip()
+    return title[:256] or "مقاله فانتزی"
+
+
 def _telegraph_to_telegram_html(text: str) -> str:
     """Convert Telegraph article structure into Telegram caption-safe HTML."""
     text = re.sub(r"<h[34][^>]*>", "<b>", text, flags=re.IGNORECASE)
@@ -209,7 +219,7 @@ def _format_telegraph_post(
 ) -> str:
     post = (
         f"<b>✍ مقاله:</b>\n\n"
-        f"<b>{title}</b>\n\n"
+        f"<b>{_escape_html(title)}</b>\n\n"
         f"- - - - - - - - -\n\n"
         f"{summary}"
     )
@@ -224,7 +234,7 @@ def _format_youtube_telegraph_post(
 ) -> str:
     return (
         f"<b>▶️ ویدئوی جدید کانال {_escape_html(channel_title)}</b>\n\n"
-        f"<b>{title}</b>\n\n"
+        f"<b>{_escape_html(title)}</b>\n\n"
         f"- - - - - - - - -\n\n"
         f"{summary}\n\n"
         f'<a href="{_escape_html(original_url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a>\n\n'
@@ -722,7 +732,7 @@ async def handle_new_message(event):
         try:
             if len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
                 result = await translator.translate_article(html)
-                title = result.get("title", "")
+                title = _article_title(result.get("title", ""))
                 summary = result.get("summary", "")
                 body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
                 telegraph_url = articles.publish_to_telegraph(title, body)
@@ -785,7 +795,7 @@ async def _finish_chunks(chat_id: int):
     if html:
         try:
             result = await translator.translate_article(html)
-            title = result.get("title", "")
+            title = _article_title(result.get("title", ""))
             summary = result.get("summary", "")
             body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
             telegraph_url = articles.publish_to_telegraph(title, body)
@@ -839,7 +849,9 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
         raw_html = articles.build_general_article_html(article)
 
     result = await translator.translate_article(raw_html)
-    title = _fix_unclosed_tags(_strip_quotes(result.get("title", ""))) or article["title"]
+    title = _article_title(
+        _fix_unclosed_tags(_strip_quotes(result.get("title", ""))), article["title"]
+    )
     summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
     translated = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
     if not translated.strip():
@@ -974,7 +986,9 @@ async def _import_youtube_transcript(url: str) -> str:
             )
 
     article = await translator.translate_article(_escape_html(transcript), transcript=True)
-    article_title = translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
+    article_title = _article_title(
+        translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
+    )
     translated_description = ""
     description = youtube_posts.description_before_first_link_sentence(metadata.description)
     if description:
@@ -1031,7 +1045,7 @@ async def _translate_dashboard_submission(event) -> str:
 
     if html and len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
         result = await translator.translate_article(html)
-        title = _fix_unclosed_tags(_strip_quotes(result.get("title", "")))
+        title = _article_title(_fix_unclosed_tags(_strip_quotes(result.get("title", ""))))
         summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
         body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
         telegraph_url = articles.publish_to_telegraph(title, body)
@@ -1158,6 +1172,10 @@ async def _openrouter_balance() -> str:
 
 async def _telegraph_browser_authorization_url() -> str:
     return await asyncio.to_thread(articles.get_browser_authorization_url)
+
+
+async def _recent_telegraph_pages() -> list[dict]:
+    return await asyncio.to_thread(articles.get_recent_telegraph_pages)
 
 
 async def _import_article(url: str) -> str:
@@ -1303,6 +1321,7 @@ async def main():
             _telegram_source_list,
             _translate_dashboard_submission,
             _telegraph_browser_authorization_url,
+            _recent_telegraph_pages,
             _import_article,
         )
         _admin_bot_client = admin_client
