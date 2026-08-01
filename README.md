@@ -1,6 +1,6 @@
 # TeleAdmin
 
-Telegram channel translation and forwarding bot. Listens to source channels, translates messages from English to Persian (Farsi) via OpenRouter LLM API, and schedules translated posts to a target channel with a configurable delay for human review.
+Telegram channel translation and forwarding bot. Listens to source channels, translates messages from English to Persian (Farsi) via OpenRouter LLM API, and places translated posts into half-hour target-channel slots for human review.
 
 ## Features
 
@@ -182,7 +182,7 @@ Source Channel ──▶ [Telethon listener] ──▶ Strip hashtags
 3. Text is sent to OpenRouter LLM for English→Persian translation
 4. Numbers are normalized (Persian→English digits) and wrapped in `<b>` tags
 5. Signature and optional link are appended
-6. Post is scheduled to target channel (10 min delay by default)
+6. Post takes the next free half-hour slot between 08:30 and 00:30 Iran time, skipping the current upcoming slot
 7. If configured, a notification preview is sent to the notif channel
 
 ### Translation Prompt
@@ -199,7 +199,7 @@ Edit `teleadmin_project/prompt.txt` to tune translation quality. The `{text}` pl
 
 ### Common Tasks
 
-- **Change schedule delay**: Edit `SCHEDULE_DELAY_MINUTES` in `bot.py`
+- **Change publishing slots**: Edit the queue rules in `post_queue.py`
 - **Change signature**: Edit `SIGNATURE` in `bot.py`
 - **Change model**: Set `OPEN_ROUTER_MODEL` in `.env`
 - **Tune translation**: Edit `prompt.txt`

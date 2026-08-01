@@ -28,7 +28,9 @@ import price_changes
 import deadlines
 import articles
 import database as db
+import post_queue
 import scheduler
+import telegraph_editor
 import runtime_config
 import x_posts
 import youtube_posts
@@ -63,7 +65,7 @@ client = TelegramClient(
 
 SIGNATURE = "@EPL_Fantasy"
 AI_SIGNATURE = "@EPL_Fantasy | \u2728AI"
-SCHEDULE_DELAY_MINUTES = 10
+QUEUED_POST_CONFIRMATION = "در اولین بازهٔ خالی زمان‌بندی کانال قرار گرفت."
 _ALBUM_TIMEOUT = 5
 # Telegram media captions allow 1,024 rendered characters.  The AI signature
 # consumes 20 (including its leading line breaks); 940 leaves at least 58
@@ -84,6 +86,7 @@ _chunk_buffer: dict[int, list] = {}
 _chunk_tasks: dict[int, asyncio.Task] = {}
 _pending_dashboard_content: str | None = None
 _admin_bot_client: TelegramClient | None = None
+_schedule_slot_lock = asyncio.Lock()
 
 
 def _target_channel() -> str:
@@ -466,12 +469,46 @@ async def _send_notification(event, caption: str, *, source: str | None = None, 
                 logger.warning("Could not notify admin %s: %s", admin_id, exc)
 
 
-async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=None, is_album=False, schedule_minutes: int = 0):
+async def _next_queue_slot(target_channel: str) -> datetime:
+    scheduled = await client.get_messages(target_channel, limit=100, scheduled=True)
+    occupied = [message.date for message in scheduled if getattr(message, "date", None)]
+    return post_queue.next_available_slot(datetime.now(tz=timezone.utc), occupied)
+
+
+async def _send_to_target(
+    text: str, *, event=None, file_path=None, album_paths=None,
+    queue: bool = False,
+):
     target_channel = _target_channel()
     if not target_channel:
         raise RuntimeError("TARGET_CHANNEL_ID is not configured")
     reply_to = _get_reply_to(event) if event else None
-    schedule_time = datetime.now(tz=timezone.utc) + timedelta(minutes=schedule_minutes) if schedule_minutes else None
+    slot_guard = _schedule_slot_lock if queue else _NullAsyncLock()
+    async with slot_guard:
+        schedule_time = await _next_queue_slot(target_channel) if queue else None
+        if schedule_time:
+            logger.info(
+                "Reserved translated-post slot %s Iran time",
+                schedule_time.astimezone(post_queue.IRAN_TZ).strftime("%Y-%m-%d %H:%M"),
+            )
+        return await _send_to_target_at(
+            target_channel, text, reply_to, schedule_time,
+            event=event, file_path=file_path, album_paths=album_paths,
+        )
+
+
+class _NullAsyncLock:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+async def _send_to_target_at(
+    target_channel, text, reply_to, schedule_time, *,
+    event=None, file_path=None, album_paths=None,
+):
     try:
         if album_paths:
             msg = await client.send_file(
@@ -500,11 +537,18 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 schedule=schedule_time,
             )
         if event:
-            _save_mapping(event, msg.id)
+            mapped_message = msg[0] if isinstance(msg, (list, tuple)) else msg
+            _save_mapping(event, mapped_message.id)
         return msg
     except FloodWaitError as e:
         logger.warning("FloodWaitError: sleeping %ss", e.seconds)
         await asyncio.sleep(e.seconds)
+        if schedule_time:
+            schedule_time = await _next_queue_slot(target_channel)
+            logger.info(
+                "Moved translated post after FloodWait to %s Iran time",
+                schedule_time.astimezone(post_queue.IRAN_TZ).strftime("%Y-%m-%d %H:%M"),
+            )
         if album_paths:
             msg = await client.send_file(
                 target_channel,
@@ -532,7 +576,8 @@ async def _send_to_target(text: str, *, event=None, file_path=None, album_paths=
                 schedule=schedule_time,
             )
         if event:
-            _save_mapping(event, msg.id)
+            mapped_message = msg[0] if isinstance(msg, (list, tuple)) else msg
+            _save_mapping(event, mapped_message.id)
         return msg
 
 
@@ -589,7 +634,7 @@ async def _forward_message(caption: str, event):
     if _has_uploadable_media(event):
         await _forward_media(caption, event)
     else:
-        await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+        await _send_to_target(caption, event=event, queue=True)
 
 
 async def _forward_media(caption: str, event):
@@ -598,7 +643,7 @@ async def _forward_media(caption: str, event):
         try:
             temp.close()
             await event.message.download_media(file=temp.name)
-            await _send_to_target(caption, file_path=temp.name, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+            await _send_to_target(caption, file_path=temp.name, event=event, queue=True)
         finally:
             os.unlink(temp.name)
 
@@ -619,9 +664,9 @@ async def _forward_album(caption: str, events: list):
             return
 
         if len(temps) == 1:
-            await _send_to_target(caption, file_path=temps[0], event=events[0], schedule_minutes=SCHEDULE_DELAY_MINUTES)
+            await _send_to_target(caption, file_path=temps[0], event=events[0], queue=True)
         else:
-            await _send_to_target(caption, album_paths=temps, event=events[0], schedule_minutes=SCHEDULE_DELAY_MINUTES)
+            await _send_to_target(caption, album_paths=temps, event=events[0], queue=True)
     finally:
         for path in temps:
             try:
@@ -738,7 +783,7 @@ async def handle_new_message(event):
                 telegraph_url = articles.publish_to_telegraph(title, body)
                 if telegraph_url:
                     caption = _format_telegraph_post(title, summary, telegraph_url)
-                    await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+                    await _send_to_target(caption, event=event, queue=True)
                     await _send_notification(event, caption)
                     logger.info("Published Telegraph article (%d chars)", len(body))
                 else:
@@ -801,7 +846,7 @@ async def _finish_chunks(chat_id: int):
             telegraph_url = articles.publish_to_telegraph(title, body)
             if telegraph_url:
                 caption = _format_telegraph_post(title, summary, telegraph_url)
-                await _send_to_target(caption, event=first_evt, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+                await _send_to_target(caption, event=first_evt, queue=True)
                 await _send_notification(first_evt, caption)
             else:
                 caption = _build_caption(body, link_url=link_url, html=True)
@@ -864,7 +909,7 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
         raise RuntimeError("Telegraph publishing failed.")
 
     caption = _format_telegraph_post(title, _strip_html_tags(summary), telegraph_url)
-    await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+    await _send_to_target(caption, event=event, queue=True)
     if event:
         await _send_notification(event, caption)
     else:
@@ -899,7 +944,7 @@ async def _prepare_x_post(url: str) -> str:
         )
         prepared.append((post, caption))
     await _schedule_x_posts(prepared)
-    return f"✅ {len(prepared)} پست X برای بررسی، با تأخیر {SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+    return f"✅ {len(prepared)} پست X برای بررسی، {QUEUED_POST_CONFIRMATION}"
 
 
 _X_MENTION_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9_-]+)")
@@ -973,7 +1018,7 @@ async def _import_youtube_transcript(url: str) -> str:
             try:
                 await _send_to_target(
                     inline_caption, file_path=thumbnail,
-                    schedule_minutes=SCHEDULE_DELAY_MINUTES,
+                    queue=True,
                 )
                 await _send_notification(
                     None, inline_caption, source="YouTube", is_media=True,
@@ -981,8 +1026,7 @@ async def _import_youtube_transcript(url: str) -> str:
             finally:
                 Path(thumbnail).unlink(missing_ok=True)
             return (
-                "✅ متن فارسی کوتاه برای بررسی، با تأخیر "
-                f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+                f"✅ متن فارسی کوتاه برای بررسی، {QUEUED_POST_CONFIRMATION}"
             )
 
     article = await translator.translate_article(_escape_html(transcript), transcript=True)
@@ -1019,7 +1063,7 @@ async def _import_youtube_transcript(url: str) -> str:
     )
     try:
         await _send_to_target(
-            article_caption, file_path=thumbnail, schedule_minutes=SCHEDULE_DELAY_MINUTES,
+            article_caption, file_path=thumbnail, queue=True,
         )
         await _send_notification(
             None, article_caption, source="YouTube", is_media=True,
@@ -1027,8 +1071,7 @@ async def _import_youtube_transcript(url: str) -> str:
     finally:
         Path(thumbnail).unlink(missing_ok=True)
     return (
-        "✅ مقالهٔ فارسی برای بررسی، با تأخیر "
-        f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+        f"✅ مقالهٔ فارسی برای بررسی، {QUEUED_POST_CONFIRMATION}"
     )
 
 
@@ -1051,7 +1094,7 @@ async def _translate_dashboard_submission(event) -> str:
         telegraph_url = articles.publish_to_telegraph(title, body)
         if telegraph_url:
             caption = _format_telegraph_post(title, summary, telegraph_url)
-            await _send_to_target(caption, event=event, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+            await _send_to_target(caption, event=event, queue=True)
         else:
             caption = _build_caption(body, link_url=link_url, html=True)
             await _forward_message(caption, event)
@@ -1067,8 +1110,7 @@ async def _translate_dashboard_submission(event) -> str:
 
     await _send_notification(event, caption)
     return (
-        "✅ ترجمه برای بررسی، با تأخیر "
-        f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+        f"✅ ترجمه برای بررسی، {QUEUED_POST_CONFIRMATION}"
     )
 
 
@@ -1078,11 +1120,11 @@ async def _schedule_x_posts(prepared: list[tuple[x_posts.Post, str]]) -> None:
         try:
             paths = [await asyncio.to_thread(_download_x_media, media) for media in post.media]
             if len(paths) > 1:
-                await _send_to_target(caption, album_paths=paths, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+                await _send_to_target(caption, album_paths=paths, queue=True)
             elif paths:
-                await _send_to_target(caption, file_path=paths[0], schedule_minutes=SCHEDULE_DELAY_MINUTES)
+                await _send_to_target(caption, file_path=paths[0], queue=True)
             else:
-                await _send_to_target(caption, schedule_minutes=SCHEDULE_DELAY_MINUTES)
+                await _send_to_target(caption, queue=True)
             await _send_notification(
                 None, caption, source=f"X: @{post.author}", is_media=bool(post.media)
             )
@@ -1170,8 +1212,8 @@ async def _openrouter_balance() -> str:
     )
 
 
-async def _telegraph_browser_authorization_url() -> str:
-    return await asyncio.to_thread(articles.get_browser_authorization_url)
+async def _telegraph_editor_url(article_url: str) -> str:
+    return telegraph_editor.create_edit_url(article_url)
 
 
 async def _recent_telegraph_pages() -> list[dict]:
@@ -1186,8 +1228,7 @@ async def _import_article(url: str) -> str:
             "نسخهٔ خواندنی این صفحه پیدا نشد یا صفحه نیاز به ورود/اشتراک دارد."
         )
     return (
-        "✅ مقالهٔ فارسی برای بررسی، با تأخیر "
-        f"{SCHEDULE_DELAY_MINUTES} دقیقه، در صف زمان‌بندی کانال قرار گرفت."
+        f"✅ مقالهٔ فارسی برای بررسی، {QUEUED_POST_CONFIRMATION}"
     )
 
 
@@ -1269,17 +1310,9 @@ async def _publish_dashboard_content() -> str:
     return "✅ محتوا در کانال منتشر شد."
 
 
-async def _health_handler(reader, writer):
-    try:
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
-        await writer.drain()
-    finally:
-        writer.close()
-
-
 async def _start_health_server():
     port = int(os.getenv("PORT", "8080"))
-    server = await asyncio.start_server(_health_handler, "0.0.0.0", port)
+    server = await asyncio.start_server(telegraph_editor.handle_http, "0.0.0.0", port)
     logger.info("Health server listening on port %s", port)
     async with server:
         await server.serve_forever()
@@ -1320,7 +1353,7 @@ async def main():
             _remove_telegram_source,
             _telegram_source_list,
             _translate_dashboard_submission,
-            _telegraph_browser_authorization_url,
+            _telegraph_editor_url,
             _recent_telegraph_pages,
             _import_article,
         )

@@ -26,7 +26,7 @@ class AdminDashboard:
         source_remove: Callable[[str, int], Awaitable[str]],
         source_list: Callable[[], str],
         translate_submission: Callable[[object], Awaitable[str]],
-        telegraph_authorize: Callable[[], Awaitable[str]],
+        telegraph_editor_url: Callable[[str], Awaitable[str]],
         telegraph_pages: Callable[[], Awaitable[list[dict]]],
         article_import: Callable[[str], Awaitable[str]],
     ):
@@ -44,7 +44,7 @@ class AdminDashboard:
         self.source_remove = source_remove
         self.source_list = source_list
         self.translate_submission = translate_submission
-        self.telegraph_authorize = telegraph_authorize
+        self.telegraph_editor_url = telegraph_editor_url
         self.telegraph_pages = telegraph_pages
         self.article_import = article_import
         self.pending: dict[str, tuple[str, str, int]] = {}
@@ -469,17 +469,14 @@ class AdminDashboard:
 
     async def _telegraph_edit_selected(self, event, article_url: str) -> None:
         try:
-            auth_url = await self.telegraph_authorize()
+            editor_url = await self.telegraph_editor_url(article_url)
         except Exception as exc:
             await event.edit(f"❌ {exc}")
             return
         await event.edit(
-            "ابتدا دکمهٔ ۱ را در همین مرورگر باز کنید، سپس دکمهٔ ۲ را بزنید. "
-            "گزینهٔ <b>EDIT</b> در انتهای مقاله ظاهر می‌شود.",
-            buttons=[
-                [Button.url("۱. فعال‌سازی ویرایش", auth_url)],
-                [Button.url("۲. باز کردن مقالهٔ انتخاب‌شده", article_url)],
-            ],
+            "این لینک خصوصی است: تا ۱۵ دقیقه آن را باز کنید؛ پس از باز شدن، ویرایشگر "
+            "دو ساعت فعال می‌ماند و مقاله را مستقیماً از طریق API رسمی Telegraph به‌روزرسانی می‌کند.",
+            buttons=[[Button.url("✏️ باز کردن ویرایشگر", editor_url)]],
             parse_mode="html",
         )
 

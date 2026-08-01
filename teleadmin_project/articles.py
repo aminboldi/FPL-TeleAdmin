@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from html import escape
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -79,20 +79,6 @@ def _get_telegraph() -> Telegraph:
     return _telegraph
 
 
-def get_browser_authorization_url() -> str:
-    """Return a short-lived URL that authorizes one browser for this account."""
-    if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
-        raise RuntimeError(
-            "TELEGRAPH_ACCESS_TOKEN is not configured; Telegraph editing is unavailable."
-        )
-
-    account = _get_telegraph().get_account_info(fields=["auth_url"])
-    auth_url = account.get("auth_url", "")
-    if not auth_url:
-        raise RuntimeError("Telegraph did not return a browser authorization link.")
-    return auth_url
-
-
 def get_recent_telegraph_pages(limit: int = 10) -> list[dict]:
     """Return the newest pages from the configured Telegraph account."""
     if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
@@ -102,6 +88,49 @@ def get_recent_telegraph_pages(limit: int = 10) -> list[dict]:
     result = _get_telegraph().get_page_list(limit=limit)
     pages = result.get("pages", [])
     return pages if isinstance(pages, list) else []
+
+
+def _telegraph_path(page_url_or_path: str) -> str:
+    """Return the API page path from a Telegraph URL or bare path."""
+    value = (page_url_or_path or "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "telegra.ph", "www.telegra.ph", "graph.org", "www.graph.org",
+        }:
+            raise ValueError("The selected URL is not a Telegraph page.")
+        value = parsed.path
+    path = unquote(value).strip("/")
+    if not path or "/" in path:
+        raise ValueError("The Telegraph page path is invalid.")
+    return path
+
+
+def get_telegraph_page(page_url_or_path: str) -> dict:
+    """Fetch an owned page, including its editable HTML content."""
+    if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
+        raise RuntimeError(
+            "TELEGRAPH_ACCESS_TOKEN is not configured; Telegraph editing is unavailable."
+        )
+    return _get_telegraph().get_page(
+        _telegraph_path(page_url_or_path), return_content=True, return_html=True
+    )
+
+
+def edit_telegraph_page(page_url_or_path: str, title: str, html_content: str) -> dict:
+    """Update an existing page through Telegraph's supported editPage API."""
+    if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
+        raise RuntimeError(
+            "TELEGRAPH_ACCESS_TOKEN is not configured; Telegraph editing is unavailable."
+        )
+    title = title.strip()
+    if not title or len(title) > 256:
+        raise ValueError("The article title must contain 1 to 256 characters.")
+    return _get_telegraph().edit_page(
+        path=_telegraph_path(page_url_or_path),
+        title=title,
+        html_content=html_content,
+    )
 
 
 def is_pl_article_url(text: str, entities: list | None = None) -> bool:

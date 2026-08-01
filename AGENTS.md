@@ -32,6 +32,7 @@ When downloading and re-uploading media, the temp file must include the original
 - Keep `.env` out of git. The session file is committed as a convenience, but `TELETHON_SESSION_STRING` takes priority.
 - The env var is `OPEN_ROUTER_API_KEY` (with underscore between OPEN and ROUTER). The old specs.md uses `OPENROUTER_API_KEY` (no underscore) — that's wrong.
 - `TELEGRAPH_ACCESS_TOKEN` (optional): set this to keep all Telegraph articles under a single account. Without it, a new account is created on every bot restart.
+- `TELEGRAPH_EDITOR_BASE_URL` (optional): public HTTPS base URL of the deployed app. `/edit` uses it for short-lived editor links; on Coolify, `COOLIFY_URL`/`COOLIFY_FQDN` is detected automatically.
 - `PRICE_PREDICTIONS_ENABLED` (optional, default `true`): set to `false` to pause the nightly price prediction scheduler post (useful during FPL off-season).
 - `LEAGUE_CODE` (optional, default `433b70`): FPL league code for the invite link in deadline posts.
 - Secrets and identities stay in `.env` / Coolify environment variables: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELETHON_SESSION_STRING`, `TELEGRAM_BOT_TOKEN`, `ADMIN_USER_IDS`, `OPEN_ROUTER_API_KEY`, `TELEGRAPH_ACCESS_TOKEN`, `YOUTUBE_API_KEY`, `X_BEARER_TOKEN`, and `X_RAPIDAPI_KEY`.
@@ -46,8 +47,8 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - Without `RUNTIME_CONFIG_PATH`, the bot still runs using a non-persistent DB beside the code; settings reset after a redeploy.
 - The BotFather dashboard is enabled only if both `TELEGRAM_BOT_TOKEN` and numeric comma-separated `ADMIN_USER_IDS` are set. It accepts private-chat commands only.
 - Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`, `/y`, `/a`, `/edit`.
-- `/a https://...` (or `a/https://...`) extracts an arbitrary article in reader mode, translates it, publishes it to Telegraph, and schedules the channel post after the usual 10-minute review delay.
-- `/edit` lists the ten most recently published pages under the shared Telegraph account. After an admin selects one, it sends a one-time browser authorization link plus the chosen article URL. Open the authorization button first and then the article button in the same browser; the article's `EDIT` button appears at the bottom. The authorization link is valid for five minutes and permits editing every page under the shared `TELEGRAPH_ACCESS_TOKEN` account; never send the raw access token to admins.
+- `/a https://...` (or `a/https://...`) extracts an arbitrary article in reader mode, translates it, publishes it to Telegraph, and places the channel post in the normal half-hour review queue.
+- `/edit` lists the ten most recently published pages under the shared Telegraph account. After an admin selects one, it sends a private editor link that must be opened within 15 minutes; an opened editor remains valid for two hours or until a successful save. The editor loads and saves the existing page through Telegraph's `getPage`/`editPage` APIs, so the page URL stays unchanged and the raw `TELEGRAPH_ACCESS_TOKEN` never reaches the browser. The link is a temporary capability and must stay in the private admin chat.
 - Dashboard-generated content always requires an explicit publish confirmation. Lineups are source-driven and publish automatically when detected.
 
 ## X post import
@@ -242,9 +243,15 @@ Deduplication uses the `last_updated` DB table (same as deadline posts).
 
 Price predictions can be paused by setting `PRICE_PREDICTIONS_ENABLED=false` in `.env`. The scheduler loop still runs, but `_check_price_post()` is skipped.
 
-## Translated post delay
+## Translated post queue
 
-All messages that go through LLM translation (forwarded from source channels) are **scheduled 10 minutes ahead** via Telethon's `schedule` parameter (`SCHEDULE_DELAY_MINUTES = 10`). This gives admins time to review before publication.
+All messages that go through LLM translation (forwarded source posts, articles, X imports, and YouTube imports) use the shared half-hour publishing queue in `post_queue.py`:
+
+- Publishing slots run every 30 minutes from 08:30 through 00:30 Iran time.
+- The next upcoming slot is treated as the current slot and skipped. For example, a post received at 13:12 starts at 14:00, then later posts take 14:30, 15:00, and so on.
+- During the 00:30–08:00 blackout, queued posts start at 08:30.
+- Existing Telegram scheduled messages are read before each allocation, so occupied slots remain respected after a bot restart.
+- Slot allocation and sending share an async lock, preventing concurrent translations from taking the same slot.
 
 Exceptions (sent immediately, no delay):
 - Game-action alerts (`alerts.py`)
