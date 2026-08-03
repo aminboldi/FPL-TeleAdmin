@@ -218,17 +218,20 @@ def _youtube_description_preview(text: str) -> str:
 
 
 def _format_telegraph_post(
-    title: str, summary: str, telegraph_url: str, *, original_url: str | None = None,
+    title: str, summary: str, telegraph_url: str, *, source_name: str = "",
 ) -> str:
+    summary_text = html_lib.unescape(_strip_html_tags(summary)).strip()
+    source_suffix = f" {_escape_html(source_name)}" if source_name else ""
     post = (
-        f"<b>✍ مقاله:</b>\n\n"
+        f"<b>✍ مقاله جدید{source_suffix}</b>\n\n"
         f"<b>{_escape_html(title)}</b>\n\n"
         f"- - - - - - - - -\n\n"
-        f"{summary}"
+        f"{_escape_html(summary_text)}"
     )
-    if original_url:
-        post += f'\n\n<a href="{original_url}">مشاهدهٔ ویدیوی اصلی در YouTube</a>'
-    post += f'\n\n<a href="{telegraph_url}">متن کامل مقاله: 👇👇👇</a>'
+    post += (
+        f'\n\n<b><a href="{_escape_html(telegraph_url)}">'
+        f"👈👈متن کامل فارسی مقاله👉👉</a></b>"
+    )
     return f"{post}\n\n{AI_SIGNATURE}"
 
 
@@ -885,15 +888,34 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     if not article:
         return False
 
+    feature_image = article.get("feature_image") or article.get("header_image", "")
+    if not feature_image:
+        feature_image = next(
+            (
+                part.get("src", "")
+                for part in article.get("parts", [])
+                if part.get("type") == "img" and part.get("src")
+            ),
+            "",
+        )
+    if not feature_image:
+        feature_image = next(iter(article.get("images", [])), "")
+    if not feature_image:
+        raise RuntimeError("مقاله تصویر شاخص ندارد و تصویری برای انتشار پیدا نشد.")
+
     if article.get("parts"):
         raw_html = articles.build_article_html(
             article["title"], article["date"], article["summary"],
-            article["parts"], article["url"], article.get("header_image", ""),
+            article["parts"], article["url"],
         )
     else:
         raw_html = articles.build_general_article_html(article)
+    raw_html = articles.remove_images_from_html(
+        raw_html, [feature_image], article.get("url", url)
+    )
 
-    result = await translator.translate_article(raw_html)
+    translation_html, inline_images = articles.prepare_article_html(raw_html)
+    result = await translator.translate_article(translation_html)
     title = _article_title(
         _fix_unclosed_tags(_strip_quotes(result.get("title", ""))), article["title"]
     )
@@ -901,19 +923,41 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     translated = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
     if not translated.strip():
         raise RuntimeError("Article translation was empty.")
-    translated = articles.restore_missing_images(
-        translated, article.get("images", [article.get("header_image", "")])
+    # Prefer the image positions represented in the extracted article HTML.
+    # The article-level image list is only a fallback for pages whose reader
+    # mode omitted all inline images (for example, lazy-loaded images).
+    source_images = inline_images or article.get(
+        "images", [article.get("header_image", "")]
     )
-    telegraph_url = articles.publish_to_telegraph(title, translated)
-    if not telegraph_url:
-        raise RuntimeError("Telegraph publishing failed.")
+    source_images = [image for image in source_images if image != feature_image]
+    translated = articles.restore_images_in_place(translated, source_images)
+    translated = articles.append_original_article_link(translated, article["url"])
 
-    caption = _format_telegraph_post(title, _strip_html_tags(summary), telegraph_url)
-    await _send_to_target(caption, event=event, queue=True)
-    if event:
-        await _send_notification(event, caption)
-    else:
-        await _send_notification(None, caption, source="Article", is_media=False)
+    feature_path = await asyncio.to_thread(
+        _download_remote_media, feature_image, "photo"
+    )
+    try:
+        telegraph_url = articles.publish_to_telegraph(
+            title, translated, raise_on_error=True
+        )
+        if not telegraph_url:
+            raise RuntimeError("Telegraph returned no article URL.")
+
+        caption = _format_telegraph_post(
+            title,
+            summary,
+            telegraph_url,
+            source_name=article.get("source_name", ""),
+        )
+        await _send_to_target(
+            caption, file_path=feature_path, event=event, queue=True
+        )
+        if event:
+            await _send_notification(event, caption, is_media=True)
+        else:
+            await _send_notification(None, caption, source="Article", is_media=True)
+    finally:
+        Path(feature_path).unlink(missing_ok=True)
     logger.info("Published article from %s", url)
     return True
 

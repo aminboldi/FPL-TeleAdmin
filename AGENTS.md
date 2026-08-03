@@ -287,8 +287,9 @@ When a source message contains a URL, `_maybe_post_article()` runs **after** the
 
 - `articles.is_pl_article_url()` selects the site-specific Premier League extractor for `premierleague.com/en/news/...`, short `preml.ge/...`, and `t.co/...` links.
 - `articles.fetch_article()` uses BeautifulSoup for Premier League pages and Trafilatura reader mode for other article-like pages. General pages need at least 500 readable characters and are skipped if inaccessible or likely paywalled.
-- Widgets stripped: `.articleWidget`, `.embeddable-article`, `.article-related-content`, `.media-actions`, `.article__share-container`
-- The translated HTML is published to Telegraph; the Telegram post links to it
+- Source-specific cleanup removes known promotional blocks and article footers before translation. PL cards/widgets, FFFix Premium blocks, FFScout `READ MORE`/trailing content, and AllAboutFPL `Further Read`/FFHUB/footer blocks are excluded.
+- A feature image is selected from the source social/header image, or the first article image, and sent with the Telegram post. It is removed from Telegraph so users do not see it twice. Remaining inline images are replaced with positional `[[TELEADMIN_IMAGE_N]]` markers and restored at those positions afterward.
+- Source hyperlinks are removed while retaining visible text. The original article URL is appended only at the end of the Telegraph article, never in the Telegram caption.
 
 ### 2. Long-text / merged-chunk articles (>940 chars)
 
@@ -298,7 +299,7 @@ When a single text message exceeds 940 source characters (`_ARTICLE_SOURCE_THRES
 
 Long-form content (>940 source chars) and merged text chunks are published as Telegraph articles via `articles.publish_to_telegraph()`.
 
-- `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله:` header, title, divider, summary, and `متن کامل مقاله: 👇👇👇` linked to the Telegraph URL
+- `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله جدید <source>` header, title, AI-generated summary, and `👈👈متن کامل فارسی مقاله👉👉` linked to the Telegraph URL. URL article posts include their feature image as Telegram media.
 - `translator.translate_article()` uses `article_prompt.txt` for structured JSON output (`title`/`summary`/`body`), falling back to regular translation if JSON parsing fails
 - Set `TELEGRAPH_ACCESS_TOKEN` env var to keep articles under a single Telegraph account; without it a new account is created on every restart
 

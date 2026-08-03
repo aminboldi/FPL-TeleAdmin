@@ -6,7 +6,7 @@ from html import escape
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from telegraph import Telegraph
 import trafilatura
 
@@ -31,6 +31,15 @@ _TCO_URL_RE = re.compile(
     r"https?://t\.co/\S+"
 )
 
+_PL_PROMOTIONAL_SELECTORS = (
+    ".articleWidget",
+    ".embeddable-article",
+    ".article-related-content",
+    ".media-actions",
+    ".article__share-container",
+    "a.content-card",
+)
+
 _GENERAL_ARTICLE_MIN_CHARS = 500
 _PAYWALL_MARKERS = (
     "subscribe to continue",
@@ -42,6 +51,32 @@ _PAYWALL_MARKERS = (
     "subscriber-only content",
     "premium content",
 )
+_FFFIX_HOSTS = {"fantasyfootballfix.com", "www.fantasyfootballfix.com"}
+_FFSCOUT_HOSTS = {
+    "fantasyfootballscout.co.uk",
+    "www.fantasyfootballscout.co.uk",
+}
+_ALLABOUTFPL_HOSTS = {"allaboutfpl.com", "www.allaboutfpl.com"}
+_ARTICLE_SOURCE_NAMES = {
+    "fantasyfootballfix.com": "Fantasy Football Fix",
+    "fantasyfootballscout.co.uk": "Fantasy Football Scout",
+    "allaboutfpl.com": "AllAboutFPL",
+    "premierleague.com": "Premier League",
+}
+_FFFIX_PROMO_LINKS = {
+    "/premium/",
+    "/reveal/",
+    "/blog-index/",
+}
+_FFFIX_PROMO_LABELS = (
+    "claim 50% off premium plus today",
+    "track elite manager team changes",
+    "stay ahead with expert fpl tips",
+)
+_FFFIX_END_MARKER = (
+    "unlock live elite team reveals, ai transfer recommendations and all our "
+    "opta-powered planning tools with premium plus"
+)
 _TELEGRAPH_TAGS = {
     "a", "b", "blockquote", "br", "code", "em", "figure", "figcaption",
     "h3", "h4", "hr", "i", "img", "li", "ol", "p", "pre", "s",
@@ -49,6 +84,10 @@ _TELEGRAPH_TAGS = {
 }
 
 _telegraph: Telegraph | None = None
+
+
+class TelegraphPublishError(RuntimeError):
+    """Raised when Telegraph rejects an article publication."""
 
 
 def _get_telegraph() -> Telegraph:
@@ -172,6 +211,12 @@ def _ensure_https(url: str) -> str:
     return url
 
 
+def article_source_name(url: str) -> str:
+    """Return the publication name used in the Telegram article header."""
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    return _ARTICLE_SOURCE_NAMES.get(host, host or "منبع وب")
+
+
 def _fetch_pl_article(url: str) -> dict | None:
     if not url.startswith("http"):
         url = "https://" + url
@@ -200,16 +245,17 @@ def _fetch_pl_article(url: str) -> dict | None:
     if header_img:
         src = header_img.get("src") or header_img.get("data-src") or ""
         if src:
-            header_image = src
+            header_image = urljoin(final_url, src)
 
     content_el = soup.select_one(".article__content")
     if not content_el:
         return None
 
-    for widget in content_el.select(
-        ".articleWidget, .embeddable-article, .article-related-content, "
-        ".media-actions, .article__share-container"
-    ):
+    # The PL site uses content cards/widgets for promotions and related
+    # articles. Remove them before walking the article body. Related Content
+    # normally sits just outside ``article__content``, but removing it here as
+    # well keeps the boundary safe if the frontend moves it inside later.
+    for widget in soup.select(", ".join(_PL_PROMOTIONAL_SELECTORS)):
         widget.decompose()
 
     parts = []
@@ -226,7 +272,7 @@ def _fetch_pl_article(url: str) -> dict | None:
             if img:
                 src = img.get("src") or img.get("data-src") or ""
                 if src:
-                    parts.append({"type": "img", "src": src})
+                    parts.append({"type": "img", "src": urljoin(final_url, src)})
 
     if not parts:
         raw_text = content_el.get_text(separator="\n", strip=True)
@@ -240,6 +286,10 @@ def _fetch_pl_article(url: str) -> dict | None:
         "parts": parts,
         "url": final_url,
         "header_image": header_image,
+        "feature_image": header_image or next(
+            (part["src"] for part in parts if part["type"] == "img"), ""
+        ),
+        "source_name": article_source_name(final_url),
     }
 
 
@@ -267,6 +317,13 @@ def _telegraph_safe_article_html(extracted_html: str, base_url: str) -> tuple[st
             tag.unwrap()
             continue
 
+        if tag.name == "a":
+            # Source article links are commonly promotional/SEO links. Keep
+            # their visible text, but do not carry the hyperlinks into the
+            # translated Telegraph article.
+            tag.unwrap()
+            continue
+
         if tag.name == "img":
             src = str(tag.get("src") or "").strip()
             src = urljoin(base_url, src)
@@ -275,10 +332,6 @@ def _telegraph_safe_article_html(extracted_html: str, base_url: str) -> tuple[st
                 continue
             tag.attrs = {"src": src}
             images.append(src)
-        elif tag.name == "a":
-            href = str(tag.get("href") or "").strip()
-            href = urljoin(base_url, href)
-            tag.attrs = {"href": href} if href.startswith(("http://", "https://")) else {}
         else:
             tag.attrs = {}
 
@@ -305,6 +358,167 @@ def _source_article_images(soup: BeautifulSoup, base_url: str) -> list[str]:
     return list(dict.fromkeys(images))
 
 
+def _is_fff_article_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.hostname in _FFFIX_HOSTS and parsed.path.startswith("/blog-index/")
+
+
+def _fff_normalized_text(element) -> str:
+    return " ".join(element.get_text(" ", strip=True).split()).lower()
+
+
+def _clean_fff_article_html(source_html: str) -> str:
+    """Remove Fantasy Football Fix's inline and trailing sales blocks.
+
+    FFFix places the article in a stable ``section.block-paragraph``. Its
+    inline sales links are a list between two ``hr`` elements, while the
+    trailing offer starts at the final ``hr`` and includes a banner image.
+    Cleaning this before reader-mode extraction prevents promotional copy and
+    images from reaching translation.
+    """
+    soup = BeautifulSoup(source_html, "html.parser")
+    article = soup.select_one("div.white-inner.blog-article")
+    content = article.select_one("section.block-paragraph") if article else None
+    if content is None:
+        return source_html
+
+    # These are the three-link Premium Plus block. Match both its visible
+    # labels and destinations so ordinary article lists are left untouched.
+    for unordered_list in list(content.find_all("ul")):
+        labels = _fff_normalized_text(unordered_list)
+        links = {
+            urlparse(urljoin("https://www.fantasyfootballfix.com", anchor.get("href", ""))).path
+            for anchor in unordered_list.find_all("a")
+        }
+        if all(label in labels for label in _FFFIX_PROMO_LABELS) and _FFFIX_PROMO_LINKS <= links:
+            previous = unordered_list.find_previous_sibling()
+            following = unordered_list.find_next_sibling()
+            unordered_list.decompose()
+            if previous and previous.name == "hr":
+                previous.decompose()
+            if following and following.name == "hr":
+                following.decompose()
+
+    # The first divider whose remainder contains the offer copy is the end of
+    # the actual article. Remove that divider and all following siblings.
+    children = list(content.find_all(recursive=False))
+    for index, child in enumerate(children):
+        if child.name != "hr":
+            continue
+        remainder = " ".join(
+            _fff_normalized_text(item) for item in children[index + 1:]
+        )
+        if _FFFIX_END_MARKER in remainder:
+            for item in children[index:]:
+                item.extract()
+            break
+
+    # Keep the extractor focused on the article body even if the page adds
+    # related cards or a site-wide offer inside the outer article wrapper.
+    for extra in article.select(".blog-tag-btns, .blog-end-offer, .blog-cards--related"):
+        extra.decompose()
+    # This dedicated image is the article's feature image. It is sent as the
+    # Telegram media post and must not be repeated in Telegraph. The source
+    # uses a WebP variant here while og:image commonly points to a PNG.
+    header = article.select_one(".blog-image")
+    if header:
+        header.decompose()
+    return str(article)
+
+
+def _is_ffscout_article_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.hostname in _FFSCOUT_HOSTS
+
+
+def _clean_ffscout_article_html(source_html: str) -> str:
+    """Remove FFScout's inline read-more and trailing promotion blocks."""
+    soup = BeautifulSoup(source_html, "html.parser")
+    entry = soup.select_one("section.entry-content")
+    if entry is None:
+        return source_html
+
+    for paragraph in list(entry.find_all("p")):
+        if _fff_normalized_text(paragraph).startswith("read more:"):
+            paragraph.decompose()
+
+    # The final WordPress separator marks the end of the article. The figure
+    # and entry links after it are site promotion/navigation, not article
+    # content. Keep earlier separators because they can divide real sections.
+    separators = entry.find_all(
+        "hr", class_=lambda value: value and "wp-block-separator" in value
+    )
+    if separators:
+        final_separator = separators[-1]
+        for sibling in list(final_separator.find_next_siblings()):
+            sibling.decompose()
+        final_separator.decompose()
+
+    return str(entry)
+
+
+def _is_allaboutfpl_article_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.hostname in _ALLABOUTFPL_HOSTS
+
+
+def _clean_allaboutfpl_article_html(source_html: str) -> str:
+    """Remove AllAboutFPL's cross-links, affiliate promos, and footer copy."""
+    soup = BeautifulSoup(source_html, "html.parser")
+    entry = soup.select_one("article .entry-content, .entry-content")
+    if entry is None:
+        return source_html
+
+    children = list(entry.find_all(recursive=False))
+
+    # The first Further reads heading starts the site's link-heavy footer.
+    for index, child in enumerate(children):
+        if _fff_normalized_text(child).startswith("further reads from allaboutfpl"):
+            for item in children[index:]:
+                item.extract()
+            break
+
+    # Remove individual article-to-article recommendations before translation.
+    for paragraph in list(entry.find_all("p")):
+        if _fff_normalized_text(paragraph).startswith("further read:"):
+            paragraph.decompose()
+
+    # Affiliate promotions are presented as complete blocks between two
+    # WordPress separators. Remove the separators with the block so no empty
+    # sales divider remains in the cleaned article.
+    while True:
+        children = list(entry.find_all(recursive=False))
+        removed = False
+        for start, child in enumerate(children):
+            if child.name != "hr" or "wp-block-separator" not in (child.get("class") or []):
+                continue
+            end = next(
+                (
+                    index for index in range(start + 1, len(children))
+                    if children[index].name == "hr"
+                    and "wp-block-separator" in (children[index].get("class") or [])
+                ),
+                None,
+            )
+            if end is None:
+                continue
+            block = children[start + 1:end]
+            block_text = " ".join(_fff_normalized_text(item) for item in block)
+            block_links = " ".join(
+                str(anchor.get("href") or "").lower()
+                for item in block for anchor in item.find_all("a")
+            )
+            if "fantasy football hub" in block_text or "fantasyfootballhub.co.uk" in block_links:
+                for item in children[start:end + 1]:
+                    item.extract()
+                removed = True
+                break
+        if not removed:
+            break
+
+    return str(entry)
+
+
 def fetch_general_article(url: str) -> dict | None:
     """Extract a readable, server-rendered article from an arbitrary web page."""
     if not url.startswith(("http://", "https://")):
@@ -321,13 +535,21 @@ def fetch_general_article(url: str) -> dict | None:
     if not response.ok or "html" not in response.headers.get("content-type", "").lower():
         return None
 
+    source_html = response.text
+    if _is_fff_article_url(response.url):
+        source_html = _clean_fff_article_html(source_html)
+    elif _is_ffscout_article_url(response.url):
+        source_html = _clean_ffscout_article_html(source_html)
+    elif _is_allaboutfpl_article_url(response.url):
+        source_html = _clean_allaboutfpl_article_html(source_html)
+
     extracted = trafilatura.extract(
-        response.text,
+        source_html,
         url=response.url,
         output_format="html",
         include_comments=False,
         include_formatting=True,
-        include_links=True,
+        include_links=False,
         include_images=True,
         favor_precision=True,
         deduplicate=True,
@@ -347,18 +569,30 @@ def fetch_general_article(url: str) -> dict | None:
 
     page = BeautifulSoup(response.text, "html.parser")
     if not images:
-        images = _source_article_images(page, response.url)
+        # Use the cleaned source when a reader-mode extractor omits images;
+        # otherwise a page's promotional banners can be reintroduced by the
+        # fallback even though the article cleaner removed them.
+        images = _source_article_images(
+            BeautifulSoup(source_html, "html.parser"), response.url
+        )
     title = _metadata_content(page, "og:title", "twitter:title") or (
         page.title.get_text(" ", strip=True) if page.title else ""
     )
     if not title:
         return None
+    feature_image = _metadata_content(page, "og:image", "twitter:image")
+    if feature_image:
+        feature_image = urljoin(response.url, feature_image)
+    elif images:
+        feature_image = images[0]
     return {
         "title": title,
         "summary": _metadata_content(page, "og:description", "description"),
         "url": response.url,
         "html": content_html,
         "images": images,
+        "feature_image": feature_image,
+        "source_name": article_source_name(response.url),
     }
 
 
@@ -383,35 +617,158 @@ def build_article_html(title: str, date: str, summary: str, parts: list[dict], o
         elif part["type"] == "img":
             src = part["src"]
             result.append(f'<img src="{src}">')
-    result.append(f'<p><a href="{original_url}">پست اصلی</a></p>')
     return "".join(result)
 
 
 def build_general_article_html(article: dict) -> str:
-    """Wrap reader-mode content with a title and canonical source link."""
+    """Wrap reader-mode content with a translated title."""
     return (
         f"<h3>{escape(article['title'])}</h3>"
         f"{article['html']}"
-        f'<p><a href="{escape(article["url"], quote=True)}">پست اصلی</a></p>'
     )
 
 
-def restore_missing_images(html_content: str, image_urls: list[str]) -> str:
-    """Append any source images omitted by the model to the Telegraph article."""
-    present = set(re.findall(r'<img[^>]+src=["\']([^"\']+)', html_content, re.IGNORECASE))
-    missing = [url for url in image_urls if url and url not in present]
-    if not missing:
+def remove_images_from_html(
+    html_content: str, image_urls: list[str], base_url: str = "",
+) -> str:
+    """Remove selected image URLs before the article is translated."""
+    targets = {
+        urljoin(base_url, str(url).strip())
+        for url in image_urls
+        if str(url).strip()
+    }
+    if not targets:
         return html_content
-    return html_content + "".join(f'<img src="{escape(url, quote=True)}">' for url in missing)
+    soup = BeautifulSoup(html_content, "html.parser")
+    for image in soup.find_all("img"):
+        src = urljoin(base_url, str(image.get("src") or "").strip())
+        if src in targets:
+            image.decompose()
+    root = soup.body or soup
+    return "".join(str(child) for child in root.contents).strip()
 
 
-def publish_to_telegraph(title: str, html_content: str) -> str | None:
+def append_original_article_link(html_content: str, original_url: str) -> str:
+    """Append the source link to the end of a Telegraph article only."""
+    safe_url = escape(original_url, quote=True)
+    return (
+        f'{html_content.rstrip()}\n\n'
+        f'<p><a href="{safe_url}">منبع اصلی مقاله</a></p>'
+    )
+
+
+_IMAGE_MARKER_PREFIX = "TELEADMIN_IMAGE_"
+_IMAGE_MARKER_RE = re.compile(rf"\[\[{_IMAGE_MARKER_PREFIX}(\d+)\]\]")
+
+
+def prepare_article_html(html_content: str) -> tuple[str, list[str]]:
+    """Replace source images with stable markers before LLM translation.
+
+    The model is free to reflow paragraphs, but each marker remains at the
+    image's original position. The markers are converted back to real images
+    after translation, avoiding the old append-all-images fallback.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+    for anchor in soup.find_all("a"):
+        anchor.unwrap()
+
+    image_urls = []
+    for image in soup.find_all("img"):
+        src = str(image.get("src") or "").strip()
+        if not src:
+            image.decompose()
+            continue
+        index = len(image_urls) + 1
+        image_urls.append(src)
+        image.replace_with(NavigableString(f"[[{_IMAGE_MARKER_PREFIX}{index}]]"))
+
+    root = soup.body or soup
+    return "".join(str(child) for child in root.contents).strip(), image_urls
+
+
+def _remove_article_links(html_content: str) -> str:
+    """Remove hyperlinks while retaining their visible article text."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    for anchor in soup.find_all("a"):
+        anchor.unwrap()
+    root = soup.body or soup
+    return "".join(str(child) for child in root.contents).strip()
+
+
+def restore_images_in_place(html_content: str, image_urls: list[str]) -> str:
+    """Restore translated image markers at their original article positions."""
+    soup = BeautifulSoup(_remove_article_links(html_content), "html.parser")
+    restored = set()
+
+    for marker_node in list(soup.find_all(string=_IMAGE_MARKER_RE)):
+        text = str(marker_node)
+        parent = marker_node.parent
+        matches = list(_IMAGE_MARKER_RE.finditer(text))
+        if len(matches) == 1 and text.strip() == matches[0].group(0):
+            marker = matches[0].group(0)
+            index = int(matches[0].group(1))
+            if 0 < index <= len(image_urls):
+                image = soup.new_tag("img", src=image_urls[index - 1])
+                if parent.name == "p":
+                    parent.replace_with(image)
+                elif parent.name == "figure":
+                    parent.clear()
+                    parent.append(image)
+                else:
+                    marker_node.replace_with(image)
+                restored.add(index)
+            continue
+
+        # Markers may share a paragraph with text after the model reflows it.
+        # Insert each image before the original text node, preserving order.
+        for match in matches:
+            index = int(match.group(1))
+            if 0 < index <= len(image_urls):
+                marker_node.insert_before(
+                    soup.new_tag("img", src=image_urls[index - 1])
+                )
+                restored.add(index)
+        marker_node.replace_with(_IMAGE_MARKER_RE.sub("", text))
+
+    missing = [
+        (index, url) for index, url in enumerate(image_urls, start=1)
+        if index not in restored and url
+    ]
+    if missing:
+        logger.warning(
+            "Article translator omitted %d image marker(s); appending as fallback",
+            len(missing),
+        )
+    root = soup.body or soup
+    for _, url in missing:
+        root.append(soup.new_tag("img", src=url))
+    return "".join(str(child) for child in root.contents).strip()
+
+
+def restore_missing_images(html_content: str, image_urls: list[str]) -> str:
+    """Backward-compatible wrapper for callers using the old helper name."""
+    return restore_images_in_place(html_content, image_urls)
+
+
+def publish_to_telegraph(
+    title: str, html_content: str, *, raise_on_error: bool = False,
+) -> str | None:
     try:
         tg = _get_telegraph()
         page = tg.create_page(title=title, html_content=html_content)
         url = page.get("url", "")
         logger.info("Telegraph page created: %s", url)
         return url
-    except Exception as e:
-        logger.error("Telegraph publish failed: %s", e)
+    except Exception as exc:
+        logger.exception(
+            "Telegraph publish failed: title=%r html_chars=%d html_bytes=%d error=%s",
+            title,
+            len(html_content),
+            len(html_content.encode("utf-8")),
+            exc,
+        )
+        if raise_on_error:
+            raise TelegraphPublishError(
+                f"Telegraph rejected the article: {type(exc).__name__}: {exc}"
+            ) from exc
         return None

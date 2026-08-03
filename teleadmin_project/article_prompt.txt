@@ -4,13 +4,15 @@ Return your response as a JSON object with exactly three fields:
 
 {
   "title": "A compelling Persian title (one line, under 100 chars)",
-  "summary": "A short excerpt/summary (2-3 sentences, under 400 chars)",
+  "summary": "A synthesized AI summary of the article's overall key points (2-3 sentences, under 400 chars; do not copy only the first paragraph)",
   "body": "The full translated article in Persian"
 }
 
 Constraints for the body:
-- Return valid Telegraph HTML only; never use Markdown. Telegraph supports: <p>, <br>, <h3>, <h4>, <b>, <strong>, <i>, <em>, <blockquote>, <ul>, <ol>, <li>, <hr>, <code>, <pre>, <a href="...">, <img>, and <figure>.
-- The input may contain HTML formatting tags. Preserve every existing tag and every existing attribute EXACTLY. You may add only the supported Telegraph tags above around plain text to make the article readable.
+- Return valid Telegraph HTML only; never use Markdown. Telegraph supports: <p>, <br>, <h3>, <h4>, <b>, <strong>, <i>, <em>, <blockquote>, <ul>, <ol>, <li>, <hr>, <code>, <pre>, <img>, and <figure>.
+- The input may contain HTML formatting tags. Preserve every existing tag and every existing attribute EXACTLY, except that hyperlinks must be removed as described below. You may add only the supported Telegraph tags above around plain text to make the article readable.
+- Image placeholders in the form [[TELEADMIN_IMAGE_1]], [[TELEADMIN_IMAGE_2]], etc. represent inline images. Preserve every placeholder exactly, do not translate, remove, duplicate, or reorder them, and keep each one at the same point in the article where it appears in the input.
+- Do not create, preserve, or move hyperlinks. If any <a> tag is present, keep its visible text but remove the link itself.
 - Format the body as a real article, never as one continuous block: use <p>...</p> for short, coherent paragraphs (normally 1–3 related sentences) and insert paragraph breaks generously whenever the topic, speaker, or point changes.
 - Use <h3> or <h4> only for genuine section changes that improve scanning. Use <ul>/<ol> with <li> for real enumerations, steps, comparisons, or grouped recommendations; do not turn ordinary prose into a list.
 - When the source clearly contains dialogue, quoted speech, or a speaker attribution, give each distinct quotation its own <blockquote>. Keep the speaker attribution in <b>...</b> when present. Do not invent speakers, quotes, headings, or lists.
