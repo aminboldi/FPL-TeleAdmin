@@ -930,7 +930,9 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
         "images", [article.get("header_image", "")]
     )
     source_images = [image for image in source_images if image != feature_image]
-    translated = articles.restore_images_in_place(translated, source_images)
+    translated = articles.restore_images_in_place(
+        translated, source_images, source_html=translation_html
+    )
     translated = articles.append_original_article_link(translated, article["url"])
 
     feature_path = await asyncio.to_thread(
@@ -1083,9 +1085,9 @@ async def _import_youtube_transcript(url: str) -> str:
         translated_description = _fix_unclosed_tags(
             _strip_quotes(await translator.translate(_escape_html(description)))
         )
-    article_summary = _youtube_description_preview(translated_description) if translated_description else _fix_unclosed_tags(
-        _strip_quotes(article.get("summary", ""))
-    )
+    article_summary = _fix_unclosed_tags(_strip_quotes(article.get("summary", "")))
+    if not article_summary:
+        article_summary = _youtube_description_preview(translated_description)
     article_body = _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
     if not article_body.strip():
         raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")

@@ -695,48 +695,164 @@ def _remove_article_links(html_content: str) -> str:
     return "".join(str(child) for child in root.contents).strip()
 
 
-def restore_images_in_place(html_content: str, image_urls: list[str]) -> str:
+def _image_marker_positions(html_content: str) -> tuple[dict[int, int], int]:
+    """Return each marker's top-level position in the source article HTML."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    root = soup.body or soup
+    nodes = [node for node in root.contents if str(node).strip()]
+    positions: dict[int, int] = {}
+
+    for marker_node in soup.find_all(string=_IMAGE_MARKER_RE):
+        current = marker_node
+        while current.parent is not None and current.parent is not root:
+            current = current.parent
+        try:
+            position = nodes.index(current)
+        except ValueError:
+            continue
+        for match in _IMAGE_MARKER_RE.finditer(str(marker_node)):
+            positions[int(match.group(1))] = position
+    return positions, len(nodes)
+
+
+def restore_images_in_place(
+    html_content: str,
+    image_urls: list[str],
+    *,
+    source_html: str | None = None,
+) -> str:
     """Restore translated image markers at their original article positions."""
     soup = BeautifulSoup(_remove_article_links(html_content), "html.parser")
     restored = set()
+
+    def image_for_marker(index: int):
+        if 0 < index <= len(image_urls) and image_urls[index - 1]:
+            return soup.new_tag("img", src=image_urls[index - 1])
+        return None
+
+    # Some models understand the placeholder as an image instruction and
+    # return it as ``<img src="[[TELEADMIN_IMAGE_1]]">``.  That is still a
+    # valid representation of the right position, but searching only text
+    # nodes (as the old implementation did) misses it and appends the image
+    # at the end as a false fallback.
+    for tag in list(soup.find_all(True)):
+        marker_matches = []
+        for value in tag.attrs.values():
+            marker_matches.extend(_IMAGE_MARKER_RE.finditer(str(value)))
+        if not marker_matches:
+            continue
+
+        valid_match = next(
+            (
+                match for match in marker_matches
+                if image_for_marker(int(match.group(1))) is not None
+            ),
+            None,
+        )
+        if valid_match is None:
+            continue
+        index = int(valid_match.group(1))
+        image = image_for_marker(index)
+        if tag.name == "img":
+            # Telegraph only needs the source URL. Dropping model-added attrs
+            # also removes the placeholder if it was placed in alt/title.
+            tag.replace_with(image)
+        else:
+            # Keep surrounding translated text and put the image at the
+            # placeholder element's location.
+            tag.insert_before(image)
+            for attr, value in list(tag.attrs.items()):
+                if _IMAGE_MARKER_RE.search(str(value)):
+                    del tag.attrs[attr]
+        restored.add(index)
 
     for marker_node in list(soup.find_all(string=_IMAGE_MARKER_RE)):
         text = str(marker_node)
         parent = marker_node.parent
         matches = list(_IMAGE_MARKER_RE.finditer(text))
         if len(matches) == 1 and text.strip() == matches[0].group(0):
-            marker = matches[0].group(0)
             index = int(matches[0].group(1))
-            if 0 < index <= len(image_urls):
-                image = soup.new_tag("img", src=image_urls[index - 1])
-                if parent.name == "p":
-                    parent.replace_with(image)
-                elif parent.name == "figure":
-                    parent.clear()
-                    parent.append(image)
+            image = image_for_marker(index)
+            if image is not None:
+                # Replace a marker-only block, but do not discard sibling text
+                # if the model kept the marker in a paragraph with content.
+                marker_block = parent.find_parent(["p", "figure"])
+                if (
+                    marker_block is not None
+                    and marker_block.get_text(strip=True) == text.strip()
+                    and not marker_block.find("img")
+                ):
+                    if marker_block.name == "figure":
+                        marker_block.clear()
+                        marker_block.append(image)
+                    else:
+                        marker_block.replace_with(image)
                 else:
                     marker_node.replace_with(image)
                 restored.add(index)
             continue
 
         # Markers may share a paragraph with text after the model reflows it.
-        # Insert each image before the original text node, preserving order.
+        # Split the text node at each marker so the image stays at the exact
+        # point where the marker occurred, rather than before the whole node.
+        cursor = 0
         for match in matches:
+            prefix = text[cursor:match.start()]
+            if prefix:
+                marker_node.insert_before(NavigableString(prefix))
             index = int(match.group(1))
-            if 0 < index <= len(image_urls):
-                marker_node.insert_before(
-                    soup.new_tag("img", src=image_urls[index - 1])
-                )
+            image = image_for_marker(index)
+            if image is not None:
+                marker_node.insert_before(image)
                 restored.add(index)
-        marker_node.replace_with(_IMAGE_MARKER_RE.sub("", text))
+            cursor = match.end()
+        suffix = text[cursor:]
+        if suffix:
+            marker_node.insert_before(NavigableString(suffix))
+        marker_node.extract()
 
     missing = [
         (index, url) for index, url in enumerate(image_urls, start=1)
         if index not in restored and url
     ]
+    if missing and source_html:
+        source_positions, source_node_count = _image_marker_positions(source_html)
+        target_root = soup.body or soup
+        target_nodes = [node for node in target_root.contents if str(node).strip()]
+        target_node_count = len(target_nodes)
+        inserted_at_rank = {}
+
+        for index, url in missing:
+            source_position = source_positions.get(index)
+            if source_position is None or not source_node_count or not target_nodes:
+                continue
+            target_rank = min(
+                target_node_count,
+                (
+                    source_position * target_node_count
+                    + source_node_count - 1
+                ) // source_node_count,
+            )
+            image = soup.new_tag("img", src=url)
+            if target_rank >= len(target_nodes):
+                target_root.append(image)
+                inserted_at_rank[target_rank] = image
+            elif target_rank in inserted_at_rank:
+                inserted_at_rank[target_rank].insert_after(image)
+                inserted_at_rank[target_rank] = image
+            else:
+                target_nodes[target_rank].insert_before(image)
+                inserted_at_rank[target_rank] = image
+            restored.add(index)
+
+        missing = [
+            (index, url) for index, url in missing if index not in restored
+        ]
+
     if missing:
         logger.warning(
-            "Article translator omitted %d image marker(s); appending as fallback",
+            "Article translator omitted %d image marker(s); appending %d without a source position",
+            len(missing),
             len(missing),
         )
     root = soup.body or soup

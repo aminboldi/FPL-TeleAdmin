@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import re
+import html as html_lib
 
 from openai import AsyncOpenAI
 
@@ -9,6 +10,8 @@ TRANSLATION_PROMPT = _prompt_path.read_text(encoding="utf-8")
 
 _article_prompt_path = Path(__file__).parent / "article_prompt.txt"
 ARTICLE_PROMPT = _article_prompt_path.read_text(encoding="utf-8")
+_summary_prompt_path = Path(__file__).parent / "summary_prompt.txt"
+SUMMARY_PROMPT = _summary_prompt_path.read_text(encoding="utf-8")
 _TRANSCRIPT_FORMATTING_INSTRUCTIONS = """
 
 Additional instructions for this raw YouTube transcript:
@@ -117,28 +120,118 @@ class Translator:
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
-            return self._normalize_article(
+            article = self._normalize_article(
                 await self._call_article_model(
                     self.google_client, self.google_model, text, formatting_instructions
                 )
             )
+            article["summary"] = (
+                await self.summarize_article(article.get("body", ""))
+                or article.get("summary", "")
+            )
+            return article
         except Exception:
             try:
-                return self._normalize_article(
+                article = self._normalize_article(
                     await self._call_article_model(
                         self.openrouter_client, self.fallback_model, text, formatting_instructions
                     )
                 )
+                article["summary"] = (
+                    await self.summarize_article(article.get("body", ""))
+                    or article.get("summary", "")
+                )
+                return article
             except Exception:
                 pass
-        # Fallback: translate normally and auto-generate title/summary
+        # Fallback: translate normally. Summary generation is deliberately
+        # handled separately, so a translation/API failure can never turn the
+        # first 300 characters of the article into a fake summary.
         body = await self.translate(text)
         body = body.strip()
         lines = body.split("\n")
         title = lines[0].strip()[:100] if lines else ""
-        plain = re.sub(r"<[^>]+>", "", body)
-        summary = plain[:300].strip()
+        summary = await self.summarize_article(body)
         return {"title": title, "summary": summary, "body": body}
+
+    async def summarize_article(self, translated_html: str) -> str:
+        """Create a concise Telegram preview from the complete translated article."""
+        source = self._summary_source_text(translated_html)
+        if not source:
+            return ""
+
+        try:
+            if not self.google_client:
+                raise TranslationError("Google AI Studio is not configured")
+            return self._clean_summary(
+                await self._call_summary_model(
+                    self.google_client, self.google_model, source
+                )
+            )
+        except Exception:
+            try:
+                return self._clean_summary(
+                    await self._call_summary_model(
+                        self.openrouter_client, self.fallback_model, source
+                    )
+                )
+            except Exception:
+                # The long article itself is still publishable if this optional
+                # preview call fails. Callers can use the structured summary as
+                # a secondary fallback.
+                return ""
+
+    @staticmethod
+    def _summary_source_text(text: str) -> str:
+        """Make translated HTML readable to the plain-text summary prompt."""
+        text = re.sub(r"<img\b[^>]*>", "", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"</(?:p|h[1-6]|li|blockquote|figure|br|hr)>",
+            "\n",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html_lib.unescape(text)
+        text = re.sub(r"\[\[TELEADMIN_IMAGE_\d+\]\]", "", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _clean_summary(text: str) -> str:
+        """Normalize a model response and enforce a caption-sized summary."""
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        raw = raw.strip()
+
+        # Accept a JSON response despite asking for plain text, but never pass
+        # JSON or a markdown label into the Telegram caption.
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end > start:
+            try:
+                value = json.loads(raw[start:end + 1]).get("summary", "")
+                if isinstance(value, str):
+                    raw = value
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        raw = re.sub(r"^(?:summary|خلاصه)\s*:\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"^(?:[-*•]\s+)", "", raw)
+        raw = re.sub(r"<[^>]+>", "", raw)
+        raw = html_lib.unescape(re.sub(r"\s+", " ", raw)).strip(" \"'")
+        raw = _translate_team_abbreviations(_normalize_digits(raw))
+        if len(raw) <= 400:
+            return raw
+
+        # Prefer a complete sentence over a hard character cut. Persian text
+        # may use either Persian or Latin punctuation.
+        candidate = raw[:400]
+        boundary = max(candidate.rfind("."), candidate.rfind("؟"), candidate.rfind("!"), candidate.rfind("؛"))
+        if boundary >= 160:
+            return candidate[:boundary + 1].strip()
+        return candidate.rstrip() + "…"
 
     @staticmethod
     def _normalize_article(article: dict[str, str]) -> dict[str, str]:
@@ -189,3 +282,16 @@ class Translator:
             raw = raw[start:end + 1]
 
         return json.loads(raw)
+
+    async def _call_summary_model(
+        self, client: AsyncOpenAI, model: str, text: str,
+    ) -> str:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": SUMMARY_PROMPT.format(text=text)}
+            ],
+            temperature=0.2,
+            max_tokens=600,
+        )
+        return response.choices[0].message.content.strip()
