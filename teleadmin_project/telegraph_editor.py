@@ -6,6 +6,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from bs4 import BeautifulSoup
@@ -21,6 +22,10 @@ _LINK_LIFETIME_SECONDS = 15 * 60
 _OPEN_EDITOR_LIFETIME_SECONDS = 2 * 60 * 60
 _MAX_REQUEST_BYTES = 256 * 1024
 _CATALOG_PAGE_SIZE = 24
+_STATIC_ASSETS = {
+    "/logo.webp": (Path(__file__).resolve().parent.parent / "logo.webp", "image/webp"),
+    "/fav-icon.png": (Path(__file__).resolve().parent.parent / "fav-icon.png", "image/png"),
+}
 _catalog_sync_lock = asyncio.Lock()
 _catalog_synced = False
 
@@ -283,37 +288,44 @@ def _catalog_page(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>مقالات فارسی فانتزی</title>
+  <link rel="icon" href="/fav-icon.png" type="image/png">
+  <title>مقالات فوتبال فانتزی لیگ برتر انگلیس FPL</title>
   <style>
     :root {{ color-scheme: light; font-family: Tahoma, system-ui, sans-serif; }}
     body {{ margin: 0; background: #f3f5f7; color: #18202a; }}
-    header {{ background: #182b3a; color: white; padding: 34px 18px 28px; }}
+    header {{ background: #310b34; color: white; padding: 24px 18px 22px; }}
     .wrap {{ max-width: 1120px; margin: 0 auto; }}
+    .brand {{ display: flex; align-items: center; gap: 16px; }}
+    .logo {{ display: block; width: 58px; height: 72px; object-fit: contain; flex: 0 0 auto; }}
     header h1 {{ margin: 0 0 8px; font-size: 27px; }}
     header p {{ margin: 0; color: #d8e3ea; }}
     form {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 22px auto; }}
     input, select, button {{ border: 1px solid #ccd4dc; border-radius: 8px; padding: 11px 12px; font: inherit; }}
     input {{ flex: 1 1 260px; min-width: 180px; }}
     select {{ min-width: 170px; background: white; }}
-    button {{ background: #168acd; border-color: #168acd; color: white; cursor: pointer; }}
+    button {{ background: #02eefe; border-color: #02eefe; color: #310b34; cursor: pointer; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; padding-bottom: 24px; }}
     .card {{ overflow: hidden; background: white; border: 1px solid #e2e7eb; border-radius: 14px; box-shadow: 0 2px 10px #182b3a0d; }}
     .thumb {{ display: block; width: 100%; height: 170px; object-fit: cover; background: #e7edf1; }}
     .card-body {{ padding: 16px; }}
     .meta {{ display: flex; justify-content: space-between; gap: 8px; color: #687582; font-size: 12px; }}
     .tag {{ color: #126a9e; font-weight: 700; }}
+    a {{ color: #02eefe; }}
     h2 {{ font-size: 19px; line-height: 1.55; margin: 10px 0 8px; }}
-    h2 a {{ color: #18202a; text-decoration: none; }}
+    h2 a {{ color: #02eefe; text-decoration: none; }}
     .card p {{ color: #53616e; line-height: 1.8; min-height: 52px; margin: 0 0 12px; }}
-    .read {{ color: #168acd; font-weight: 700; text-decoration: none; }}
+    .read {{ color: #02eefe; font-weight: 700; text-decoration: none; }}
     .pager-row {{ display: flex; justify-content: space-between; min-height: 44px; }}
-    .pager {{ color: #168acd; font-weight: 700; text-decoration: none; }}
+    .pager {{ color: #02eefe; font-weight: 700; text-decoration: none; }}
     .empty {{ background: white; border-radius: 12px; padding: 32px; text-align: center; color: #687582; }}
     @media (max-width: 600px) {{ header h1 {{ font-size: 22px; }} .grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
-  <header><div class="wrap"><h1>مقالات فارسی فانتزی</h1><p>آرشیو مقالات منتشرشده در Telegraph</p></div></header>
+  <header><div class="wrap brand">
+    <img class="logo" src="/logo.webp" alt="EPL Fantasy">
+    <div><h1>مقالات فوتبال فانتزی لیگ برتر انگلیس <a href="https://fantasy.premierleague.com/" target="_blank" rel="noopener">FPL</a></h1><p>آرشیو مقالات منتشر شده در کانال تلگرامی @EPL_Fantasy</p></div>
+  </div></header>
   <main class="wrap">
     <form method="get">
       <input name="q" value="{html.escape(query, quote=True)}" placeholder="جست‌وجو در عنوان و خلاصه">
@@ -369,17 +381,24 @@ async def _read_request(reader) -> tuple[str, str, dict[str, str], bytes]:
     return method.upper(), target, headers, body
 
 
-async def _send_response(writer, status: int, body: str, *, head: bool = False) -> None:
+async def _send_response(
+    writer,
+    status: int,
+    body: str | bytes,
+    *,
+    head: bool = False,
+    content_type: str = "text/html; charset=utf-8",
+) -> None:
     reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 413: "Payload Too Large", 500: "Internal Server Error"}
-    payload = body.encode("utf-8")
+    payload = body if isinstance(body, bytes) else body.encode("utf-8")
     headers = (
         f"HTTP/1.1 {status} {reasons.get(status, '')}\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"
+        f"Content-Type: {content_type}\r\n"
         "Cache-Control: no-store\r\n"
         "Referrer-Policy: no-referrer\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "X-Frame-Options: DENY\r\n"
-        "Content-Security-Policy: default-src 'none'; img-src https: data:; "
+        "Content-Security-Policy: default-src 'none'; img-src 'self' https: data:; "
         "frame-src https:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
         "form-action 'self'; base-uri 'none'\r\n"
         f"Content-Length: {len(payload)}\r\n"
@@ -402,6 +421,17 @@ async def handle_http(reader, writer) -> None:
             return
 
         path = urlparse(target).path
+        if path in _STATIC_ASSETS and method in {"GET", "HEAD"}:
+            asset_path, content_type = _STATIC_ASSETS[path]
+            try:
+                asset = await asyncio.to_thread(asset_path.read_bytes)
+            except FileNotFoundError:
+                await _send_response(writer, 404, "Not found")
+                return
+            await _send_response(
+                writer, 200, asset, head=method == "HEAD", content_type=content_type
+            )
+            return
         if path == "/" and method in {"GET", "HEAD"}:
             await _ensure_catalog_synced()
             query = parse_qs(urlparse(target).query)

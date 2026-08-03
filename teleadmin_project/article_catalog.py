@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import runtime_config
 
@@ -24,13 +25,44 @@ def init() -> None:
                 url TEXT NOT NULL,
                 title TEXT NOT NULL,
                 summary TEXT NOT NULL DEFAULT '',
+                summary_source TEXT NOT NULL DEFAULT 'ai',
                 source_tag TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
                 image_url TEXT NOT NULL DEFAULT '',
                 published_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS telegraph_catalog_meta "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(telegraph_articles)")
+        }
+        if "summary_source" not in columns:
+            conn.execute(
+                "ALTER TABLE telegraph_articles ADD COLUMN "
+                "summary_source TEXT NOT NULL DEFAULT 'ai'"
+            )
+        if "source_url" not in columns:
+            conn.execute(
+                "ALTER TABLE telegraph_articles ADD COLUMN "
+                "source_url TEXT NOT NULL DEFAULT ''"
+            )
+        migrated = conn.execute(
+            "SELECT 1 FROM telegraph_catalog_meta WHERE key='summary_source_migrated'"
+        ).fetchone()
+        if not migrated:
+            conn.execute(
+                "UPDATE telegraph_articles SET summary_source='telegraph' "
+                "WHERE source_tag='آرشیو' AND summary_source='ai'"
+            )
+            conn.execute(
+                "INSERT INTO telegraph_catalog_meta (key, value) "
+                "VALUES ('summary_source_migrated', '1')"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_telegraph_articles_published "
             "ON telegraph_articles(published_at DESC)"
@@ -58,6 +90,8 @@ def record_page(
     source_tag: str = "",
     image_url: str = "",
     published_at: str | None = None,
+    summary_source: str = "ai",
+    source_url: str = "",
 ) -> None:
     """Insert or update a locally indexed Telegraph page."""
     path = _path_from_url(url)
@@ -70,17 +104,31 @@ def record_page(
         conn.execute(
             """
             INSERT INTO telegraph_articles
-                (path, url, title, summary, source_tag, image_url,
-                 published_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (path, url, title, summary, summary_source, source_tag,
+                 source_url, image_url, published_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 url=excluded.url,
                 title=excluded.title,
-                summary=excluded.summary,
+                summary=CASE
+                    WHEN telegraph_articles.summary_source='ai'
+                         AND excluded.summary_source='telegraph'
+                    THEN telegraph_articles.summary
+                    ELSE excluded.summary
+                END,
+                summary_source=CASE
+                    WHEN telegraph_articles.summary_source='ai'
+                    THEN 'ai'
+                    ELSE excluded.summary_source
+                END,
                 source_tag=CASE
                     WHEN telegraph_articles.source_tag <> ''
                     THEN telegraph_articles.source_tag
                     ELSE excluded.source_tag
+                END,
+                source_url=CASE
+                    WHEN excluded.source_url <> '' THEN excluded.source_url
+                    ELSE telegraph_articles.source_url
                 END,
                 image_url=CASE
                     WHEN excluded.image_url <> '' THEN excluded.image_url
@@ -93,7 +141,9 @@ def record_page(
                 url,
                 _plain_text(title),
                 _plain_text(summary),
+                summary_source,
                 _plain_text(source_tag),
+                str(source_url or "").strip(),
                 str(image_url or "").strip(),
                 published_at,
                 now,
@@ -129,13 +179,87 @@ def list_pages(
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT path, url, title, summary, source_tag, image_url, "
+            "SELECT path, url, title, summary, summary_source, source_tag, "
+            "source_url, image_url, "
             "published_at, updated_at "
             f"FROM telegraph_articles {where} "
             "ORDER BY published_at DESC, path DESC LIMIT ? OFFSET ?",
             (*params, limit, offset),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def pages_needing_enrichment(limit: int = 12) -> list[dict]:
+    init()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT path, url, title, summary, summary_source, source_tag, "
+            "source_url, image_url "
+            "FROM telegraph_articles "
+            "WHERE summary_source <> 'ai' OR summary='' OR image_url='' "
+            "ORDER BY published_at DESC LIMIT ?",
+            (max(1, min(int(limit), 50)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_metadata(
+    url: str,
+    *,
+    summary: str | None = None,
+    image_url: str | None = None,
+    summary_source: str | None = None,
+    source_url: str | None = None,
+) -> None:
+    path = _path_from_url(url)
+    if not path:
+        return
+    fields = []
+    values: list[str] = []
+    if summary is not None:
+        fields.append("summary=?")
+        values.append(_plain_text(summary))
+    if image_url is not None:
+        fields.append("image_url=?")
+        values.append(str(image_url).strip())
+    if source_url is not None:
+        fields.append("source_url=?")
+        values.append(str(source_url).strip())
+    if summary_source is not None:
+        fields.append("summary_source=?")
+        values.append(summary_source)
+    if not fields:
+        return
+    fields.append("updated_at=?")
+    values.append(datetime.now(timezone.utc).isoformat())
+    init()
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE telegraph_articles SET {', '.join(fields)} WHERE path=?",
+            (*values, path),
+        )
+
+
+def first_image_url(html_content: str) -> str:
+    match = re.search(
+        r'<img\b[^>]*\bsrc=["\'](https?://[^"\']+)',
+        str(html_content or ""),
+        flags=re.IGNORECASE,
+    )
+    url = match.group(1) if match else ""
+    return url if urlparse(url).scheme in {"http", "https"} else ""
+
+
+def first_source_url(html_content: str) -> str:
+    matches = re.findall(
+        r'<a\b[^>]*\bhref=["\'](https?://[^"\']+)',
+        str(html_content or ""),
+        flags=re.IGNORECASE,
+    )
+    for url in reversed(matches):
+        if "telegra.ph/" not in url and "graph.org/" not in url:
+            return html.unescape(url)
+    return ""
 
 
 def has_more(
@@ -171,6 +295,7 @@ def sync_from_telegraph() -> int:
                 "آرشیو",
                 page.get("image_url", ""),
                 published_at=imported_at,
+                summary_source="telegraph",
             )
             imported += 1
         if len(pages) < limit:

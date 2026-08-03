@@ -988,6 +988,7 @@ def publish_to_telegraph(
     summary: str = "",
     source_tag: str = "",
     image_url: str = "",
+    source_url: str = "",
 ) -> str | None:
     try:
         tg = _get_telegraph()
@@ -1010,6 +1011,7 @@ def publish_to_telegraph(
                 summary=summary,
                 source_tag=source_tag,
                 image_url=image_url,
+                source_url=source_url,
             )
         except Exception:
             logger.exception("Telegraph page created but catalog indexing failed")

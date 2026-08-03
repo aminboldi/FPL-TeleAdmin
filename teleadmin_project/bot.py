@@ -226,6 +226,15 @@ def _youtube_description_preview(text: str) -> str:
     return _escape_html(text)
 
 
+def _youtube_thumbnail_url(url: str) -> str:
+    """Return a stable public thumbnail URL for a YouTube page."""
+    try:
+        video_id = youtube_posts.extract_video_id(url)
+    except youtube_posts.YouTubeImportError:
+        return ""
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
 def _format_telegraph_post(
     title: str, summary: str, telegraph_url: str, *, source_name: str = "",
 ) -> str:
@@ -965,6 +974,7 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
             summary=summary,
             source_tag=article.get("source_name", ""),
             image_url=feature_image,
+            source_url=article.get("url", url),
         )
         if not telegraph_url:
             raise RuntimeError("Telegraph returned no article URL.")
@@ -1124,6 +1134,7 @@ async def _import_youtube_transcript(url: str) -> str:
         summary=article_summary,
         source_tag=metadata.channel_title,
         image_url=metadata.thumbnail_url,
+        source_url=url,
     )
     if not telegraph_url:
         raise RuntimeError("ساخت مقاله در Telegraph ناموفق بود.")
@@ -1301,6 +1312,65 @@ async def _recent_telegraph_pages() -> list[dict]:
     return await asyncio.to_thread(article_catalog.list_pages, limit=50)
 
 
+async def _enrich_article_catalog() -> None:
+    """Backfill images and AI summaries for imported Telegraph pages."""
+    import article_catalog
+
+    if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
+        return
+    try:
+        await asyncio.to_thread(article_catalog.sync_from_telegraph)
+        pages = await asyncio.to_thread(
+            article_catalog.pages_needing_enrichment, 50
+        )
+        for page in pages:
+            try:
+                remote = await asyncio.to_thread(
+                    articles.get_telegraph_page, page["url"]
+                )
+                content = str(remote.get("content") or "")
+                source_url = page.get("source_url") or article_catalog.first_source_url(content)
+                image_url = (
+                    page.get("image_url")
+                    or article_catalog.first_image_url(content)
+                )
+                if not image_url and source_url:
+                    image_url = _youtube_thumbnail_url(source_url)
+                    if not image_url:
+                        source_article = await asyncio.to_thread(
+                            articles.fetch_article, source_url
+                        )
+                        if source_article:
+                            image_url = (
+                                source_article.get("feature_image")
+                                or source_article.get("header_image", "")
+                                or next(
+                                    iter(source_article.get("images", [])), ""
+                                )
+                            )
+                summary = page.get("summary", "")
+                generated_summary = ""
+                if page.get("summary_source") != "ai" or not summary:
+                    generated_summary = await translator.summarize_article(content)
+                    summary = generated_summary or summary
+                await asyncio.to_thread(
+                    article_catalog.update_metadata,
+                    page["url"],
+                    summary=summary,
+                    image_url=image_url,
+                    source_url=source_url,
+                    summary_source="ai" if generated_summary else page.get(
+                        "summary_source", "telegraph"
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to enrich Telegraph catalog page %s", page.get("url")
+                )
+    except Exception:
+        logger.exception("Telegraph catalog enrichment failed")
+
+
 async def _article_catalog_url() -> str:
     return telegraph_editor.public_catalog_url()
 
@@ -1450,6 +1520,7 @@ async def main():
 
     tasks = [
         _start_health_server(),
+        _enrich_article_catalog(),
         client.run_until_disconnected(),
         deadlines.run_deadline_loop(
             client=client,
