@@ -306,7 +306,7 @@ def _catalog_page(
     button {{ background: #02eefe; border-color: #02eefe; color: #310b34; cursor: pointer; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; padding-bottom: 24px; }}
     .card {{ overflow: hidden; background: white; border: 1px solid #e2e7eb; border-radius: 14px; box-shadow: 0 2px 10px #182b3a0d; }}
-    .thumb {{ display: block; width: 100%; height: 170px; object-fit: cover; background: #e7edf1; }}
+    .thumb {{ display: block; width: 100%; height: auto; object-fit: contain; background: #e7edf1; }}
     .card-body {{ padding: 16px; }}
     .meta {{ display: flex; justify-content: space-between; gap: 8px; color: #687582; font-size: 12px; }}
     .tag {{ color: #126a9e; font-weight: 700; }}

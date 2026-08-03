@@ -45,7 +45,8 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - The database has an audit log and every setting change requires a Telegram confirmation.
 - `runtime_config.db` is ignored by git. In Coolify it must live in persistent storage: mount a volume at `/app/teleadmin_project/data` and set `RUNTIME_CONFIG_PATH=/app/teleadmin_project/data/runtime_config.db`.
 - Without `RUNTIME_CONFIG_PATH`, the bot still runs using a non-persistent DB beside the code; settings reset after a redeploy.
-- `article_catalog.py` stores the Telegraph article index in the same database. The public root URL serves searchable article cards; new Telegraph pages are indexed automatically and existing account pages are imported on first catalog visit.
+- `article_catalog.py` stores the Telegraph article index in the same database. The public root URL serves searchable article cards; new Telegraph pages are indexed automatically and existing account pages are imported on first catalog visit. Keep `runtime_config.db` on the persistent Coolify volume so the catalog survives redeploys.
+- The public catalog is served at the app root (`/`), not `/articles`. `telegraph_editor.py` also serves the repository-root assets `/logo.webp` and `/fav-icon.png`; both files must remain in the repository for the branded header and favicon to work in deployment.
 - The BotFather dashboard is enabled only if both `TELEGRAM_BOT_TOKEN` and numeric comma-separated `ADMIN_USER_IDS` are set. It accepts private-chat commands only.
 - Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`, `/y`, `/a`, `/articles`, `/edit`.
 - `/a https://...` (or `a/https://...`) extracts an arbitrary article in reader mode, translates it, publishes it to Telegraph, and places the channel post in the normal half-hour review queue.
@@ -303,6 +304,17 @@ Long-form content (>940 source chars) and merged text chunks are published as Te
 - `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله جدید <source>` header, title, AI-generated summary, and `👈👈متن کامل فارسی مقاله👉👉` linked to the Telegraph URL. URL article posts include their feature image as Telegram media.
 - `translator.translate_article()` uses `article_prompt.txt` for structured JSON output (`title`/`summary`/`body`), falling back to regular translation if JSON parsing fails
 - Set `TELEGRAPH_ACCESS_TOKEN` env var to keep articles under a single Telegraph account; without it a new account is created on every restart
+
+- `articles.publish_to_telegraph()` indexes each new page with its AI summary, source tag, original source URL, and feature-image URL. The feature image is intentionally removed from the Telegraph body when it is sent separately with the Telegram post; the catalog must use the stored URL rather than expecting an image inside Telegraph HTML.
+- YouTube article pages use the fetched YouTube thumbnail URL. URL-imported articles use the selected source/header image URL. No local image copy is required for catalog cards; images are loaded from their public HTTPS URLs. Articles without a recoverable image render as text-only cards.
+- `_enrich_article_catalog()` backfills older imported pages: it generates an AI summary from the full Telegraph content, recovers the original source link when present, derives YouTube thumbnails, and attempts to refetch source-article images. Recovery is impossible when an old page contains neither an image nor an original source link.
+
+## Public article catalog
+
+- The catalog is the root-domain landing page served by `telegraph_editor.py`; it is read-only and links each card to the Telegraph page. `/articles` is only the private dashboard command that sends admins the public catalog URL.
+- Current public branding: header background `#310b34`, logo `/logo.webp`, favicon `/fav-icon.png`, title `مقالات فوتبال فانتزی لیگ برتر انگلیس FPL`, and subtitle `آرشیو مقالات منتشر شده در کانال تلگرامی @EPL_Fantasy`. The `FPL` title text links to `https://fantasy.premierleague.com/`.
+- The search button and catalog hyperlinks use `#02eefe`.
+- Feature images use responsive natural dimensions (`width: 100%; height: auto`) with no forced crop, so card heights may differ. Preserve this behavior unless a deliberate design change is requested.
 
 ## Text chunk merging
 
