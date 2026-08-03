@@ -77,6 +77,7 @@ _FFFIX_END_MARKER = (
     "unlock live elite team reveals, ai transfer recommendations and all our "
     "opta-powered planning tools with premium plus"
 )
+_FFFIX_END_IMAGE_PREFIX = "s1-preseason-blog-1"
 _TELEGRAPH_TAGS = {
     "a", "b", "blockquote", "br", "code", "em", "figure", "figcaption",
     "h3", "h4", "hr", "i", "img", "li", "ol", "p", "pre", "s",
@@ -118,15 +119,19 @@ def _get_telegraph() -> Telegraph:
     return _telegraph
 
 
-def get_recent_telegraph_pages(limit: int = 10) -> list[dict]:
+def get_telegraph_page_list(limit: int = 200, offset: int = 0) -> list[dict]:
     """Return the newest pages from the configured Telegraph account."""
     if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
         raise RuntimeError(
             "TELEGRAPH_ACCESS_TOKEN is not configured; Telegraph editing is unavailable."
         )
-    result = _get_telegraph().get_page_list(limit=limit)
+    result = _get_telegraph().get_page_list(limit=limit, offset=offset)
     pages = result.get("pages", [])
     return pages if isinstance(pages, list) else []
+
+
+def get_recent_telegraph_pages(limit: int = 10) -> list[dict]:
+    return get_telegraph_page_list(limit=limit)
 
 
 def _telegraph_path(page_url_or_path: str) -> str:
@@ -399,19 +404,49 @@ def _clean_fff_article_html(source_html: str) -> str:
             if following and following.name == "hr":
                 following.decompose()
 
-    # The first divider whose remainder contains the offer copy is the end of
-    # the actual article. Remove that divider and all following siblings.
+    def is_end_image(element) -> bool:
+        images = []
+        if getattr(element, "name", None) == "img":
+            images.append(element)
+        images.extend(element.find_all("img"))
+        for image in images:
+            src = str(
+                image.get("src")
+                or image.get("data-src")
+                or image.get("data-original")
+                or ""
+            ).strip()
+            filename = urlparse(src).path.rsplit("/", 1)[-1].lower()
+            if filename.startswith(_FFFIX_END_IMAGE_PREFIX):
+                return True
+        return False
+
+    # FFFix's seasonal promotion has appeared both with and without the
+    # marketing divider. The banner itself is a more reliable boundary than
+    # the surrounding copy, so cut from the first top-level child containing
+    # it and everything below it.
     children = list(content.find_all(recursive=False))
-    for index, child in enumerate(children):
-        if child.name != "hr":
-            continue
-        remainder = " ".join(
-            _fff_normalized_text(item) for item in children[index + 1:]
-        )
-        if _FFFIX_END_MARKER in remainder:
-            for item in children[index:]:
-                item.extract()
-            break
+    end_index = next(
+        (index for index, child in enumerate(children) if is_end_image(child)),
+        None,
+    )
+    if end_index is not None:
+        for item in children[end_index:]:
+            item.extract()
+    else:
+        # The first divider whose remainder contains the offer copy is the
+        # end of the actual article. Remove that divider and all following
+        # siblings.
+        for index, child in enumerate(children):
+            if child.name != "hr":
+                continue
+            remainder = " ".join(
+                _fff_normalized_text(item) for item in children[index + 1:]
+            )
+            if _FFFIX_END_MARKER in remainder:
+                for item in children[index:]:
+                    item.extract()
+                break
 
     # Keep the extractor focused on the article body even if the page adds
     # related cards or a site-wide offer inside the outer article wrapper.
@@ -423,7 +458,9 @@ def _clean_fff_article_html(source_html: str) -> str:
     header = article.select_one(".blog-image")
     if header:
         header.decompose()
-    return str(article)
+    # Return only the cleaned article body. Passing the whole wrapper through
+    # reader mode can flatten otherwise correctly ordered images to the end.
+    return str(content)
 
 
 def _is_ffscout_article_url(url: str) -> bool:
@@ -536,24 +573,31 @@ def fetch_general_article(url: str) -> dict | None:
         return None
 
     source_html = response.text
-    if _is_fff_article_url(response.url):
+    is_fff_article = _is_fff_article_url(response.url)
+    if is_fff_article:
         source_html = _clean_fff_article_html(source_html)
     elif _is_ffscout_article_url(response.url):
         source_html = _clean_ffscout_article_html(source_html)
     elif _is_allaboutfpl_article_url(response.url):
         source_html = _clean_allaboutfpl_article_html(source_html)
 
-    extracted = trafilatura.extract(
-        source_html,
-        url=response.url,
-        output_format="html",
-        include_comments=False,
-        include_formatting=True,
-        include_links=False,
-        include_images=True,
-        favor_precision=True,
-        deduplicate=True,
-    )
+    if is_fff_article:
+        # The FFFix cleaner already isolates the article body. Running that
+        # body through reader mode can flatten inline images to the end, so
+        # retain its cleaned DOM order directly.
+        extracted = source_html
+    else:
+        extracted = trafilatura.extract(
+            source_html,
+            url=response.url,
+            output_format="html",
+            include_comments=False,
+            include_formatting=True,
+            include_links=False,
+            include_images=True,
+            favor_precision=True,
+            deduplicate=True,
+        )
     if not extracted:
         return None
 
@@ -715,6 +759,69 @@ def _image_marker_positions(html_content: str) -> tuple[dict[int, int], int]:
     return positions, len(nodes)
 
 
+def _restore_images_by_source_position(
+    soup: BeautifulSoup, image_urls: list[str], source_html: str,
+) -> set[int]:
+    """Place every source image using the original markerized layout."""
+    source_positions, source_node_count = _image_marker_positions(source_html)
+    if not image_urls or len(source_positions) != len(image_urls):
+        return set()
+
+    root = soup.body or soup
+    for image in list(soup.find_all("img")):
+        src = str(image.get("src") or "").strip()
+        has_marker = any(
+            _IMAGE_MARKER_RE.search(str(value))
+            for value in image.attrs.values()
+        )
+        if src in image_urls or has_marker:
+            image.decompose()
+
+    for marker_node in list(soup.find_all(string=_IMAGE_MARKER_RE)):
+        text = _IMAGE_MARKER_RE.sub("", str(marker_node))
+        if text:
+            marker_node.replace_with(NavigableString(text))
+        else:
+            marker_node.extract()
+
+    # Remove empty wrappers left when the model kept a marker-only paragraph.
+    for wrapper in list(soup.find_all(["p", "figure"])):
+        if not wrapper.get_text(strip=True) and not wrapper.find("img"):
+            wrapper.decompose()
+
+    target_nodes = [node for node in root.contents if str(node).strip()]
+    target_node_count = len(target_nodes)
+    inserted_at_rank = {}
+    restored = set()
+
+    for index, url in enumerate(image_urls, start=1):
+        source_position = source_positions.get(index)
+        if source_position is None:
+            continue
+        image = soup.new_tag("img", src=url)
+        if not target_nodes:
+            root.append(image)
+        else:
+            target_rank = min(
+                target_node_count,
+                (
+                    source_position * target_node_count
+                    + source_node_count - 1
+                ) // source_node_count,
+            )
+            if target_rank >= len(target_nodes):
+                root.append(image)
+                inserted_at_rank[target_rank] = image
+            elif target_rank in inserted_at_rank:
+                inserted_at_rank[target_rank].insert_after(image)
+                inserted_at_rank[target_rank] = image
+            else:
+                target_nodes[target_rank].insert_before(image)
+                inserted_at_rank[target_rank] = image
+        restored.add(index)
+    return restored
+
+
 def restore_images_in_place(
     html_content: str,
     image_urls: list[str],
@@ -723,6 +830,13 @@ def restore_images_in_place(
 ) -> str:
     """Restore translated image markers at their original article positions."""
     soup = BeautifulSoup(_remove_article_links(html_content), "html.parser")
+    if source_html:
+        restored = _restore_images_by_source_position(
+            soup, image_urls, source_html
+        )
+        if len(restored) == len(image_urls):
+            root = soup.body or soup
+            return "".join(str(child) for child in root.contents).strip()
     restored = set()
 
     def image_for_marker(index: int):
@@ -867,13 +981,38 @@ def restore_missing_images(html_content: str, image_urls: list[str]) -> str:
 
 
 def publish_to_telegraph(
-    title: str, html_content: str, *, raise_on_error: bool = False,
+    title: str,
+    html_content: str,
+    *,
+    raise_on_error: bool = False,
+    summary: str = "",
+    source_tag: str = "",
+    image_url: str = "",
 ) -> str | None:
     try:
         tg = _get_telegraph()
         page = tg.create_page(title=title, html_content=html_content)
         url = page.get("url", "")
         logger.info("Telegraph page created: %s", url)
+        try:
+            import article_catalog
+
+            if not image_url:
+                image_match = re.search(
+                    r'<img\b[^>]*\bsrc=["\'](https?://[^"\']+)',
+                    html_content,
+                    flags=re.IGNORECASE,
+                )
+                image_url = image_match.group(1) if image_match else ""
+            article_catalog.record_page(
+                url,
+                title,
+                summary=summary,
+                source_tag=source_tag,
+                image_url=image_url,
+            )
+        except Exception:
+            logger.exception("Telegraph page created but catalog indexing failed")
         return url
     except Exception as exc:
         logger.exception(

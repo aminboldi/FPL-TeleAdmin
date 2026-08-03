@@ -93,6 +93,15 @@ def _target_channel() -> str:
     return runtime_config.get("TARGET_CHANNEL_ID")
 
 
+def _catalog_source_tag(event, fallback: str = "Telegram") -> str:
+    """Use the source channel title as the catalog tag when available."""
+    chat = getattr(event, "chat", None)
+    return (
+        str(getattr(chat, "title", "") or getattr(chat, "username", "")).strip()
+        or fallback
+    )
+
+
 def _telegram_source_list() -> str:
     sources = runtime_config.telegram_sources()
     if not sources:
@@ -783,7 +792,12 @@ async def handle_new_message(event):
                 title = _article_title(result.get("title", ""))
                 summary = result.get("summary", "")
                 body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
-                telegraph_url = articles.publish_to_telegraph(title, body)
+                telegraph_url = articles.publish_to_telegraph(
+                    title,
+                    body,
+                    summary=summary,
+                    source_tag=_catalog_source_tag(event),
+                )
                 if telegraph_url:
                     caption = _format_telegraph_post(title, summary, telegraph_url)
                     await _send_to_target(caption, event=event, queue=True)
@@ -846,7 +860,12 @@ async def _finish_chunks(chat_id: int):
             title = _article_title(result.get("title", ""))
             summary = result.get("summary", "")
             body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
-            telegraph_url = articles.publish_to_telegraph(title, body)
+            telegraph_url = articles.publish_to_telegraph(
+                title,
+                body,
+                summary=summary,
+                source_tag=_catalog_source_tag(first_evt),
+            )
             if telegraph_url:
                 caption = _format_telegraph_post(title, summary, telegraph_url)
                 await _send_to_target(caption, event=first_evt, queue=True)
@@ -940,7 +959,12 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     )
     try:
         telegraph_url = articles.publish_to_telegraph(
-            title, translated, raise_on_error=True
+            title,
+            translated,
+            raise_on_error=True,
+            summary=summary,
+            source_tag=article.get("source_name", ""),
+            image_url=feature_image,
         )
         if not telegraph_url:
             raise RuntimeError("Telegraph returned no article URL.")
@@ -1094,7 +1118,13 @@ async def _import_youtube_transcript(url: str) -> str:
     article_body += (
         f'\n\n<p><a href="{_escape_html(url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a></p>'
     )
-    telegraph_url = articles.publish_to_telegraph(article_title, article_body)
+    telegraph_url = articles.publish_to_telegraph(
+        article_title,
+        article_body,
+        summary=article_summary,
+        source_tag=metadata.channel_title,
+        image_url=metadata.thumbnail_url,
+    )
     if not telegraph_url:
         raise RuntimeError("ساخت مقاله در Telegraph ناموفق بود.")
     article_caption = _format_youtube_telegraph_post(
@@ -1137,7 +1167,9 @@ async def _translate_dashboard_submission(event) -> str:
         title = _article_title(_fix_unclosed_tags(_strip_quotes(result.get("title", ""))))
         summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
         body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
-        telegraph_url = articles.publish_to_telegraph(title, body)
+        telegraph_url = articles.publish_to_telegraph(
+            title, body, summary=summary, source_tag="Telegram",
+        )
         if telegraph_url:
             caption = _format_telegraph_post(title, summary, telegraph_url)
             await _send_to_target(caption, event=event, queue=True)
@@ -1263,7 +1295,14 @@ async def _telegraph_editor_url(article_url: str) -> str:
 
 
 async def _recent_telegraph_pages() -> list[dict]:
-    return await asyncio.to_thread(articles.get_recent_telegraph_pages)
+    import article_catalog
+
+    await asyncio.to_thread(article_catalog.sync_from_telegraph)
+    return await asyncio.to_thread(article_catalog.list_pages, limit=50)
+
+
+async def _article_catalog_url() -> str:
+    return telegraph_editor.public_catalog_url()
 
 
 async def _import_article(url: str) -> str:
@@ -1402,6 +1441,7 @@ async def main():
             _telegraph_editor_url,
             _recent_telegraph_pages,
             _import_article,
+            _article_catalog_url,
         )
         _admin_bot_client = admin_client
         logger.info("Admin dashboard enabled for %d user(s)", len(settings.admin_user_ids))

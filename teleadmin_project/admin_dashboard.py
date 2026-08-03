@@ -1,5 +1,6 @@
 """Private, admin-only BotFather control surface for TeleAdmin."""
 import asyncio
+import html
 import secrets
 from collections.abc import Awaitable, Callable
 
@@ -29,6 +30,7 @@ class AdminDashboard:
         telegraph_editor_url: Callable[[str], Awaitable[str]],
         telegraph_pages: Callable[[], Awaitable[list[dict]]],
         article_import: Callable[[str], Awaitable[str]],
+        article_catalog_url: Callable[[], Awaitable[str]],
     ):
         self.client = client
         self.admin_ids = admin_ids
@@ -47,6 +49,7 @@ class AdminDashboard:
         self.telegraph_editor_url = telegraph_editor_url
         self.telegraph_pages = telegraph_pages
         self.article_import = article_import
+        self.article_catalog_url = article_catalog_url
         self.pending: dict[str, tuple[str, str, int]] = {}
         self.pending_youtube: dict[str, tuple[str, str, int]] = {}
         self.pending_source: dict[str, tuple[str, str, int]] = {}
@@ -120,6 +123,16 @@ class AdminDashboard:
             await event.reply(self._guide_text(), buttons=self._back_button(), parse_mode="html")
         elif command == "/edit":
             await self._telegraph_edit(event)
+        elif command == "/articles":
+            try:
+                url = await self.article_catalog_url()
+                await event.reply(
+                    f'<b>📚 آرشیو مقالات</b>\n\n'
+                    f'<a href="{html.escape(url, quote=True)}">باز کردن آرشیو مقالات</a>',
+                    parse_mode="html",
+                )
+            except Exception as exc:
+                await event.reply(f"❌ {exc}")
         elif command == "/a":
             if not arg.startswith(("http://", "https://")):
                 await event.reply("نمونه: <code>/a https://example.com/article</code>", parse_mode="html")
@@ -461,7 +474,9 @@ class AdminDashboard:
             token = secrets.token_urlsafe(8)
             self.pending_telegraph_pages[token] = (url, event.sender_id)
             title = str(page.get("title") or "مقالهٔ بدون عنوان").replace("\n", " ").strip()
-            buttons.append([Button.inline(title[:60], f"telegraphedit:{token}".encode())])
+            source = str(page.get("source_tag") or "").replace("\n", " ").strip()
+            label = f"{source} · {title}" if source else title
+            buttons.append([Button.inline(label[:60], f"telegraphedit:{token}".encode())])
         await event.reply(
             "<b>۱۰ مقالهٔ اخیر Telegraph</b>\nمقاله‌ای را که می‌خواهید ویرایش کنید انتخاب کنید.",
             buttons=buttons, parse_mode="html",
@@ -485,7 +500,7 @@ class AdminDashboard:
         return (
             "<b>❔ Command Guide</b>\n\n"
             "<b>Dashboard</b>\n/dashboard — Open the main panel\n/guide — Show this guide\n/balance — Check OpenRouter credit\n\n"
-            "<b>Telegraph Articles</b>\n/edit — Select one of the 10 latest articles to edit\n\n"
+            "<b>Telegraph Articles</b>\n/articles — Open the article catalog\n/edit — Select a recent article to edit\n\n"
             "<b>Article from Link</b>\n/a https://example.com/article\nor a/https://example.com/article — Extract, translate, and publish a readable article to Telegraph\n\n"
             "<b>Leagues</b>\n/league epl or /league iran\n/activity epl or /activity iran\n\n"
             "<b>Content (without AI)</b>\n/fixtures — Gameweek fixtures\n/points — Latest finished-match points\n/eo — Effective ownership\n/prices — LiveFPL price predictions\n/lineups — Automatic lineup status\n\n"

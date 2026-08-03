@@ -6,12 +6,13 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from bs4 import BeautifulSoup
 from telegraph.utils import ALLOWED_TAGS, html_to_nodes
 
 import articles
+import article_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,9 @@ _EDITOR_PATH = "/telegraph/edit/"
 _LINK_LIFETIME_SECONDS = 15 * 60
 _OPEN_EDITOR_LIFETIME_SECONDS = 2 * 60 * 60
 _MAX_REQUEST_BYTES = 256 * 1024
+_CATALOG_PAGE_SIZE = 24
+_catalog_sync_lock = asyncio.Lock()
+_catalog_synced = False
 
 
 @dataclass
@@ -64,6 +68,11 @@ def create_edit_url(page_url: str) -> str:
     token = secrets.token_urlsafe(32)
     _grants[token] = _EditGrant(page_url=page_url, expires_at=now + _LINK_LIFETIME_SECONDS)
     return f"{_public_base_url()}{_EDITOR_PATH}{token}"
+
+
+def public_catalog_url() -> str:
+    """Return the public root URL used for the article catalog."""
+    return _public_base_url() + "/"
 
 
 def _grant_for(token: str, *, open_editor: bool = False) -> _EditGrant | None:
@@ -205,6 +214,133 @@ def _message_page(message: str, *, success: bool = False, article_url: str = "")
     )
 
 
+def _catalog_page(
+    pages: list[dict],
+    source_tags: list[str],
+    *,
+    query: str = "",
+    source_tag: str = "",
+    page_number: int = 1,
+    has_next: bool = False,
+) -> str:
+    """Render the public root-domain Telegraph article catalog."""
+    cards = []
+    for page in pages:
+        title = html.escape(str(page.get("title") or "بدون عنوان"))
+        url = html.escape(str(page.get("url") or ""), quote=True)
+        summary = html.escape(str(page.get("summary") or ""))
+        source = html.escape(str(page.get("source_tag") or "مقاله"))
+        image_url = str(page.get("image_url") or "")
+        image = ""
+        if urlparse(image_url).scheme in {"http", "https"}:
+            image = (
+                f'<img class="thumb" src="{html.escape(image_url, quote=True)}" '
+                f'alt="{source}">'
+            )
+        published = html.escape(str(page.get("published_at") or "")[:10])
+        cards.append(
+            f"""
+            <article class="card">
+              {image}
+              <div class="card-body">
+                <div class="meta"><span class="tag">{source}</span><span>{published}</span></div>
+                <h2><a href="{url}" target="_blank" rel="noopener">{title}</a></h2>
+                <p>{summary or "برای خواندن متن کامل، روی عنوان مقاله بزنید."}</p>
+                <a class="read" href="{url}" target="_blank" rel="noopener">خواندن مقاله ←</a>
+              </div>
+            </article>
+            """
+        )
+    cards_html = "".join(cards) or (
+        '<div class="empty">مقاله‌ای با این فیلتر پیدا نشد.</div>'
+    )
+
+    def filter_url(page_value: int) -> str:
+        params = {"page": str(page_value)}
+        if query:
+            params["q"] = query
+        if source_tag:
+            params["source"] = source_tag
+        return "/?" + urlencode(params)
+
+    tags = ['<option value="">همهٔ منابع</option>']
+    tags.extend(
+        f'<option value="{html.escape(tag, quote=True)}"'
+        f'{" selected" if tag == source_tag else ""}>{html.escape(tag)}</option>'
+        for tag in source_tags
+    )
+    previous = (
+        f'<a class="pager" href="{html.escape(filter_url(page_number - 1), quote=True)}">← جدیدتر</a>'
+        if page_number > 1 else ""
+    )
+    next_page = (
+        f'<a class="pager" href="{html.escape(filter_url(page_number + 1), quote=True)}">قدیمی‌تر →</a>'
+        if has_next else ""
+    )
+    return f"""<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>مقالات فارسی فانتزی</title>
+  <style>
+    :root {{ color-scheme: light; font-family: Tahoma, system-ui, sans-serif; }}
+    body {{ margin: 0; background: #f3f5f7; color: #18202a; }}
+    header {{ background: #182b3a; color: white; padding: 34px 18px 28px; }}
+    .wrap {{ max-width: 1120px; margin: 0 auto; }}
+    header h1 {{ margin: 0 0 8px; font-size: 27px; }}
+    header p {{ margin: 0; color: #d8e3ea; }}
+    form {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 22px auto; }}
+    input, select, button {{ border: 1px solid #ccd4dc; border-radius: 8px; padding: 11px 12px; font: inherit; }}
+    input {{ flex: 1 1 260px; min-width: 180px; }}
+    select {{ min-width: 170px; background: white; }}
+    button {{ background: #168acd; border-color: #168acd; color: white; cursor: pointer; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; padding-bottom: 24px; }}
+    .card {{ overflow: hidden; background: white; border: 1px solid #e2e7eb; border-radius: 14px; box-shadow: 0 2px 10px #182b3a0d; }}
+    .thumb {{ display: block; width: 100%; height: 170px; object-fit: cover; background: #e7edf1; }}
+    .card-body {{ padding: 16px; }}
+    .meta {{ display: flex; justify-content: space-between; gap: 8px; color: #687582; font-size: 12px; }}
+    .tag {{ color: #126a9e; font-weight: 700; }}
+    h2 {{ font-size: 19px; line-height: 1.55; margin: 10px 0 8px; }}
+    h2 a {{ color: #18202a; text-decoration: none; }}
+    .card p {{ color: #53616e; line-height: 1.8; min-height: 52px; margin: 0 0 12px; }}
+    .read {{ color: #168acd; font-weight: 700; text-decoration: none; }}
+    .pager-row {{ display: flex; justify-content: space-between; min-height: 44px; }}
+    .pager {{ color: #168acd; font-weight: 700; text-decoration: none; }}
+    .empty {{ background: white; border-radius: 12px; padding: 32px; text-align: center; color: #687582; }}
+    @media (max-width: 600px) {{ header h1 {{ font-size: 22px; }} .grid {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <header><div class="wrap"><h1>مقالات فارسی فانتزی</h1><p>آرشیو مقالات منتشرشده در Telegraph</p></div></header>
+  <main class="wrap">
+    <form method="get">
+      <input name="q" value="{html.escape(query, quote=True)}" placeholder="جست‌وجو در عنوان و خلاصه">
+      <select name="source">{"".join(tags)}</select>
+      <button type="submit">جست‌وجو</button>
+    </form>
+    <section class="grid">{cards_html}</section>
+    <nav class="pager-row">{previous}{next_page}</nav>
+  </main>
+</body>
+</html>"""
+
+
+async def _ensure_catalog_synced() -> None:
+    global _catalog_synced
+    if _catalog_synced:
+        return
+    async with _catalog_sync_lock:
+        if _catalog_synced:
+            return
+        try:
+            await asyncio.to_thread(article_catalog.sync_from_telegraph)
+        except Exception:
+            logger.exception("Initial Telegraph catalog sync failed")
+        _catalog_synced = True
+
+
 async def _read_request(reader) -> tuple[str, str, dict[str, str], bytes]:
     request_line = await asyncio.wait_for(reader.readline(), timeout=10)
     if not request_line:
@@ -266,7 +402,41 @@ async def handle_http(reader, writer) -> None:
             return
 
         path = urlparse(target).path
-        if path in {"/", "/health", "/healthz"} and method in {"GET", "HEAD"}:
+        if path == "/" and method in {"GET", "HEAD"}:
+            await _ensure_catalog_synced()
+            query = parse_qs(urlparse(target).query)
+            search = query.get("q", [""])[0].strip()
+            source_tag = query.get("source", [""])[0].strip()
+            try:
+                page_number = max(1, int(query.get("page", ["1"])[0]))
+            except ValueError:
+                page_number = 1
+            offset = (page_number - 1) * _CATALOG_PAGE_SIZE
+            pages = await asyncio.to_thread(
+                article_catalog.list_pages,
+                query=search,
+                source_tag=source_tag,
+                limit=_CATALOG_PAGE_SIZE,
+                offset=offset,
+            )
+            has_next = await asyncio.to_thread(
+                article_catalog.has_more,
+                query=search,
+                source_tag=source_tag,
+                offset=offset,
+                limit=_CATALOG_PAGE_SIZE,
+            )
+            page = _catalog_page(
+                pages,
+                await asyncio.to_thread(article_catalog.list_source_tags),
+                query=search,
+                source_tag=source_tag,
+                page_number=page_number,
+                has_next=has_next,
+            )
+            await _send_response(writer, 200, page, head=method == "HEAD")
+            return
+        if path in {"/health", "/healthz"} and method in {"GET", "HEAD"}:
             await _send_response(writer, 200, "OK", head=method == "HEAD")
             return
         if not path.startswith(_EDITOR_PATH):
