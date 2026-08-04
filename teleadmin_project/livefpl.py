@@ -207,7 +207,9 @@ def _build_team_section(players: list, events: list) -> str:
     return "\n".join(result)
 
 
-_DIVIDER = "\u2796 \u2796 \u2796"
+# Arabic tatweel is a strong RTL character, so this divider follows Persian
+# text direction in Telegram instead of the neutral heavy-minus emoji.
+_DIVIDER = "\u0640 \u0640 \u0640"
 
 
 def build_game_text(fixture: dict) -> str | None:

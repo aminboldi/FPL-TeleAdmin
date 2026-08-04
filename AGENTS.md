@@ -67,6 +67,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - `YOUTUBE_API_KEY` is used only for public video metadata and channel monitoring. The official YouTube captions API cannot download transcripts for arbitrary external videos; it requires OAuth permission to edit the video.
 - English transcripts use a quota-aware RapidAPI chain with `X_RAPIDAPI_KEY`, in this order: `youtube-captions-transcript-subtitles-video-combiner`, `youtube-transcripts`, `youtube-transcript3`, `youtube-2-transcript`, and `youtube-transcripts-playlists-channels-search1`. Provider HTTP/auth/quota failures are persisted in `youtube_transcript_provider_health` and skipped until the next UTC calendar month; a valid no-captions response is treated as video-specific and allows the next provider. `transcriptapi` is not subscribed and is excluded.
 - The two caption providers are intentionally first because they retrieve YouTube subtitle tracks when available; their normalized SRT/segment output is preferred over generated speech recognition. The additional RapidAPI speech-recognition endpoints require an uploaded `audio_file`, so they are not usable as direct YouTube fallbacks without a separate audio-download/encoding pipeline.
+- If every transcript provider is exhausted for an automatically monitored upload, the admin bot sends a one-time private failure notification and leaves the video unseen so a later poll can retry it.
 - Every transcript uses the structured article translator. It reconstructs raw captions into paragraphs, inferred topic headings, and genuine lists; short inline posts convert that structure into Telegram-safe bold headings, spacing, and bullets, while long posts retain Telegraph HTML.
 
 ## Deployment
@@ -223,7 +224,7 @@ Helper: `_build_stat_emojis()` in livefpl.py. Emojis:
 | penalty_saved | 📛 |
 | penalty_missed | ❌ |
 
-Divider between team sections: `➖ ➖ ➖` (`_DIVIDER` in livefpl.py).
+Divider between team sections: `ـ ـ ـ` using RTL Arabic tatweel (`_DIVIDER` in `livefpl.py`), so it follows Persian text direction in Telegram.
 
 **Known issue**: The EO leaderboard heading is hardcoded to "GW38" in `livefpl.py:303` (`build_eo_text()`). It doesn't reflect the actual gameweek. Fix by reading the current GW from the DB.
 
@@ -254,7 +255,7 @@ All messages that go through LLM translation (forwarded source posts, articles, 
 - The next upcoming slot is treated as the current slot and skipped. For example, a post received at 13:12 starts at 14:00, then later posts take 14:30, 15:00, and so on.
 - During the 00:30–08:00 blackout, queued posts start at 08:30.
 - Existing Telegram scheduled messages are read before each allocation, so occupied slots remain respected after a bot restart.
-- Slot allocation and sending share an async lock, preventing concurrent translations from taking the same slot.
+- Slot allocation and sending share an async lock. The process also remembers the last reserved slot per target, ensuring successive queued posts advance by 30 minutes even if Telegram has not yet returned a just-created scheduled message; Telegram's scheduled list remains the restart-safe baseline.
 
 Exceptions (sent immediately, no delay):
 - Game-action alerts (`alerts.py`)
@@ -314,7 +315,7 @@ Long-form content (>940 source chars) and merged text chunks are published as Te
 ## Public article catalog
 
 - The catalog is the root-domain landing page served by `telegraph_editor.py`; it is read-only and links each card to the Telegraph page. `/articles` is only the private dashboard command that sends admins the public catalog URL.
-- Current public branding: header background `#310b34`, logo `/logo.webp`, favicon `/fav-icon.png`, title `مقالات فوتبال فانتزی لیگ برتر انگلیس FPL`, and subtitle `آرشیو مقالات منتشر شده در کانال تلگرامی @EPL_Fantasy`. The `FPL` title text links to `https://fantasy.premierleague.com/`.
+- Current public branding: header background `#310b34`, logo `/logo.webp`, favicon `/fav-icon.png`, title `مقالات فوتبال فانتزی لیگ برتر انگلیس FPL`, and subtitle `آرشیو مقالات منتشر شده در کانال تلگرامی @EPL_Fantasy`. The `FPL` title text links to `https://fantasy.premierleague.com/`, and the `@EPL_Fantasy` subtitle text links to `https://t.me/EPL_Fantasy`.
 - The search button and catalog hyperlinks use `#02eefe`.
 - Feature images use responsive natural dimensions (`width: 100%; height: auto`) with no forced crop, so card heights may differ. Preserve this behavior unless a deliberate design change is requested.
 

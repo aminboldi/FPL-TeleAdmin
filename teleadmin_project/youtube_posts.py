@@ -30,6 +30,10 @@ class YouTubeImportError(Exception):
     """An expected, user-facing failure while importing a YouTube transcript."""
 
 
+class TranscriptProvidersExhausted(YouTubeImportError):
+    """All configured transcript providers failed or had no usable transcript."""
+
+
 class _ProviderFailure(Exception):
     """A provider-level failure that should disable the service for this month."""
 
@@ -356,7 +360,13 @@ def fetch_english_transcript(url: str, rapidapi_key: str | None) -> str:
         return text
 
     if not attempted:
-        raise YouTubeImportError("تمام سرویس‌های زیرنویس برای این ماه غیرفعال شده‌اند.")
+        raise TranscriptProvidersExhausted(
+            "تمام سرویس‌های زیرنویس برای این ماه غیرفعال شده‌اند."
+        )
     if failures:
-        raise YouTubeImportError("همهٔ سرویس‌های زیرنویس در دسترس نبودند؛ وضعیت سهمیهٔ RapidAPI را بررسی کنید.")
-    raise YouTubeImportError("هیچ‌یک از سرویس‌های زیرنویس برای این ویدیو متن قابل استفاده‌ای پیدا نکردند.")
+        raise TranscriptProvidersExhausted(
+            "همهٔ سرویس‌های زیرنویس در دسترس نبودند؛ وضعیت سهمیهٔ RapidAPI را بررسی کنید."
+        )
+    raise TranscriptProvidersExhausted(
+        "هیچ‌یک از سرویس‌های زیرنویس برای این ویدیو متن قابل استفاده‌ای پیدا نکردند."
+    )

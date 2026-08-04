@@ -324,7 +324,7 @@ def _catalog_page(
 <body>
   <header><div class="wrap brand">
     <img class="logo" src="/logo.webp" alt="EPL Fantasy">
-    <div><h1>مقالات فوتبال فانتزی لیگ برتر انگلیس <a href="https://fantasy.premierleague.com/" target="_blank" rel="noopener">FPL</a></h1><p>آرشیو مقالات منتشر شده در کانال تلگرامی @EPL_Fantasy</p></div>
+    <div><h1>مقالات فوتبال فانتزی لیگ برتر انگلیس <a href="https://fantasy.premierleague.com/" target="_blank" rel="noopener">FPL</a></h1><p>آرشیو مقالات منتشر شده در کانال تلگرامی <a href="https://t.me/EPL_Fantasy" target="_blank" rel="noopener">@EPL_Fantasy</a></p></div>
   </div></header>
   <main class="wrap">
     <form method="get">

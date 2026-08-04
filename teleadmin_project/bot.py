@@ -88,6 +88,8 @@ _chunk_tasks: dict[int, asyncio.Task] = {}
 _pending_dashboard_content: str | None = None
 _admin_bot_client: TelegramClient | None = None
 _schedule_slot_lock = asyncio.Lock()
+_last_reserved_queue_slots: dict[str, datetime] = {}
+_youtube_failure_notified: set[str] = set()
 
 
 def _target_channel() -> str:
@@ -491,10 +493,34 @@ async def _send_notification(event, caption: str, *, source: str | None = None, 
                 logger.warning("Could not notify admin %s: %s", admin_id, exc)
 
 
+async def _notify_youtube_monitor_failure(video, error: Exception):
+    """Alert admins once when every transcript provider failed for a video."""
+    if not isinstance(error, youtube_posts.TranscriptProvidersExhausted):
+        return
+    if video.id in _youtube_failure_notified:
+        return
+    _youtube_failure_notified.add(video.id)
+    caption = (
+        "<b>❌ همهٔ سرویس‌های زیرنویس YouTube شکست خوردند</b>\n\n"
+        f'<a href="{_escape_html(video.url)}">مشاهدهٔ ویدیو</a>\n\n'
+        f"{_escape_html(str(error))}"
+    )
+    await _send_notification(
+        None, caption, source="YouTube transcription", is_media=False
+    )
+
+
 async def _next_queue_slot(target_channel: str) -> datetime:
     scheduled = await client.get_messages(target_channel, limit=100, scheduled=True)
     occupied = [message.date for message in scheduled if getattr(message, "date", None)]
-    return post_queue.next_available_slot(datetime.now(tz=timezone.utc), occupied)
+    target_key = str(target_channel)
+    slot = post_queue.next_available_slot(
+        datetime.now(tz=timezone.utc),
+        occupied,
+        after=_last_reserved_queue_slots.get(target_key),
+    )
+    _last_reserved_queue_slots[target_key] = slot
+    return slot
 
 
 async def _send_to_target(
@@ -513,10 +539,17 @@ async def _send_to_target(
                 "Reserved translated-post slot %s Iran time",
                 schedule_time.astimezone(post_queue.IRAN_TZ).strftime("%Y-%m-%d %H:%M"),
             )
-        return await _send_to_target_at(
-            target_channel, text, reply_to, schedule_time,
-            event=event, file_path=file_path, album_paths=album_paths,
-        )
+        try:
+            return await _send_to_target_at(
+                target_channel, text, reply_to, schedule_time,
+                event=event, file_path=file_path, album_paths=album_paths,
+            )
+        except Exception:
+            if schedule_time:
+                target_key = str(target_channel)
+                if _last_reserved_queue_slots.get(target_key) == schedule_time:
+                    _last_reserved_queue_slots.pop(target_key, None)
+            raise
 
 
 class _NullAsyncLock:
@@ -1535,7 +1568,11 @@ async def main():
             league_code=runtime_config.get("EPL_LEAGUE_CODE"),
             price_predictions_enabled=runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"),
         ),
-        youtube_monitor.run_monitor(settings.youtube_api_key, _import_youtube_transcript),
+        youtube_monitor.run_monitor(
+            settings.youtube_api_key,
+            _import_youtube_transcript,
+            _notify_youtube_monitor_failure,
+        ),
     ]
     if admin_client:
         tasks.append(admin_client.run_until_disconnected())

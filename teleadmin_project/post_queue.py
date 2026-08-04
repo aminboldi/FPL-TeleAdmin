@@ -52,9 +52,16 @@ def first_candidate(now: datetime) -> datetime:
     return _next_allowed_slot(current_upcoming)
 
 
-def next_available_slot(now: datetime, occupied: Iterable[datetime] = ()) -> datetime:
-    """Return the first unoccupied publishing slot as an aware UTC datetime."""
+def next_available_slot(
+    now: datetime,
+    occupied: Iterable[datetime] = (),
+    after: datetime | None = None,
+) -> datetime:
+    """Return the first unoccupied slot, optionally after a prior reservation."""
     candidate = first_candidate(now)
+    if after is not None:
+        while candidate <= after:
+            candidate = _next_allowed_slot(after)
     occupied_keys = {_slot_key(value) for value in occupied if value.tzinfo is not None}
     while _slot_key(candidate) in occupied_keys:
         candidate = _next_allowed_slot(candidate)

@@ -197,7 +197,9 @@ def find_new_videos(api_key: str | None) -> list[MonitoredVideo]:
 
 
 async def run_monitor(
-    api_key: str | None, import_video: Callable[[str], Awaitable[str]]
+    api_key: str | None,
+    import_video: Callable[[str], Awaitable[str]],
+    on_error: Callable[[MonitoredVideo, Exception], Awaitable[None]] | None = None,
 ) -> None:
     """Continuously queue newly uploaded non-live videos through the /y pipeline."""
     if not api_key:
@@ -215,6 +217,11 @@ async def run_monitor(
                     # Leave it unseen so the next poll can retry rather than
                     # permanently dropping a valid upload.
                     logger.warning("Could not import monitored YouTube video %s yet: %s", video.id, exc)
+                    if on_error:
+                        try:
+                            await on_error(video, exc)
+                        except Exception:
+                            logger.exception("Could not report YouTube import failure for %s", video.id)
                 else:
                     runtime_config.mark_youtube_video(video.id, video.channel_id, "posted")
                     logger.info("Queued monitored YouTube video %s", video.id)
