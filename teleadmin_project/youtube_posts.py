@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import requests
+
+import runtime_config
+
+logger = logging.getLogger(__name__)
 
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -22,6 +28,33 @@ _DESCRIPTION_LINK_RE = re.compile(
 
 class YouTubeImportError(Exception):
     """An expected, user-facing failure while importing a YouTube transcript."""
+
+
+class _ProviderFailure(Exception):
+    """A provider-level failure that should disable the service for this month."""
+
+
+class _NoTranscript(Exception):
+    """The provider responded normally but has no usable transcript for this video."""
+
+
+_TRANSCRIPT_PROVIDERS = (
+    "youtube-captions-transcript-subtitles-video-combiner",
+    "youtube-transcripts",
+    "youtube-transcript3",
+    "youtube-2-transcript",
+    "youtube-transcripts-playlists-channels-search1",
+)
+_PROVIDER_HOSTS = {
+    "youtube-captions-transcript-subtitles-video-combiner": (
+        "youtube-captions-transcript-subtitles-video-combiner.p.rapidapi.com"
+    ),
+    "youtube-transcripts": "youtube-transcripts.p.rapidapi.com",
+    "youtube-2-transcript": "youtube-2-transcript.p.rapidapi.com",
+    "youtube-transcripts-playlists-channels-search1": (
+        "youtube-transcripts-playlists-channels-search1.p.rapidapi.com"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -124,17 +157,103 @@ def _clean_lines(lines: list[str]) -> str:
     previous = ""
     for line in lines:
         line = re.sub(r"\s+", " ", html.unescape(line)).strip()
+        if re.fullmatch(r"\d{1,6}", line) or re.match(
+            r"^\d{2}:\d{2}:\d{2}(?:[,.]\d{3})?\s+-->\s+", line
+        ):
+            continue
         if line and line.casefold() != previous.casefold():
             result.append(line)
             previous = line
     return "\n".join(result)
 
 
-def fetch_english_transcript(url: str, rapidapi_key: str | None) -> str:
-    """Fetch a flattened English transcript through RapidAPI."""
-    extract_video_id(url)  # Validate the input before sending it to the provider.
-    if not rapidapi_key:
-        raise YouTubeImportError("برای دریافت زیرنویس، X_RAPIDAPI_KEY را تنظیم کنید.")
+def _request_provider_json(
+    provider: str,
+    method: str,
+    path: str,
+    rapidapi_key: str,
+    *,
+    params: dict | None = None,
+    json_body: dict | None = None,
+) -> dict | list | str:
+    host = _PROVIDER_HOSTS[provider]
+    headers = {
+        "x-rapidapi-host": host,
+        "x-rapidapi-key": rapidapi_key,
+        "Content-Type": "application/json",
+    }
+    try:
+        response = requests.request(
+            method,
+            f"https://{host}{path}",
+            params=params,
+            json=json_body,
+            headers=headers,
+            timeout=45,
+        )
+    except requests.RequestException as exc:
+        raise _ProviderFailure(f"{provider}: network error") from exc
+    if response.status_code >= 400:
+        if response.status_code in {401, 403, 429}:
+            raise _ProviderFailure(f"{provider}: HTTP {response.status_code}")
+        raise _ProviderFailure(f"{provider}: HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = response.text
+    if not isinstance(payload, (dict, list, str)):
+        raise _ProviderFailure(f"{provider}: unsupported response shape")
+    return payload
+
+
+def _extract_transcript_text(payload) -> str:
+    """Extract text from the known and common transcript response shapes."""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        parts = []
+        for item in payload:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                segment = (
+                    item.get("text")
+                    or item.get("content")
+                    or item.get("caption")
+                    or item.get("transcript")
+                    or item.get("subtitle")
+                    or item.get("subtitles")
+                    or item.get("srt")
+                    or item.get("answer")
+                )
+                if isinstance(segment, str):
+                    parts.append(segment)
+                elif isinstance(segment, (dict, list)):
+                    parts.append(_extract_transcript_text(segment))
+        return "\n".join(part for part in parts if part)
+    if not isinstance(payload, dict):
+        return ""
+    for key in (
+        "transcript", "transcripts", "segments", "captions", "data", "result", "content", "text",
+        "answer", "subtitle", "subtitles", "srt", "transcript_text",
+    ):
+        if key in payload:
+            text = _extract_transcript_text(payload[key])
+            if text:
+                return text
+    return ""
+
+
+def _normalize_provider_transcript(payload) -> str:
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise _NoTranscript()
+    text = _clean_lines(_extract_transcript_text(payload).splitlines())
+    if len(text) < 40:
+        raise _NoTranscript()
+    return text
+
+
+def _fetch_main_transcript(url: str, rapidapi_key: str) -> str:
     try:
         response = requests.get(
             _TRANSCRIPT_URL,
@@ -146,16 +265,98 @@ def fetch_english_transcript(url: str, rapidapi_key: str | None) -> str:
             },
             timeout=45,
         )
-        response.raise_for_status()
-        data = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise YouTubeImportError("دریافت زیرنویس از سرویس RapidAPI ناموفق بود.") from exc
-    if not isinstance(data, dict) or not data.get("success"):
-        raise YouTubeImportError("سرویس RapidAPI برای این ویدیو زیرنویس انگلیسی پیدا نکرد.")
-    transcript = data.get("transcript")
-    if not isinstance(transcript, str):
-        raise YouTubeImportError("سرویس RapidAPI پاسخ زیرنویس قابل استفاده‌ای نداد.")
-    text = _clean_lines(transcript.splitlines())
-    if len(text) < 40:
-        raise YouTubeImportError("زیرنویس انگلیسی قابل استفاده‌ای برای این ویدیو پیدا نشد.")
-    return text
+    except requests.RequestException as exc:
+        raise _ProviderFailure("youtube-transcript3: network error") from exc
+    if response.status_code >= 400:
+        raise _ProviderFailure(f"youtube-transcript3: HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise _ProviderFailure("youtube-transcript3: invalid JSON response") from exc
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        raise _NoTranscript()
+    return _normalize_provider_transcript(payload)
+
+
+def _fetch_fallback_transcript(provider: str, url: str, rapidapi_key: str) -> str:
+    video_id = extract_video_id(url)
+    if provider == "youtube-captions-transcript-subtitles-video-combiner":
+        payload = _request_provider_json(
+            provider,
+            "GET",
+            f"/download-all/{video_id}",
+            rapidapi_key,
+            params={
+                "format_subtitle": "srt",
+                "format_answer": "json",
+                "response_mode": "default",
+            },
+        )
+    elif provider == "youtube-transcripts":
+        payload = _request_provider_json(
+            provider,
+            "GET",
+            "/youtube/transcript",
+            rapidapi_key,
+            params={
+                "url": url,
+                "videoId": video_id,
+                "chunkSize": "500",
+                "text": "false",
+                "lang": "en",
+            },
+        )
+    elif provider == "youtube-2-transcript":
+        payload = _request_provider_json(
+            provider,
+            "GET",
+            "/transcript-with-url",
+            rapidapi_key,
+            params={"url": url, "flat_text": "false"},
+        )
+    else:
+        payload = _request_provider_json(
+            provider,
+            "POST",
+            "/api/v1/transcripts/video",
+            rapidapi_key,
+            json_body={"video": video_id},
+        )
+    return _normalize_provider_transcript(payload)
+
+
+def fetch_english_transcript(url: str, rapidapi_key: str | None) -> str:
+    """Fetch a transcript, disabling failed providers for this month."""
+    extract_video_id(url)
+    if not rapidapi_key:
+        raise YouTubeImportError("برای دریافت زیرنویس، X_RAPIDAPI_KEY را تنظیم کنید.")
+
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    failures = []
+    attempted = []
+    for provider in _TRANSCRIPT_PROVIDERS:
+        if runtime_config.transcript_provider_is_disabled(provider, month):
+            logger.info("Skipping disabled transcript provider %s for %s", provider, month)
+            continue
+        attempted.append(provider)
+        try:
+            if provider == "youtube-transcript3":
+                text = _fetch_main_transcript(url, rapidapi_key)
+            else:
+                text = _fetch_fallback_transcript(provider, url, rapidapi_key)
+        except _NoTranscript:
+            logger.info("Transcript provider %s has no usable captions for this video", provider)
+            continue
+        except _ProviderFailure as exc:
+            failures.append(str(exc))
+            runtime_config.disable_transcript_provider(provider, month, str(exc))
+            logger.warning("Disabling transcript provider %s until next month: %s", provider, exc)
+            continue
+        logger.info("Transcript provider %s returned %d characters", provider, len(text))
+        return text
+
+    if not attempted:
+        raise YouTubeImportError("تمام سرویس‌های زیرنویس برای این ماه غیرفعال شده‌اند.")
+    if failures:
+        raise YouTubeImportError("همهٔ سرویس‌های زیرنویس در دسترس نبودند؛ وضعیت سهمیهٔ RapidAPI را بررسی کنید.")
+    raise YouTubeImportError("هیچ‌یک از سرویس‌های زیرنویس برای این ویدیو متن قابل استفاده‌ای پیدا نکردند.")

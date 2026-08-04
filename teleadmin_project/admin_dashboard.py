@@ -509,6 +509,6 @@ class AdminDashboard:
             "<b>Direct Translation</b>\nSend text, forwarded posts, or media without a command to translate it and add it to the channel queue.\n\n"
             "<b>YouTube Monitoring</b>\n/youtube — List monitored channels\n/youtube add https://youtube.com/@channel\n/youtube remove UC...\n\n"
             "<b>Telegram Sources</b>\n/source — List source channels\n/source add @sourcechannel\n/source remove @sourcechannel\n\n"
-            "<b>Settings</b>\n/channels\n/target @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
+            "<b>Settings</b>\n/channels\n/target @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set ARTICLE_MONITOR_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"
             "Setting changes and dashboard-content publishing require confirmation. X posts are placed directly in the scheduled channel queue for review."
         )

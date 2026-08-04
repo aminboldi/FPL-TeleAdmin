@@ -27,6 +27,7 @@ import alerts
 import price_changes
 import deadlines
 import articles
+import article_monitor
 import database as db
 import post_queue
 import scheduler
@@ -1521,6 +1522,7 @@ async def main():
     tasks = [
         _start_health_server(),
         _enrich_article_catalog(),
+        article_monitor.run_monitor(_publish_article_from_url),
         client.run_until_disconnected(),
         deadlines.run_deadline_loop(
             client=client,

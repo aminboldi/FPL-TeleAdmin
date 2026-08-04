@@ -41,7 +41,7 @@ When downloading and re-uploading media, the temp file must include the original
 
 Operational settings are dashboard-editable and persist in `runtime_config.db`, not `.env`:
 
-- `OPEN_ROUTER_MODEL`, source/target/notification channels, `PRICE_PREDICTIONS_ENABLED`, `EPL_LEAGUE_CODE`, `EPL_LEAGUE_ID`, `IRAN_LEAGUE_ID`
+- `OPEN_ROUTER_MODEL`, source/target/notification channels, `PRICE_PREDICTIONS_ENABLED`, `ARTICLE_MONITOR_ENABLED`, `EPL_LEAGUE_CODE`, `EPL_LEAGUE_ID`, `IRAN_LEAGUE_ID`
 - The database has an audit log and every setting change requires a Telegram confirmation.
 - `runtime_config.db` is ignored by git. In Coolify it must live in persistent storage: mount a volume at `/app/teleadmin_project/data` and set `RUNTIME_CONFIG_PATH=/app/teleadmin_project/data/runtime_config.db`.
 - Without `RUNTIME_CONFIG_PATH`, the bot still runs using a non-persistent DB beside the code; settings reset after a redeploy.
@@ -65,7 +65,8 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 
 - Admins can submit `/y https://youtube.com/watch?v=...` or `y/https://youtu.be/...`.
 - `YOUTUBE_API_KEY` is used only for public video metadata and channel monitoring. The official YouTube captions API cannot download transcripts for arbitrary external videos; it requires OAuth permission to edit the video.
-- English transcripts are retrieved through the subscribed RapidAPI service (`youtube-transcript3`) using `X_RAPIDAPI_KEY`.
+- English transcripts use a quota-aware RapidAPI chain with `X_RAPIDAPI_KEY`, in this order: `youtube-captions-transcript-subtitles-video-combiner`, `youtube-transcripts`, `youtube-transcript3`, `youtube-2-transcript`, and `youtube-transcripts-playlists-channels-search1`. Provider HTTP/auth/quota failures are persisted in `youtube_transcript_provider_health` and skipped until the next UTC calendar month; a valid no-captions response is treated as video-specific and allows the next provider. `transcriptapi` is not subscribed and is excluded.
+- The two caption providers are intentionally first because they retrieve YouTube subtitle tracks when available; their normalized SRT/segment output is preferred over generated speech recognition. The additional RapidAPI speech-recognition endpoints require an uploaded `audio_file`, so they are not usable as direct YouTube fallbacks without a separate audio-download/encoding pipeline.
 - Every transcript uses the structured article translator. It reconstructs raw captions into paragraphs, inferred topic headings, and genuine lists; short inline posts convert that structure into Telegram-safe bold headings, spacing, and bullets, while long posts retain Telegraph HTML.
 
 ## Deployment
@@ -308,6 +309,7 @@ Long-form content (>940 source chars) and merged text chunks are published as Te
 - `articles.publish_to_telegraph()` indexes each new page with its AI summary, source tag, original source URL, and feature-image URL. The feature image is intentionally removed from the Telegraph body when it is sent separately with the Telegram post; the catalog must use the stored URL rather than expecting an image inside Telegraph HTML.
 - YouTube article pages use the fetched YouTube thumbnail URL. URL-imported articles use the selected source/header image URL. No local image copy is required for catalog cards; images are loaded from their public HTTPS URLs. Articles without a recoverable image render as text-only cards.
 - `_enrich_article_catalog()` backfills older imported pages: it generates an AI summary from the full Telegraph content, recovers the original source link when present, derives YouTube thumbnails, and attempts to refetch source-article images. Recovery is impossible when an old page contains neither an image nor an original source link.
+- `article_monitor.py` polls Premier League and Fantasy Football Fix listing pages plus the Fantasy Football Scout and AllAboutFPL RSS feeds every 15 minutes. It seeds the current backlog on first startup, then sends only newly discovered URLs through `_publish_article_from_url()` and the normal half-hour review queue. Seen URLs and retry state live in `runtime_config.db`; `/set ARTICLE_MONITOR_ENABLED false` pauses polling.
 
 ## Public article catalog
 

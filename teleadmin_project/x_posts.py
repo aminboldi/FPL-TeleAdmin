@@ -145,6 +145,10 @@ def _rapid_post(tweet: dict, author: str) -> Post:
     return Post(id=tweet["rest_id"], text=text, author=author, media=media)
 
 
+def _rapid_reply_parent_id(tweet: dict) -> str:
+    return str((tweet.get("legacy") or {}).get("in_reply_to_status_id_str") or "")
+
+
 def _fetch_rapid_post_and_thread(url: str, key: str) -> list[Post]:
     post_id = extract_post_id(url)
     timeline = _rapid_request("/TweetDetail/", key, {"tweetId": post_id})
@@ -170,14 +174,26 @@ def _fetch_rapid_post_and_thread(url: str, key: str) -> list[Post]:
     root = tweets.get(post_id)
     if not root:
         raise XPostError("RapidAPI returned no readable post for this link.")
-    conversation = root["legacy"].get("conversation_id_str", post_id)
     author = tweet_author(root) or _extract_username(url)
-    thread = [
-        _rapid_post(tweet, author)
-        for tweet in tweets.values()
-        if tweet["legacy"].get("conversation_id_str") == conversation
-        and tweet_author(tweet).lower() == author.lower()
-    ]
+    # Conversation + author is not enough: an author can reply to someone else's
+    # comment inside the same conversation. Follow only replies whose parent is
+    # the submitted post or an already accepted self-authored thread post.
+    thread_tweets = {post_id: root}
+    pending = [tweet for tweet_id, tweet in tweets.items() if tweet_id != post_id]
+    while pending:
+        accepted = []
+        for tweet in pending:
+            if tweet_author(tweet).lower() != author.lower():
+                continue
+            if _rapid_reply_parent_id(tweet) in thread_tweets:
+                thread_tweets[tweet["rest_id"]] = tweet
+                accepted.append(tweet)
+        if not accepted:
+            break
+        accepted_ids = {tweet["rest_id"] for tweet in accepted}
+        pending = [tweet for tweet in pending if tweet["rest_id"] not in accepted_ids]
+
+    thread = [_rapid_post(tweet, author) for tweet in thread_tweets.values()]
     if not thread:
         raise XPostError("RapidAPI returned the post but no publishable thread content.")
     return sorted(thread, key=lambda post: int(post.id))
@@ -192,7 +208,7 @@ def fetch_post_and_thread(url: str, token: str | None = None, rapidapi_key: str 
     post_id = extract_post_id(url)
     params = {
         "expansions": "author_id,attachments.media_keys",
-        "tweet.fields": "conversation_id,created_at,note_tweet",
+        "tweet.fields": "conversation_id,created_at,note_tweet,referenced_tweets",
         "user.fields": "username",
         "media.fields": "url,preview_image_url,variants,type",
     }
@@ -222,11 +238,36 @@ def fetch_post_and_thread(url: str, token: str | None = None, rapidapi_key: str 
     except XPostError:
         return posts
 
-    thread = [_to_post(tweet, thread_data.get("includes", {})) for tweet in thread_data.get("data", [])]
+    raw_thread = {
+        str(tweet["id"]): tweet
+        for tweet in thread_data.get("data", [])
+        if tweet.get("author_id") == root.get("author_id")
+    }
+    raw_thread[root["id"]] = root
+    accepted = {root["id"]: root}
+    pending = [tweet for tweet_id, tweet in raw_thread.items() if tweet_id != root["id"]]
+    while pending:
+        newly_accepted = []
+        for tweet in pending:
+            parent_id = next(
+                (
+                    str(reference.get("id"))
+                    for reference in tweet.get("referenced_tweets", [])
+                    if reference.get("type") == "replied_to"
+                ),
+                "",
+            )
+            if parent_id in accepted:
+                accepted[tweet["id"]] = tweet
+                newly_accepted.append(tweet)
+        if not newly_accepted:
+            break
+        accepted_ids = {tweet["id"] for tweet in newly_accepted}
+        pending = [tweet for tweet in pending if tweet["id"] not in accepted_ids]
+
+    thread = [_to_post(tweet, thread_data.get("includes", {})) for tweet in accepted.values()]
     if not thread:
         return posts
-    by_id = {post.id: post for post in thread}
-    by_id.setdefault(posts[0].id, posts[0])
     # Search results have timestamps only when requested. Stable ID ordering is a
     # reasonable fallback for a single author thread.
-    return sorted(by_id.values(), key=lambda post: int(post.id))
+    return sorted(thread, key=lambda post: int(post.id))

@@ -14,6 +14,7 @@ DEFAULTS = {
     "EPL_LEAGUE_CODE": os.getenv("EPL_LEAGUE_CODE", os.getenv("LEAGUE_CODE", "433b70")),
     "EPL_LEAGUE_ID": os.getenv("EPL_LEAGUE_ID", ""),
     "IRAN_LEAGUE_ID": os.getenv("IRAN_LEAGUE_ID", ""),
+    "ARTICLE_MONITOR_ENABLED": os.getenv("ARTICLE_MONITOR_ENABLED", "true"),
 }
 
 
@@ -58,6 +59,27 @@ def init() -> None:
                 source_ref TEXT NOT NULL,
                 added_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS article_monitor_seen (
+                url TEXT PRIMARY KEY,
+                source_key TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                published_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                discovered_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS article_monitor_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS youtube_transcript_provider_health (
+                provider_key TEXT PRIMARY KEY,
+                disabled_month TEXT NOT NULL,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
             """
         )
         now = datetime.now(timezone.utc).isoformat()
@@ -81,6 +103,136 @@ def get(key: str) -> str:
 
 def get_bool(key: str) -> bool:
     return get(key).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def article_monitor_is_bootstrapped() -> bool:
+    init()
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM article_monitor_meta WHERE key='bootstrapped'"
+        ).fetchone() is not None
+
+
+def mark_article_monitor_bootstrapped() -> None:
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO article_monitor_meta (key, value) VALUES ('bootstrapped', '1')"
+        )
+
+
+def seed_article_monitor_candidates(candidates: list[dict]) -> None:
+    """Remember the current source contents without importing the backlog."""
+    if not candidates:
+        return
+    init()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO article_monitor_seen "
+            "(url, source_key, title, published_at, status, discovered_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'seeded', ?, ?)",
+            [
+                (
+                    str(candidate["url"]),
+                    str(candidate.get("source_key", "")),
+                    str(candidate.get("title", "")),
+                    str(candidate.get("published_at", "")),
+                    now,
+                    now,
+                )
+                for candidate in candidates
+            ],
+        )
+
+
+def claim_article_monitor_candidate(
+    candidate: dict, *, retry_after_seconds: int = 6 * 60 * 60
+) -> bool:
+    """Reserve a new or retryable candidate for one import attempt."""
+    init()
+    now = datetime.now(timezone.utc)
+    now_text = now.isoformat()
+    url = str(candidate["url"])
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT status, attempts, updated_at FROM article_monitor_seen WHERE url=?",
+            (url,),
+        ).fetchone()
+        if row:
+            status, attempts, updated_at = row
+            if status in {"published", "seeded"}:
+                return False
+            try:
+                age = (now - datetime.fromisoformat(updated_at)).total_seconds()
+            except ValueError:
+                age = retry_after_seconds
+            if status == "processing" and age < 60 * 60:
+                return False
+            if status == "failed" and age < retry_after_seconds:
+                return False
+            conn.execute(
+                "UPDATE article_monitor_seen SET status='processing', attempts=?, "
+                "last_error='', updated_at=? WHERE url=?",
+                (int(attempts or 0) + 1, now_text, url),
+            )
+            return True
+        conn.execute(
+            "INSERT INTO article_monitor_seen "
+            "(url, source_key, title, published_at, status, attempts, discovered_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'processing', 1, ?, ?)",
+            (
+                url,
+                str(candidate.get("source_key", "")),
+                str(candidate.get("title", "")),
+                str(candidate.get("published_at", "")),
+                now_text,
+                now_text,
+            ),
+        )
+        return True
+
+
+def finish_article_monitor_candidate(url: str, *, success: bool, error: str = "") -> None:
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE article_monitor_seen SET status=?, last_error=?, updated_at=? WHERE url=?",
+            (
+                "published" if success else "failed",
+                str(error)[:1000],
+                datetime.now(timezone.utc).isoformat(),
+                url,
+            ),
+        )
+
+
+def transcript_provider_is_disabled(provider_key: str, month: str) -> bool:
+    init()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT disabled_month FROM youtube_transcript_provider_health "
+            "WHERE provider_key=?",
+            (provider_key,),
+        ).fetchone()
+    return bool(row and row[0] == month)
+
+
+def disable_transcript_provider(provider_key: str, month: str, error: str) -> None:
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO youtube_transcript_provider_health "
+            "(provider_key, disabled_month, last_error, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(provider_key) DO UPDATE SET disabled_month=excluded.disabled_month, "
+            "last_error=excluded.last_error, updated_at=excluded.updated_at",
+            (
+                provider_key,
+                month,
+                str(error)[:1000],
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
 
 
 def values() -> dict[str, str]:
