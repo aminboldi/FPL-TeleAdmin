@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 _POLL_SECONDS = 15 * 60
 _MAX_CANDIDATES_PER_SOURCE = 12
-_PL_NEWS_URL = "https://www.premierleague.com/en/news"
+# The unfiltered page contains every Premier League publication.  The
+# `type=Fantasy` channel is the official PL classification for FPL articles.
+_PL_NEWS_URL = "https://www.premierleague.com/en/news?type=Fantasy"
 _PL_CONTENT_API_BASE = "https://api.premierleague.com/content/premierleague/playlist/EN"
 _HEADERS = {
     "User-Agent": (
@@ -119,12 +121,13 @@ def _listing_candidates_from_html(
 
 
 def _premier_league_candidates() -> list[Candidate]:
-    """Read PL news cards from the public content API.
+    """Read fantasy-only PL news cards from the public content API.
 
-    The PL news page now renders its article grid in JavaScript. The initial
-    HTML contains the grid configuration, but not the current article links.
-    Keep scraping the HTML as a fallback for older/site-degraded responses,
-    then use the playlist API that the page itself calls for the live cards.
+    The PL news page now renders its article grid in JavaScript. The filtered
+    HTML contains the fantasy playlist configuration, but not the current
+    article links. Keep scraping that same filtered HTML as a fallback for
+    older/site-degraded responses, then use the playlist API that the page
+    itself calls for the live cards. Never fall back to the unfiltered feed.
     """
     page_html = _fetch(_PL_NEWS_URL)
     html_candidates = _listing_candidates_from_html(
