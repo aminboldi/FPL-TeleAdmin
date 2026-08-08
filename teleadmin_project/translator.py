@@ -3,6 +3,7 @@ import json
 import re
 import html as html_lib
 
+from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
 _prompt_path = Path(__file__).parent / "prompt.txt"
@@ -12,6 +13,8 @@ _article_prompt_path = Path(__file__).parent / "article_prompt.txt"
 ARTICLE_PROMPT = _article_prompt_path.read_text(encoding="utf-8")
 _summary_prompt_path = Path(__file__).parent / "summary_prompt.txt"
 SUMMARY_PROMPT = _summary_prompt_path.read_text(encoding="utf-8")
+_transcript_format_prompt_path = Path(__file__).parent / "transcript_format_prompt.txt"
+TRANSCRIPT_FORMAT_PROMPT = _transcript_format_prompt_path.read_text(encoding="utf-8")
 _TRANSCRIPT_FORMATTING_INSTRUCTIONS = """
 
 Additional instructions for this raw YouTube transcript:
@@ -125,6 +128,8 @@ class Translator:
                     self.google_client, self.google_model, text, formatting_instructions
                 )
             )
+            if transcript:
+                article["body"] = await self._format_transcript_body(article.get("body", ""))
             article["summary"] = (
                 await self.summarize_article(article.get("body", ""))
                 or article.get("summary", "")
@@ -137,6 +142,8 @@ class Translator:
                         self.openrouter_client, self.fallback_model, text, formatting_instructions
                     )
                 )
+                if transcript:
+                    article["body"] = await self._format_transcript_body(article.get("body", ""))
                 article["summary"] = (
                     await self.summarize_article(article.get("body", ""))
                     or article.get("summary", "")
@@ -149,6 +156,8 @@ class Translator:
         # first 300 characters of the article into a fake summary.
         body = await self.translate(text)
         body = body.strip()
+        if transcript:
+            body = await self._format_transcript_body(body)
         lines = body.split("\n")
         title = lines[0].strip()[:100] if lines else ""
         summary = await self.summarize_article(body)
@@ -241,6 +250,104 @@ class Translator:
             for key, value in article.items()
         }
 
+    async def _format_transcript_body(self, body: str) -> str:
+        """Enforce readable structure after transcript translation.
+
+        Formatting instructions in the translation prompt are advisory. This
+        second pass is deliberately separate so a successful translation can
+        still be reformatted, and a failed formatter falls back to deterministic
+        paragraph splitting instead of publishing one giant block.
+        """
+        body = str(body or "").strip()
+        if not body:
+            return body
+
+        for client, model in (
+            (self.google_client, self.google_model),
+            (self.openrouter_client, self.fallback_model),
+        ):
+            if client is None:
+                continue
+            try:
+                formatted = await self._call_format_model(client, model, body)
+                formatted = self._clean_formatted_html(formatted)
+                if self._has_readable_structure(formatted):
+                    return formatted
+            except Exception:
+                continue
+        return self._deterministic_transcript_format(body)
+
+    @staticmethod
+    def _clean_formatted_html(value: str) -> str:
+        raw = str(value or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        soup = BeautifulSoup(raw.strip(), "html.parser")
+        root = soup.body or soup
+        return "".join(str(child) for child in root.contents).strip()
+
+    @staticmethod
+    def _has_readable_structure(value: str) -> bool:
+        soup = BeautifulSoup(value, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        if not text:
+            return False
+        blocks = soup.find_all(["p", "h3", "h4", "ul", "ol", "blockquote"])
+        if len(text) <= 900:
+            return bool(blocks)
+        return len(blocks) >= 2 or len(soup.find_all("br")) >= 1
+
+    @staticmethod
+    def _deterministic_transcript_format(value: str) -> str:
+        """Split an unformatted fallback into readable Telegraph paragraphs."""
+        soup = BeautifulSoup(value, "html.parser")
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
+        if not text:
+            return value.strip()
+
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?؟؛])\s+", text)
+            if sentence.strip()
+        ]
+        chunks: list[str] = []
+        current = ""
+        sentence_count = 0
+        for sentence in sentences:
+            if current and (
+                sentence_count >= 3
+                or len(current) + len(sentence) + 1 > 550
+            ):
+                chunks.append(current)
+                current = ""
+                sentence_count = 0
+            current = f"{current} {sentence}".strip()
+            sentence_count += 1
+        if current:
+            chunks.append(current)
+
+        if len(chunks) == 1 and len(chunks[0]) > 700:
+            words = chunks[0].split()
+            chunks = []
+            current_words: list[str] = []
+            current_length = 0
+            for word in words:
+                if current_words and current_length + len(word) + 1 > 500:
+                    chunks.append(" ".join(current_words))
+                    current_words = []
+                    current_length = 0
+                current_words.append(word)
+                current_length += len(word) + 1
+            if current_words:
+                chunks.append(" ".join(current_words))
+
+        return "\n".join(
+            f"<p>{html_lib.escape(chunk, quote=False)}</p>"
+            for chunk in chunks
+        )
+
     async def _call_model(self, client: AsyncOpenAI, model: str, text: str) -> str:
         response = await client.chat.completions.create(
             model=model,
@@ -282,6 +389,19 @@ class Translator:
             raw = raw[start:end + 1]
 
         return json.loads(raw)
+
+    async def _call_format_model(
+        self, client: AsyncOpenAI, model: str, text: str,
+    ) -> str:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": TRANSCRIPT_FORMAT_PROMPT.format(text=text)}
+            ],
+            temperature=0.2,
+            max_tokens=8192,
+        )
+        return response.choices[0].message.content.strip()
 
     async def _call_summary_model(
         self, client: AsyncOpenAI, model: str, text: str,

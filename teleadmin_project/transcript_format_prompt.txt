@@ -1,0 +1,21 @@
+You are the final Persian copy editor for a translated YouTube transcript.
+
+Reformat the translated body below into readable Telegraph HTML. This is a
+formatting pass, not a translation or summary.
+
+Rules:
+- Return only the article body as valid Telegraph HTML; no JSON, Markdown,
+  code fences, explanation, or quotation marks.
+- Do not omit, paraphrase, reorder, or add substantive information.
+- Split long continuous text into short logical <p> paragraphs, normally one to
+  three related sentences each.
+- Identify genuine topic changes and add concise factual <h3> or <h4> headings.
+- Convert clearly enumerated advice, options, comparisons, rankings, or steps
+  into <ul> or <ol> with <li> items. Do not force ordinary prose into a list.
+- Preserve names, numbers, prices, player references, and all emojis exactly.
+- Use only Telegraph-safe tags: <p>, <br>, <h3>, <h4>, <b>, <strong>, <i>,
+  <em>, <blockquote>, <ul>, <ol>, <li>, <hr>, <code>, and <pre>.
+- Do not add links or invent headings, facts, quotes, or recommendations.
+
+Translated transcript body:
+{text}

@@ -20,6 +20,12 @@ _RAPID_HOST = "youtube-transcript3.p.rapidapi.com"
 _TRANSCRIPT_URL = f"https://{_RAPID_HOST}/api/transcript-with-url"
 _YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 _THUMBNAIL_PREFERENCE = ("maxres", "standard", "high", "medium", "default")
+_HASHTAG_RE = re.compile(r"(?<!\w)#[\w-]+", re.UNICODE)
+_AD_HASHTAG_RE = re.compile(r"(?<!\w)#ad(?!\w)", re.IGNORECASE)
+_SHORTS_HASHTAG_RE = re.compile(r"(?<!\w)#shorts(?!\w)", re.IGNORECASE)
+_ISO_DURATION_RE = re.compile(
+    r"^PT(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?$"
+)
 _DESCRIPTION_LINK_RE = re.compile(
     r"(?:https?://|www\.)\S+|\b(?:[\w-]+\.)+(?:com|net|org|io|co|me|tv|gg|fm|ly|be|app|ai)(?:/\S*)?",
     re.IGNORECASE,
@@ -32,6 +38,68 @@ class YouTubeImportError(Exception):
 
 class TranscriptProvidersExhausted(YouTubeImportError):
     """All configured transcript providers failed or had no usable transcript."""
+
+
+def _duration_seconds(value: str) -> int | None:
+    match = _ISO_DURATION_RE.fullmatch(str(value or ""))
+    if not match:
+        return None
+    return (
+        int(match.group("hours") or 0) * 3600
+        + int(match.group("minutes") or 0) * 60
+        + int(match.group("seconds") or 0)
+    )
+
+
+def is_short_video(video: dict, *, source_url: str = "") -> bool:
+    """Return whether a public video has YouTube-Shorts characteristics."""
+    parsed = urlparse(str(source_url or "").strip())
+    if parsed.path.strip("/").split("/", 1)[0].casefold() == "shorts":
+        return True
+
+    snippet = video.get("snippet") or {}
+    if _SHORTS_HASHTAG_RE.search(
+        f"{snippet.get('title', '')}\n{snippet.get('description', '')}"
+    ):
+        return True
+
+    content_details = video.get("contentDetails") or {}
+    duration = _duration_seconds(content_details.get("duration", ""))
+    if duration is None or duration > 180:
+        return False
+
+    # The API's public player dimensions are available when requested with
+    # maxWidth/maxHeight. A square or taller frame is the reliable signal;
+    # fileDetails.videoStreams is owner-only and cannot be used here.
+    player = video.get("player") or {}
+    try:
+        width = int(player.get("embedWidth") or 0)
+        height = int(player.get("embedHeight") or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+    if width and height:
+        return height >= width
+
+    # Some API responses expose this newer aspect-ratio value directly.
+    aspect_ratio = str(content_details.get("aspectRatio") or "").upper()
+    return aspect_ratio in {"RATIO_1_1", "RATIO_9_16", "1:1", "9:16"}
+
+
+def is_ad_video(title: str, description: str) -> bool:
+    """Return whether either public YouTube field contains the #ad hashtag."""
+    return bool(
+        _AD_HASHTAG_RE.search(str(title or ""))
+        or _AD_HASHTAG_RE.search(str(description or ""))
+    )
+
+
+def clean_video_title(title: str) -> str:
+    """Remove hashtags from a title while keeping the remaining wording."""
+    cleaned = _HASHTAG_RE.sub("", str(title or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = cleaned.strip(" -|–—")
+    return cleaned
 
 
 class _ProviderFailure(Exception):
@@ -118,9 +186,11 @@ def fetch_video_metadata(url: str, youtube_api_key: str | None) -> VideoMetadata
         response = requests.get(
             _YOUTUBE_VIDEOS_URL,
             params={
-                "part": "snippet",
+                "part": "snippet,contentDetails,player",
                 "id": extract_video_id(url),
                 "key": youtube_api_key,
+                "maxWidth": 640,
+                "maxHeight": 640,
             },
             timeout=15,
         )
@@ -130,13 +200,17 @@ def fetch_video_metadata(url: str, youtube_api_key: str | None) -> VideoMetadata
         raise YouTubeImportError("دریافت اطلاعات ویدیو از YouTube ناموفق بود.") from exc
 
     items = data.get("items") if isinstance(data, dict) else None
-    snippet = items[0].get("snippet") if isinstance(items, list) and items else None
+    video = items[0] if isinstance(items, list) and items else None
+    snippet = video.get("snippet") if isinstance(video, dict) else None
     if not isinstance(snippet, dict):
         raise YouTubeImportError("اطلاعات عمومی این ویدیوی YouTube پیدا نشد.")
 
-    title = str(snippet.get("title") or "").strip()
+    raw_title = str(snippet.get("title") or "").strip()
     channel_title = str(snippet.get("channelTitle") or "").strip()
     description = str(snippet.get("description") or "").strip()
+    if is_ad_video(raw_title, description):
+        raise YouTubeImportError("این ویدیو به‌دلیل وجود هشتگ #ad منتشر نمی‌شود.")
+    title = clean_video_title(raw_title)
     thumbnails = snippet.get("thumbnails") or {}
     thumbnail_url = next(
         (

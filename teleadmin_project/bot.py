@@ -1104,8 +1104,10 @@ async def _import_youtube_transcript(url: str) -> str:
         youtube_posts.fetch_english_transcript, url, settings.x_rapidapi_key
     )
     _refresh_translator_model()
-    translated_title = _fix_unclosed_tags(
-        _strip_quotes(await translator.translate(_escape_html(metadata.title)))
+    translated_title = youtube_posts.clean_video_title(
+        _fix_unclosed_tags(
+            _strip_quotes(await translator.translate(_escape_html(metadata.title)))
+        )
     )
     if len(transcript) <= _YOUTUBE_INLINE_TRANSCRIPT_LIMIT:
         article = await translator.translate_article(

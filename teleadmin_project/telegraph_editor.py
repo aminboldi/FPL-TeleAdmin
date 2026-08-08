@@ -6,6 +6,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -18,8 +19,12 @@ import article_catalog
 logger = logging.getLogger(__name__)
 
 _EDITOR_PATH = "/telegraph/edit/"
+_ADMIN_PATH = "/telegraph/admin"
+_ADMIN_LOGIN_PATH = "/telegraph/admin/login"
+_ADMIN_LOGOUT_PATH = "/telegraph/admin/logout"
 _LINK_LIFETIME_SECONDS = 15 * 60
 _OPEN_EDITOR_LIFETIME_SECONDS = 2 * 60 * 60
+_ADMIN_SESSION_LIFETIME_SECONDS = 12 * 60 * 60
 _MAX_REQUEST_BYTES = 256 * 1024
 _CATALOG_PAGE_SIZE = 24
 _STATIC_ASSETS = {
@@ -38,6 +43,7 @@ class _EditGrant:
 
 
 _grants: dict[str, _EditGrant] = {}
+_admin_sessions: dict[str, float] = {}
 
 
 def _public_base_url() -> str:
@@ -78,6 +84,36 @@ def create_edit_url(page_url: str) -> str:
 def public_catalog_url() -> str:
     """Return the public root URL used for the article catalog."""
     return _public_base_url() + "/"
+
+
+def _admin_password() -> str:
+    return os.getenv("TELEGRAPH_EDITOR_PASSWORD", "")
+
+
+def _admin_session_from_headers(headers: dict[str, str]) -> str:
+    cookies = SimpleCookie()
+    try:
+        cookies.load(headers.get("cookie", ""))
+    except Exception:
+        return ""
+    return cookies.get("telegraph_admin").value if cookies.get("telegraph_admin") else ""
+
+
+def _admin_authenticated(headers: dict[str, str]) -> bool:
+    token = _admin_session_from_headers(headers)
+    expires_at = _admin_sessions.get(token, 0)
+    if not token or expires_at <= time.time():
+        _admin_sessions.pop(token, None)
+        return False
+    return True
+
+
+def _admin_cookie(token: str, *, max_age: int) -> str:
+    secure = "; Secure" if _public_base_url().startswith("https://") else ""
+    return (
+        f"telegraph_admin={token}; Path=/telegraph/admin; Max-Age={max_age}; "
+        f"HttpOnly; SameSite=Strict{secure}"
+    )
 
 
 def _grant_for(token: str, *, open_editor: bool = False) -> _EditGrant | None:
@@ -147,7 +183,7 @@ def _page_shell(title: str, body: str) -> str:
     .card {{ background: white; border-radius: 14px; padding: 18px; box-shadow: 0 2px 12px #0001; }}
     h1 {{ font-size: 20px; margin: 0 0 16px; }}
     label {{ display: block; font-weight: 700; margin: 14px 0 6px; }}
-    input[type=text] {{ width: 100%; box-sizing: border-box; padding: 11px; border: 1px solid #ccd0d5; border-radius: 8px; font: inherit; }}
+    input[type=text], input[type=password] {{ width: 100%; box-sizing: border-box; padding: 11px; border: 1px solid #ccd0d5; border-radius: 8px; font: inherit; }}
     .toolbar {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; direction: ltr; }}
     .toolbar button {{ min-width: 38px; padding: 7px 10px; border: 1px solid #ccd0d5; border-radius: 7px; background: #fff; cursor: pointer; }}
     #editor {{ min-height: 420px; border: 1px solid #ccd0d5; border-radius: 8px; padding: 16px; outline: none; line-height: 1.8; }}
@@ -157,6 +193,12 @@ def _page_shell(title: str, body: str) -> str:
     .note {{ color: #646a73; font-size: 13px; }}
     .error {{ color: #a82121; background: #fff0f0; border-radius: 8px; padding: 12px; }}
     .success {{ color: #116329; background: #effaf1; border-radius: 8px; padding: 12px; }}
+    .admin-list {{ display: grid; gap: 10px; margin-top: 18px; }}
+    .admin-row {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid #e1e5e9; border-radius: 10px; padding: 12px; }}
+    .admin-row h2 {{ margin: 0 0 4px; font-size: 16px; }}
+    .admin-row .note {{ overflow-wrap: anywhere; margin: 0; }}
+    .admin-edit {{ flex: 0 0 auto; background: #310b34; color: #fff; border-radius: 7px; padding: 9px 14px; text-decoration: none; font-weight: 700; }}
+    .logout {{ margin-top: 18px; border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
     a {{ color: #168acd; }}
   </style>
 </head>
@@ -205,6 +247,45 @@ document.getElementById('edit-form').addEventListener('submit', e => {{
 }});
 </script>"""
     return _page_shell("ویرایش مقاله", body)
+
+
+def _admin_login_page(error: str = "") -> str:
+    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    body = f"""
+<h1>مدیریت مقالات Telegraph</h1>
+{error_html}
+<form method="post" action="{_ADMIN_LOGIN_PATH}">
+  <label for="password">رمز عبور</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button class="save" type="submit">ورود</button>
+</form>
+"""
+    return _page_shell("ورود به مدیریت مقالات", body)
+
+
+def _admin_index_page(pages: list[dict]) -> str:
+    rows = []
+    for page in pages:
+        title = html.escape(str(page.get("title") or "بدون عنوان"))
+        page_url = str(page.get("url") or "").strip()
+        safe_page_url = html.escape(page_url, quote=True)
+        editor_url = html.escape(create_edit_url(page_url), quote=True)
+        rows.append(
+            f"""
+            <article class="admin-row">
+              <div><h2>{title}</h2><p class="note">{safe_page_url}</p></div>
+              <a class="admin-edit" href="{editor_url}" target="_blank" rel="noopener">ویرایش</a>
+            </article>
+            """
+        )
+    body = f"""
+<h1>مدیریت مقالات Telegraph</h1>
+<p class="note">برای تغییر عنوان یا متن، روی «ویرایش» بزنید. لینک ویرایش موقت است و پس از ذخیره منقضی می‌شود.</p>
+<p class="note">حذف کامل صفحه از Telegraph از طریق API رسمی این سرویس پشتیبانی نمی‌شود؛ این بخش فعلاً فقط ویرایش و تغییر عنوان را انجام می‌دهد.</p>
+<div class="admin-list">{"".join(rows) or '<p class="note">مقاله‌ای پیدا نشد.</p>'}</div>
+<form method="post" action="{_ADMIN_LOGOUT_PATH}"><button class="logout" type="submit">خروج</button></form>
+"""
+    return _page_shell("مدیریت مقالات", body)
 
 
 def _message_page(message: str, *, success: bool = False, article_url: str = "") -> str:
@@ -299,6 +380,9 @@ def _catalog_page(
     .logo {{ display: block; width: 58px; height: 72px; object-fit: contain; flex: 0 0 auto; }}
     header h1 {{ margin: 0 0 8px; font-size: 27px; }}
     header p {{ margin: 0; color: #d8e3ea; }}
+    header a {{ color: white; }}
+    .league-invite {{ margin-top: 10px; }}
+    .league-invite a {{ font-weight: 700; text-decoration: none; }}
     form {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 22px auto; }}
     input, select, button {{ border: 1px solid #ccd4dc; border-radius: 8px; padding: 11px 12px; font: inherit; }}
     input {{ flex: 1 1 260px; min-width: 180px; }}
@@ -310,13 +394,13 @@ def _catalog_page(
     .card-body {{ padding: 16px; }}
     .meta {{ display: flex; justify-content: space-between; gap: 8px; color: #687582; font-size: 12px; }}
     .tag {{ color: #126a9e; font-weight: 700; }}
-    a {{ color: #02eefe; }}
+    a {{ color: #310b34; }}
     h2 {{ font-size: 19px; line-height: 1.55; margin: 10px 0 8px; }}
-    h2 a {{ color: #02eefe; text-decoration: none; }}
+    h2 a {{ color: #310b34; text-decoration: none; }}
     .card p {{ color: #53616e; line-height: 1.8; min-height: 52px; margin: 0 0 12px; }}
-    .read {{ color: #02eefe; font-weight: 700; text-decoration: none; }}
+    .read {{ color: #310b34; font-weight: 700; text-decoration: none; }}
     .pager-row {{ display: flex; justify-content: space-between; min-height: 44px; }}
-    .pager {{ color: #02eefe; font-weight: 700; text-decoration: none; }}
+    .pager {{ color: #310b34; font-weight: 700; text-decoration: none; }}
     .empty {{ background: white; border-radius: 12px; padding: 32px; text-align: center; color: #687582; }}
     @media (max-width: 600px) {{ header h1 {{ font-size: 22px; }} .grid {{ grid-template-columns: 1fr; }} }}
   </style>
@@ -324,7 +408,7 @@ def _catalog_page(
 <body>
   <header><div class="wrap brand">
     <img class="logo" src="/logo.webp" alt="EPL Fantasy">
-    <div><h1>مقالات فوتبال فانتزی لیگ برتر انگلیس <a href="https://fantasy.premierleague.com/" target="_blank" rel="noopener">FPL</a></h1><p>آرشیو مقالات منتشر شده در کانال تلگرامی <a href="https://t.me/EPL_Fantasy" target="_blank" rel="noopener">@EPL_Fantasy</a></p></div>
+    <div><h1>مقالات فوتبال فانتزی لیگ برتر انگلیس <a href="https://fantasy.premierleague.com/" target="_blank" rel="noopener">FPL</a></h1><p>آرشیو مقالات منتشر شده در کانال تلگرامی <a href="https://t.me/EPL_Fantasy" target="_blank" rel="noopener">@EPL_Fantasy</a></p><p class="league-invite"><a href="https://fantasy.premierleague.com/leagues/auto-join/316d22" target="_blank" rel="noopener">برای عضویت در لیگ فانتزی ما کلیک کنید</a></p></div>
   </div></header>
   <main class="wrap">
     <form method="get">
@@ -388,8 +472,13 @@ async def _send_response(
     *,
     head: bool = False,
     content_type: str = "text/html; charset=utf-8",
+    extra_headers: tuple[str, ...] = (),
 ) -> None:
-    reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 413: "Payload Too Large", 500: "Internal Server Error"}
+    reasons = {
+        200: "OK", 303: "See Other", 400: "Bad Request", 401: "Unauthorized",
+        404: "Not Found", 405: "Method Not Allowed", 413: "Payload Too Large",
+        500: "Internal Server Error",
+    }
     payload = body if isinstance(body, bytes) else body.encode("utf-8")
     headers = (
         f"HTTP/1.1 {status} {reasons.get(status, '')}\r\n"
@@ -401,8 +490,9 @@ async def _send_response(
         "Content-Security-Policy: default-src 'none'; img-src 'self' https: data:; "
         "frame-src https:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
         "form-action 'self'; base-uri 'none'\r\n"
-        f"Content-Length: {len(payload)}\r\n"
-        "Connection: close\r\n\r\n"
+        + "".join(f"{header}\r\n" for header in extra_headers)
+        + f"Content-Length: {len(payload)}\r\n"
+        + "Connection: close\r\n\r\n"
     ).encode("ascii")
     writer.write(headers + (b"" if head else payload))
     await writer.drain()
@@ -469,6 +559,70 @@ async def handle_http(reader, writer) -> None:
         if path in {"/health", "/healthz"} and method in {"GET", "HEAD"}:
             await _send_response(writer, 200, "OK", head=method == "HEAD")
             return
+        if path in {_ADMIN_PATH, _ADMIN_PATH + "/"}:
+            if not _admin_password():
+                await _send_response(
+                    writer, 404,
+                    _message_page("مدیریت وب فعال نیست؛ TELEGRAPH_EDITOR_PASSWORD را تنظیم کنید."),
+                )
+                return
+            if method != "GET":
+                await _send_response(writer, 405, "Method not allowed")
+                return
+            if not _admin_authenticated(headers):
+                await _send_response(writer, 200, _admin_login_page())
+                return
+            try:
+                pages = await asyncio.to_thread(articles.get_recent_telegraph_pages, 100)
+                page = _admin_index_page(pages)
+            except Exception as exc:
+                logger.exception("Failed to load Telegraph admin pages")
+                await _send_response(writer, 500, _message_page(f"دریافت فهرست مقالات ناموفق بود: {exc}"))
+                return
+            await _send_response(writer, 200, page)
+            return
+        if path == _ADMIN_LOGIN_PATH:
+            if not _admin_password():
+                await _send_response(writer, 404, "Not found")
+                return
+            if method != "POST":
+                await _send_response(writer, 405, "Method not allowed")
+                return
+            if not headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
+                await _send_response(writer, 400, _admin_login_page("فرمت درخواست نامعتبر است."))
+                return
+            fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=4)
+            password = fields.get("password", [""])[0]
+            if not secrets.compare_digest(password, _admin_password()):
+                await _send_response(writer, 401, _admin_login_page("رمز عبور نادرست است."))
+                return
+            now = time.time()
+            for token, expires_at in list(_admin_sessions.items()):
+                if expires_at <= now:
+                    _admin_sessions.pop(token, None)
+            token = secrets.token_urlsafe(32)
+            _admin_sessions[token] = now + _ADMIN_SESSION_LIFETIME_SECONDS
+            await _send_response(
+                writer, 303, "",
+                extra_headers=(
+                    f"Location: {_ADMIN_PATH}",
+                    f"Set-Cookie: {_admin_cookie(token, max_age=_ADMIN_SESSION_LIFETIME_SECONDS)}",
+                ),
+            )
+            return
+        if path == _ADMIN_LOGOUT_PATH:
+            if method != "POST":
+                await _send_response(writer, 405, "Method not allowed")
+                return
+            _admin_sessions.pop(_admin_session_from_headers(headers), None)
+            await _send_response(
+                writer, 303, "",
+                extra_headers=(
+                    f"Location: {_ADMIN_PATH}",
+                    f"Set-Cookie: {_admin_cookie('', max_age=0)}",
+                ),
+            )
+            return
         if not path.startswith(_EDITOR_PATH):
             await _send_response(writer, 404, "Not found")
             return
@@ -500,6 +654,7 @@ async def handle_http(reader, writer) -> None:
             title = fields.get("title", [""])[0]
             content = _clean_editor_html(fields.get("content", [""])[0])
             await asyncio.to_thread(articles.edit_telegraph_page, grant.page_url, title, content)
+            await asyncio.to_thread(article_catalog.update_title, grant.page_url, title)
         except Exception as exc:
             logger.exception("Failed to save Telegraph page")
             await _send_response(writer, 400, _message_page(f"ذخیره ناموفق بود: {exc}"))

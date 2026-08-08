@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import requests
 
 import runtime_config
+import youtube_posts
 
 
 logger = logging.getLogger(__name__)
@@ -117,9 +118,11 @@ def _videos(video_ids: list[str], api_key: str) -> dict[str, dict]:
     data = _api_get(
         _VIDEOS_URL,
         params={
-            "part": "snippet,status,liveStreamingDetails",
+            "part": "snippet,status,contentDetails,player,liveStreamingDetails",
             "id": ",".join(video_ids),
             "key": api_key,
+            "maxWidth": 640,
+            "maxHeight": 640,
         },
     )
     return {
@@ -191,6 +194,15 @@ def find_new_videos(api_key: str | None) -> list[MonitoredVideo]:
             video = videos.get(video_id)
             if not video or not _is_publishable_video(video):
                 runtime_config.mark_youtube_video(video_id, channel["channel_id"], "skipped")
+            elif youtube_posts.is_ad_video(
+                (video.get("snippet") or {}).get("title", ""),
+                (video.get("snippet") or {}).get("description", ""),
+            ):
+                runtime_config.mark_youtube_video(video_id, channel["channel_id"], "skipped")
+                logger.info("Skipping YouTube ad video %s", video_id)
+            elif youtube_posts.is_short_video(video):
+                runtime_config.mark_youtube_video(video_id, channel["channel_id"], "skipped")
+                logger.info("Skipping YouTube Short %s", video_id)
             else:
                 candidates.append(MonitoredVideo(video_id, channel["channel_id"]))
     return candidates

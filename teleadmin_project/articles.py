@@ -574,17 +574,18 @@ def fetch_general_article(url: str) -> dict | None:
 
     source_html = response.text
     is_fff_article = _is_fff_article_url(response.url)
+    is_ffscout_article = _is_ffscout_article_url(response.url)
     if is_fff_article:
         source_html = _clean_fff_article_html(source_html)
-    elif _is_ffscout_article_url(response.url):
+    elif is_ffscout_article:
         source_html = _clean_ffscout_article_html(source_html)
     elif _is_allaboutfpl_article_url(response.url):
         source_html = _clean_allaboutfpl_article_html(source_html)
 
-    if is_fff_article:
-        # The FFFix cleaner already isolates the article body. Running that
-        # body through reader mode can flatten inline images to the end, so
-        # retain its cleaned DOM order directly.
+    if is_fff_article or is_ffscout_article:
+        # These site-specific cleaners already isolate the article body.
+        # Running the cleaned DOM through reader mode can flatten inline
+        # images to the end, so retain its original order directly.
         extracted = source_html
     else:
         extracted = trafilatura.extract(

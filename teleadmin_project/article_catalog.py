@@ -240,6 +240,23 @@ def update_metadata(
         )
 
 
+def update_title(url: str, title: str) -> None:
+    """Keep the local catalog title in sync after a Telegraph edit."""
+    path = _path_from_url(url)
+    if not path:
+        return
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE telegraph_articles SET title=?, updated_at=? WHERE path=?",
+            (
+                _plain_text(title),
+                datetime.now(timezone.utc).isoformat(),
+                path,
+            ),
+        )
+
+
 def first_image_url(html_content: str) -> str:
     match = re.search(
         r'<img\b[^>]*\bsrc=["\'](https?://[^"\']+)',

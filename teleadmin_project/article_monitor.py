@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 _POLL_SECONDS = 15 * 60
 _MAX_CANDIDATES_PER_SOURCE = 12
+_PL_NEWS_URL = "https://www.premierleague.com/en/news"
+_PL_CONTENT_API_BASE = "https://api.premierleague.com/content/premierleague/playlist/EN"
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -87,7 +90,18 @@ def _listing_candidates(
     listing_url: str,
     link_matcher,
 ) -> list[Candidate]:
-    soup = BeautifulSoup(_fetch(listing_url), "html.parser")
+    return _listing_candidates_from_html(
+        source_key, listing_url, _fetch(listing_url), link_matcher
+    )
+
+
+def _listing_candidates_from_html(
+    source_key: str,
+    listing_url: str,
+    html: str,
+    link_matcher,
+) -> list[Candidate]:
+    soup = BeautifulSoup(html, "html.parser")
     candidates = []
     seen: set[str] = set()
     for anchor in soup.find_all("a", href=True):
@@ -102,6 +116,74 @@ def _listing_candidates(
         if len(candidates) >= _MAX_CANDIDATES_PER_SOURCE:
             break
     return candidates
+
+
+def _premier_league_candidates() -> list[Candidate]:
+    """Read PL news cards from the public content API.
+
+    The PL news page now renders its article grid in JavaScript. The initial
+    HTML contains the grid configuration, but not the current article links.
+    Keep scraping the HTML as a fallback for older/site-degraded responses,
+    then use the playlist API that the page itself calls for the live cards.
+    """
+    page_html = _fetch(_PL_NEWS_URL)
+    html_candidates = _listing_candidates_from_html(
+        "premierleague", _PL_NEWS_URL, page_html, _is_premier_league_article
+    )
+
+    page = BeautifulSoup(page_html, "html.parser")
+    grid = page.select_one(
+        'div.content-grid[data-widget="content-list/content-grid-responsive"]'
+    )
+    playlist_id = str(grid.get("data-playlist-id", "")).strip() if grid else ""
+    if not playlist_id.isdigit():
+        logger.warning("Premier League news page did not expose a playlist ID")
+        return html_candidates
+
+    api_url = (
+        f"{_PL_CONTENT_API_BASE}/{playlist_id}"
+        f"?pageSize={_MAX_CANDIDATES_PER_SOURCE}&detail=DETAILED"
+    )
+    try:
+        payload = json.loads(_fetch(api_url))
+    except Exception:
+        logger.exception("Failed to read the Premier League news playlist API")
+        return html_candidates
+
+    candidates = []
+    seen: set[str] = set()
+    for item in payload.get("items", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("response")
+        if not isinstance(content, dict):
+            content = item
+        content_type = str(content.get("type") or item.get("type") or "").lower()
+        if content_type not in {"text", "article"}:
+            continue
+
+        content_id = content.get("id") or item.get("id")
+        if not str(content_id or "").isdigit():
+            continue
+        slug = str(content.get("titleUrlSegment") or "").strip(" /")
+        url = f"https://www.premierleague.com/en/news/{content_id}"
+        if slug:
+            url += f"/{slug}"
+        if url in seen or not _is_premier_league_article(url):
+            continue
+        seen.add(url)
+        published_at = content.get("date") or content.get("publishFrom") or ""
+        candidates.append(
+            Candidate(
+                "premierleague",
+                _plain_text(content.get("title", "")),
+                url,
+                str(published_at),
+            )
+        )
+        if len(candidates) >= _MAX_CANDIDATES_PER_SOURCE:
+            break
+    return (candidates or html_candidates)[:_MAX_CANDIDATES_PER_SOURCE]
 
 
 def _is_premier_league_article(url: str) -> bool:
@@ -124,9 +206,7 @@ def _is_fff_article(url: str) -> bool:
 def discover_candidates() -> list[Candidate]:
     """Fetch the latest candidates from all four supported sources."""
     sources = (
-        ("premierleague", lambda: _listing_candidates(
-            "premierleague", "https://www.premierleague.com/en/news", _is_premier_league_article
-        )),
+        ("premierleague", _premier_league_candidates),
         ("fantasyfootballfix", lambda: _listing_candidates(
             "fantasyfootballfix", "https://www.fantasyfootballfix.com/blog-index/", _is_fff_article
         )),
