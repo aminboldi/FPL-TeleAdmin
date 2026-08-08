@@ -22,6 +22,7 @@ _EDITOR_PATH = "/telegraph/edit/"
 _ADMIN_PATH = "/telegraph/admin"
 _ADMIN_LOGIN_PATH = "/telegraph/admin/login"
 _ADMIN_LOGOUT_PATH = "/telegraph/admin/logout"
+_ADMIN_HIDE_PATH = "/telegraph/admin/catalog-visibility"
 _LINK_LIFETIME_SECONDS = 15 * 60
 _OPEN_EDITOR_LIFETIME_SECONDS = 2 * 60 * 60
 _ADMIN_SESSION_LIFETIME_SECONDS = 12 * 60 * 60
@@ -197,7 +198,11 @@ def _page_shell(title: str, body: str) -> str:
     .admin-row {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid #e1e5e9; border-radius: 10px; padding: 12px; }}
     .admin-row h2 {{ margin: 0 0 4px; font-size: 16px; }}
     .admin-row .note {{ overflow-wrap: anywhere; margin: 0; }}
+    .admin-row.hidden {{ opacity: .68; }}
+    .admin-actions {{ display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; flex: 0 0 auto; }}
     .admin-edit {{ flex: 0 0 auto; background: #310b34; color: #fff; border-radius: 7px; padding: 9px 14px; text-decoration: none; font-weight: 700; }}
+    .admin-action {{ margin: 0; }}
+    .admin-hide {{ border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
     .logout {{ margin-top: 18px; border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
     a {{ color: #168acd; }}
   </style>
@@ -263,25 +268,38 @@ def _admin_login_page(error: str = "") -> str:
     return _page_shell("ورود به مدیریت مقالات", body)
 
 
-def _admin_index_page(pages: list[dict]) -> str:
+def _admin_index_page(pages: list[dict], hidden_paths: set[str] | None = None) -> str:
+    hidden_paths = hidden_paths or set()
     rows = []
     for page in pages:
         title = html.escape(str(page.get("title") or "بدون عنوان"))
         page_url = str(page.get("url") or "").strip()
         safe_page_url = html.escape(page_url, quote=True)
         editor_url = html.escape(create_edit_url(page_url), quote=True)
+        page_path = page_url.rstrip("/").rsplit("/", 1)[-1]
+        is_hidden = page_path in hidden_paths
+        hidden_class = " hidden" if is_hidden else ""
+        visibility_label = "نمایش در کاتالوگ" if is_hidden else "مخفی کردن از کاتالوگ"
+        visibility_value = "0" if is_hidden else "1"
         rows.append(
             f"""
-            <article class="admin-row">
+            <article class="admin-row{hidden_class}">
               <div><h2>{title}</h2><p class="note">{safe_page_url}</p></div>
-              <a class="admin-edit" href="{editor_url}" target="_blank" rel="noopener">ویرایش</a>
+              <div class="admin-actions">
+                <a class="admin-edit" href="{editor_url}" target="_blank" rel="noopener">ویرایش</a>
+                <form class="admin-action" method="post" action="{_ADMIN_HIDE_PATH}">
+                  <input type="hidden" name="url" value="{safe_page_url}">
+                  <input type="hidden" name="hidden" value="{visibility_value}">
+                  <button class="admin-hide" type="submit">{visibility_label}</button>
+                </form>
+              </div>
             </article>
             """
         )
     body = f"""
 <h1>مدیریت مقالات Telegraph</h1>
 <p class="note">برای تغییر عنوان یا متن، روی «ویرایش» بزنید. لینک ویرایش موقت است و پس از ذخیره منقضی می‌شود.</p>
-<p class="note">حذف کامل صفحه از Telegraph از طریق API رسمی این سرویس پشتیبانی نمی‌شود؛ این بخش فعلاً فقط ویرایش و تغییر عنوان را انجام می‌دهد.</p>
+<p class="note">دکمهٔ «مخفی کردن از کاتالوگ» فقط مقاله را از صفحهٔ اصلی این دامنه پنهان می‌کند؛ خود مقالهٔ Telegraph و لینک مستقیم آن باقی می‌ماند. هر زمان بخواهید می‌توانید آن را دوباره نمایش دهید.</p>
 <div class="admin-list">{"".join(rows) or '<p class="note">مقاله‌ای پیدا نشد.</p>'}</div>
 <form method="post" action="{_ADMIN_LOGOUT_PATH}"><button class="logout" type="submit">خروج</button></form>
 """
@@ -574,12 +592,48 @@ async def handle_http(reader, writer) -> None:
                 return
             try:
                 pages = await asyncio.to_thread(articles.get_recent_telegraph_pages, 100)
-                page = _admin_index_page(pages)
+                hidden_paths = await asyncio.to_thread(article_catalog.hidden_paths)
+                page = _admin_index_page(pages, hidden_paths)
             except Exception as exc:
                 logger.exception("Failed to load Telegraph admin pages")
                 await _send_response(writer, 500, _message_page(f"دریافت فهرست مقالات ناموفق بود: {exc}"))
                 return
             await _send_response(writer, 200, page)
+            return
+        if path == _ADMIN_HIDE_PATH:
+            if not _admin_password():
+                await _send_response(writer, 404, "Not found")
+                return
+            if method != "POST":
+                await _send_response(writer, 405, "Method not allowed")
+                return
+            if not _admin_authenticated(headers):
+                await _send_response(writer, 401, _admin_login_page("ابتدا وارد مدیریت شوید."))
+                return
+            if not headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
+                await _send_response(writer, 400, _message_page("فرمت درخواست نامعتبر است."))
+                return
+            fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=4)
+            page_url = fields.get("url", [""])[0].strip()
+            hidden = fields.get("hidden", ["1"])[0] == "1"
+            parsed_page_url = urlparse(page_url)
+            if (
+                parsed_page_url.scheme not in {"http", "https"}
+                or parsed_page_url.hostname not in {
+                    "telegra.ph", "www.telegra.ph", "graph.org", "www.graph.org",
+                }
+                or not parsed_page_url.path.strip("/")
+            ):
+                await _send_response(writer, 400, _message_page("آدرس مقالهٔ Telegraph نامعتبر است."))
+                return
+            changed = await asyncio.to_thread(article_catalog.set_hidden, page_url, hidden)
+            if not changed:
+                await _send_response(writer, 404, _message_page("این مقاله در کاتالوگ پیدا نشد."))
+                return
+            await _send_response(
+                writer, 303, "",
+                extra_headers=(f"Location: {_ADMIN_PATH}",),
+            )
             return
         if path == _ADMIN_LOGIN_PATH:
             if not _admin_password():

@@ -29,6 +29,7 @@ def init() -> None:
                 source_tag TEXT NOT NULL DEFAULT '',
                 source_url TEXT NOT NULL DEFAULT '',
                 image_url TEXT NOT NULL DEFAULT '',
+                hidden INTEGER NOT NULL DEFAULT 0,
                 published_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -50,6 +51,11 @@ def init() -> None:
             conn.execute(
                 "ALTER TABLE telegraph_articles ADD COLUMN "
                 "source_url TEXT NOT NULL DEFAULT ''"
+            )
+        if "hidden" not in columns:
+            conn.execute(
+                "ALTER TABLE telegraph_articles ADD COLUMN "
+                "hidden INTEGER NOT NULL DEFAULT 0"
             )
         migrated = conn.execute(
             "SELECT 1 FROM telegraph_catalog_meta WHERE key='summary_source_migrated'"
@@ -156,7 +162,8 @@ def list_source_tags() -> list[str]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT DISTINCT source_tag FROM telegraph_articles "
-            "WHERE source_tag <> '' ORDER BY source_tag COLLATE NOCASE"
+            "WHERE source_tag <> '' AND hidden=0 "
+            "ORDER BY source_tag COLLATE NOCASE"
         ).fetchall()
     return [str(row[0]) for row in rows]
 
@@ -176,7 +183,8 @@ def list_pages(
     if source_tag.strip():
         clauses.append("source_tag = ?")
         params.append(source_tag.strip())
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    clauses.insert(0, "hidden=0")
+    where = f"WHERE {' AND '.join(clauses)}"
     with _connect() as conn:
         rows = conn.execute(
             "SELECT path, url, title, summary, summary_source, source_tag, "
@@ -196,7 +204,8 @@ def pages_needing_enrichment(limit: int = 12) -> list[dict]:
             "SELECT path, url, title, summary, summary_source, source_tag, "
             "source_url, image_url "
             "FROM telegraph_articles "
-            "WHERE summary_source <> 'ai' OR summary='' OR image_url='' "
+            "WHERE hidden=0 AND "
+            "(summary_source <> 'ai' OR summary='' OR image_url='') "
             "ORDER BY published_at DESC LIMIT ?",
             (max(1, min(int(limit), 50)),),
         ).fetchall()
@@ -255,6 +264,34 @@ def update_title(url: str, title: str) -> None:
                 path,
             ),
         )
+
+
+def set_hidden(url: str, hidden: bool = True) -> bool:
+    """Hide or restore one indexed page in the public catalog."""
+    path = _path_from_url(url)
+    if not path:
+        return False
+    init()
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE telegraph_articles SET hidden=?, updated_at=? WHERE path=?",
+            (
+                1 if hidden else 0,
+                datetime.now(timezone.utc).isoformat(),
+                path,
+            ),
+        )
+    return cursor.rowcount > 0
+
+
+def hidden_paths() -> set[str]:
+    """Return paths hidden from the public catalog."""
+    init()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT path FROM telegraph_articles WHERE hidden=1"
+        ).fetchall()
+    return {str(row[0]) for row in rows}
 
 
 def first_image_url(html_content: str) -> str:
