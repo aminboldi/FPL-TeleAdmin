@@ -85,8 +85,7 @@ _TELEGRAPH_TAGS = {
 }
 _ARTICLE_CATALOGUE_URL = "https://epl-fantasy.ir"
 _ARTICLE_CATALOGUE_FOOTER = (
-    f'<p>آرشیو مقالات کانال<br>'
-    f'<a href="{_ARTICLE_CATALOGUE_URL}">{_ARTICLE_CATALOGUE_URL}</a></p>'
+    f'<p><a href="{_ARTICLE_CATALOGUE_URL}">آرشیو مقالات کانال</a></p>'
 )
 
 _telegraph: Telegraph | None = None

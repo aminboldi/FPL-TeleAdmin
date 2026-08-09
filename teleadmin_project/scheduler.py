@@ -14,6 +14,8 @@ _IRAN_OFFSET = timedelta(hours=3, minutes=30)
 _PRICE_POSTED_KEY = "price_prediction_posted"
 _EO_POSTED_KEY = "eo_posted"
 _PRICE_CHANGES_RESUME_DATE = date(2026, 8, 21)
+_DB_REFRESH_INTERVAL = 6 * 60 * 60
+_DB_REFRESH_RETRY_INTERVAL = 30 * 60
 
 
 def _now_iran() -> datetime:
@@ -23,9 +25,25 @@ def _now_iran() -> datetime:
 async def run_scheduler(client, target_channel: str, league_code: str, price_predictions_enabled: bool = True):
     logger.info("Scheduler started")
     await asyncio.sleep(5)
+    next_db_refresh = 0.0
 
     while True:
         try:
+            now_monotonic = asyncio.get_running_loop().time()
+            if now_monotonic >= next_db_refresh:
+                try:
+                    result = await asyncio.to_thread(db.refresh_from_fpl_api)
+                    logger.info(
+                        "FPL database refreshed: %d players, %d fixtures, %d new players",
+                        result["player_count"],
+                        result["fixture_count"],
+                        len(result["new_players"]),
+                    )
+                    next_db_refresh = now_monotonic + _DB_REFRESH_INTERVAL
+                except Exception as exc:
+                    logger.warning("FPL database refresh failed: %s", exc)
+                    next_db_refresh = now_monotonic + _DB_REFRESH_RETRY_INTERVAL
+
             now_iran = _now_iran()
             target_channel = runtime_config.get("TARGET_CHANNEL_ID") or target_channel
             price_predictions_enabled = runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED")

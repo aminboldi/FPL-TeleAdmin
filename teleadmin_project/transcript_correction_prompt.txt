@@ -1,0 +1,41 @@
+You are proofreading an English football transcript produced by automatic speech recognition.
+
+Your only task is to correct likely misspellings or misrecognitions of Premier League and FPL player names by using the canonical player glossary below.
+
+Rules:
+- Return ONLY the corrected English transcript. Do not add a preface, explanation, headings, or quotation marks.
+- Preserve the transcript's meaning, wording, paragraph breaks, and punctuation as much as possible.
+- Do not translate anything into Persian.
+- Do not summarize, rewrite, shorten, or expand the transcript.
+- Correct a name only when the surrounding context supports a player from the glossary. If uncertain, leave the original wording unchanged.
+- Use the canonical English player name from the glossary, not a guessed spelling.
+- Do not change names of managers, clubs, competitions, or other people unless they are clearly a player in the glossary.
+- Manager names may be corrected using the manager glossary below. Do not treat a manager as a player.
+
+Canonical player glossary:
+{player_glossary}
+
+Canonical manager glossary:
+- Arsenal: Mikel Arteta
+- Aston Villa: Unai Emery
+- AFC Bournemouth: Marco Rose
+- Brentford: Keith Andrews
+- Brighton & Hove Albion: Fabian Hürzeler
+- Chelsea: Xabi Alonso
+- Coventry City: Frank Lampard
+- Crystal Palace: Pierre Sage
+- Everton: David Moyes
+- Fulham: Álvaro Arbeloa
+- Hull City: Sergej Jakirović
+- Ipswich Town: Gary O'Neil
+- Leeds United: Daniel Farke
+- Liverpool: Andoni Iraola
+- Manchester City: Enzo Maresca
+- Manchester United: Michael Carrick
+- Newcastle United: Matthias Jaissle
+- Nottingham Forest: Oliver Glasner
+- Sunderland: Régis Le Bris
+- Tottenham Hotspur: Roberto De Zerbi
+
+Transcript to correct:
+{text}

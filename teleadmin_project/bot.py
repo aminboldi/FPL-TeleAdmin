@@ -1124,6 +1124,37 @@ async def _import_youtube_transcript(url: str) -> str:
     transcript = await asyncio.to_thread(
         youtube_posts.fetch_english_transcript, url, settings.x_rapidapi_key
     )
+    try:
+        player_rows = await asyncio.to_thread(
+            db.query,
+            """
+            SELECT p.first_name, p.second_name, p.web_name, p.alias,
+                   t.short_name AS team
+            FROM players AS p
+            JOIN teams AS t ON t.id = p.team_id
+            ORDER BY p.id
+            """,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not load player glossary for transcript correction: %s", exc
+        )
+        player_rows = []
+    player_glossary = []
+    for player in player_rows:
+        first_name = str(player.get("first_name") or "").strip()
+        second_name = str(player.get("second_name") or "").strip()
+        canonical = " ".join(part for part in (first_name, second_name) if part)
+        if canonical:
+            player_glossary.append(
+                {
+                    "canonical": canonical,
+                    "display": str(player.get("web_name") or "").strip(),
+                    "aliases": str(player.get("alias") or "").strip(),
+                    "team": str(player.get("team") or "").strip(),
+                }
+            )
+    transcript = await translator.correct_transcript(transcript, player_glossary)
     _refresh_translator_model()
     translated_title = youtube_posts.clean_video_title(
         _fix_unclosed_tags(

@@ -1,16 +1,21 @@
 from pathlib import Path
 import json
+import logging
 import re
 import html as html_lib
 
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
+logger = logging.getLogger(__name__)
+
 _prompt_path = Path(__file__).parent / "prompt.txt"
 TRANSLATION_PROMPT = _prompt_path.read_text(encoding="utf-8")
 
 _article_prompt_path = Path(__file__).parent / "article_prompt.txt"
 ARTICLE_PROMPT = _article_prompt_path.read_text(encoding="utf-8")
+_transcript_correction_prompt_path = Path(__file__).parent / "transcript_correction_prompt.txt"
+TRANSCRIPT_CORRECTION_PROMPT = _transcript_correction_prompt_path.read_text(encoding="utf-8")
 _summary_prompt_path = Path(__file__).parent / "summary_prompt.txt"
 SUMMARY_PROMPT = _summary_prompt_path.read_text(encoding="utf-8")
 _transcript_format_prompt_path = Path(__file__).parent / "transcript_format_prompt.txt"
@@ -117,6 +122,63 @@ class Translator:
                 raise TranslationError(
                     "Translation failed with both primary and fallback models"
                 )
+
+    async def correct_transcript(
+        self, text: str, player_glossary: list[dict[str, str]]
+    ) -> str:
+        """Normalize likely ASR player-name errors before translation.
+
+        Correction is best-effort: if either model cannot complete the pass,
+        the original transcript is returned so importing the video still works.
+        """
+        source = str(text or "").strip()
+        if not source or not player_glossary:
+            return source
+
+        glossary = self._format_player_glossary(player_glossary)
+        prompt = TRANSCRIPT_CORRECTION_PROMPT.format(
+            player_glossary=glossary,
+            text=source,
+        )
+        for client, model in (
+            (self.google_client, self.google_model),
+            (self.openrouter_client, self.fallback_model),
+        ):
+            if client is None:
+                continue
+            try:
+                corrected = await self._call_transcript_correction(
+                    client, model, prompt
+                )
+                if corrected:
+                    return corrected
+            except Exception as exc:
+                logger.warning(
+                    "Transcript player-name correction failed with %s: %s",
+                    model,
+                    exc,
+                )
+        return source
+
+    @staticmethod
+    def _format_player_glossary(players: list[dict[str, str]]) -> str:
+        lines = []
+        for player in players:
+            canonical = str(player.get("canonical") or "").strip()
+            if not canonical:
+                continue
+            display = str(player.get("display") or "").strip()
+            aliases = str(player.get("aliases") or "").strip()
+            team = str(player.get("team") or "").strip()
+            details = [f"canonical: {canonical}"]
+            if display and display.casefold() != canonical.casefold():
+                details.append(f"display: {display}")
+            if aliases:
+                details.append(f"aliases: {aliases}")
+            if team:
+                details.append(f"club: {team}")
+            lines.append("- " + " | ".join(details))
+        return "\n".join(lines)
 
     async def translate_article(self, text: str, *, transcript: bool = False) -> dict[str, str]:
         formatting_instructions = _TRANSCRIPT_FORMATTING_INSTRUCTIONS if transcript else ""
@@ -358,6 +420,22 @@ class Translator:
             max_tokens=4096,
         )
         return response.choices[0].message.content.strip()
+
+    async def _call_transcript_correction(
+        self, client: AsyncOpenAI, model: str, prompt: str,
+    ) -> str:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=16384,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        return raw.strip()
 
     async def _call_article_model(
         self, client: AsyncOpenAI, model: str, text: str, formatting_instructions: str = ""

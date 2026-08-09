@@ -1,5 +1,6 @@
 import json
 import logging
+import requests
 import sqlite3
 import unicodedata
 from pathlib import Path
@@ -10,6 +11,8 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "fpl.db"
+_FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
+_FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS gameweeks (
@@ -153,6 +156,53 @@ def import_fixtures(json_path: str) -> None:
     with _connect() as conn:
         _upsert_fixtures(conn, fixtures)
         _set_updated(conn, "fixtures")
+
+
+def refresh_from_fpl_api(timeout: int = 25) -> dict[str, Any]:
+    """Refresh official FPL data while preserving local manual enrichments."""
+    bootstrap_response = requests.get(_FPL_BOOTSTRAP_URL, timeout=timeout)
+    bootstrap_response.raise_for_status()
+    bootstrap = bootstrap_response.json()
+    if not isinstance(bootstrap, dict) or not isinstance(bootstrap.get("elements"), list):
+        raise ValueError("FPL bootstrap response has an unexpected shape")
+
+    fixtures_response = requests.get(_FPL_FIXTURES_URL, timeout=timeout)
+    fixtures_response.raise_for_status()
+    fixtures = fixtures_response.json()
+    if not isinstance(fixtures, list):
+        raise ValueError("FPL fixtures response has an unexpected shape")
+
+    incoming_players = bootstrap["elements"]
+    incoming_player_ids = {row.get("id") for row in incoming_players}
+    with _connect() as conn:
+        conn.executescript(SCHEMA)
+        existing_ids = {
+            row[0] for row in conn.execute("SELECT id FROM players").fetchall()
+        }
+        _upsert_gameweeks(conn, bootstrap.get("events", []))
+        _upsert_teams(conn, bootstrap.get("teams", []))
+        _upsert_positions(conn, bootstrap.get("element_types", []))
+        _upsert_players(conn, incoming_players)
+        _upsert_fixtures(conn, fixtures)
+        _set_updated(conn, "bootstrap")
+        _set_updated(conn, "fixtures")
+        _set_updated(conn, "database_refresh")
+
+    new_players = [
+        {
+            "id": row.get("id"),
+            "first_name": row.get("first_name", ""),
+            "second_name": row.get("second_name", ""),
+            "web_name": row.get("web_name", ""),
+        }
+        for row in incoming_players
+        if row.get("id") not in existing_ids
+    ]
+    return {
+        "player_count": len(incoming_player_ids),
+        "new_players": new_players,
+        "fixture_count": len(fixtures),
+    }
 
 
 def _upsert_gameweeks(conn: sqlite3.Connection, rows: list[dict]) -> None:
