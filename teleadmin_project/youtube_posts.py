@@ -21,7 +21,7 @@ _TRANSCRIPT_URL = f"https://{_RAPID_HOST}/api/transcript-with-url"
 _YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 _THUMBNAIL_PREFERENCE = ("maxres", "standard", "high", "medium", "default")
 _HASHTAG_RE = re.compile(r"(?<!\w)#[\w-]+", re.UNICODE)
-_AD_HASHTAG_RE = re.compile(r"(?<!\w)#ad(?!\w)", re.IGNORECASE)
+_AD_TITLE_RE = re.compile(r"(?<!\w)#ad(?!\w)|(?<!\w)ad(?!\w)", re.IGNORECASE)
 _SHORTS_HASHTAG_RE = re.compile(r"(?<!\w)#shorts(?!\w)", re.IGNORECASE)
 _ISO_DURATION_RE = re.compile(
     r"^PT(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?$"
@@ -85,12 +85,9 @@ def is_short_video(video: dict, *, source_url: str = "") -> bool:
     return aspect_ratio in {"RATIO_1_1", "RATIO_9_16", "1:1", "9:16"}
 
 
-def is_ad_video(title: str, description: str) -> bool:
-    """Return whether either public YouTube field contains the #ad hashtag."""
-    return bool(
-        _AD_HASHTAG_RE.search(str(title or ""))
-        or _AD_HASHTAG_RE.search(str(description or ""))
-    )
+def is_ad_title(title: str) -> bool:
+    """Return whether a video title contains a standalone ad marker."""
+    return bool(_AD_TITLE_RE.search(str(title or "")))
 
 
 def clean_video_title(title: str) -> str:
@@ -208,8 +205,8 @@ def fetch_video_metadata(url: str, youtube_api_key: str | None) -> VideoMetadata
     raw_title = str(snippet.get("title") or "").strip()
     channel_title = str(snippet.get("channelTitle") or "").strip()
     description = str(snippet.get("description") or "").strip()
-    if is_ad_video(raw_title, description):
-        raise YouTubeImportError("این ویدیو به‌دلیل وجود هشتگ #ad منتشر نمی‌شود.")
+    if is_ad_title(raw_title):
+        raise YouTubeImportError("این ویدیو به‌دلیل وجود نشانگر تبلیغ در عنوان منتشر نمی‌شود.")
     title = clean_video_title(raw_title)
     thumbnails = snippet.get("thumbnails") or {}
     thumbnail_url = next(

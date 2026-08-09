@@ -194,10 +194,7 @@ def find_new_videos(api_key: str | None) -> list[MonitoredVideo]:
             video = videos.get(video_id)
             if not video or not _is_publishable_video(video):
                 runtime_config.mark_youtube_video(video_id, channel["channel_id"], "skipped")
-            elif youtube_posts.is_ad_video(
-                (video.get("snippet") or {}).get("title", ""),
-                (video.get("snippet") or {}).get("description", ""),
-            ):
+            elif youtube_posts.is_ad_title((video.get("snippet") or {}).get("title", "")):
                 runtime_config.mark_youtube_video(video_id, channel["channel_id"], "skipped")
                 logger.info("Skipping YouTube ad video %s", video_id)
             elif youtube_posts.is_short_video(video):

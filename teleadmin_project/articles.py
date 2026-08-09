@@ -83,6 +83,11 @@ _TELEGRAPH_TAGS = {
     "h3", "h4", "hr", "i", "img", "li", "ol", "p", "pre", "s",
     "strong", "u", "ul",
 }
+_ARTICLE_CATALOGUE_URL = "https://epl-fantasy.ir"
+_ARTICLE_CATALOGUE_FOOTER = (
+    f'<p>آرشیو مقالات کانال<br>'
+    f'<a href="{_ARTICLE_CATALOGUE_URL}">{_ARTICLE_CATALOGUE_URL}</a></p>'
+)
 
 _telegraph: Telegraph | None = None
 
@@ -993,6 +998,9 @@ def publish_to_telegraph(
 ) -> str | None:
     try:
         tg = _get_telegraph()
+        html_content = (
+            f"{html_content.rstrip()}\n\n{_ARTICLE_CATALOGUE_FOOTER}"
+        )
         page = tg.create_page(title=title, html_content=html_content)
         url = page.get("url", "")
         logger.info("Telegraph page created: %s", url)
