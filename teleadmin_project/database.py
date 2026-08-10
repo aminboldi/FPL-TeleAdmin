@@ -406,7 +406,8 @@ def list_players_for_edit() -> list[dict]:
         SELECT id, first_name, second_name, web_name,
                first_name_fa, second_name_fa, web_name_fa
         FROM players
-        ORDER BY second_name COLLATE NOCASE,
+        ORDER BY web_name COLLATE NOCASE,
+                 second_name COLLATE NOCASE,
                  first_name COLLATE NOCASE,
                  id
         """

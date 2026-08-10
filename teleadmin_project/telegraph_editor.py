@@ -190,7 +190,8 @@ def _clean_editor_html(value: str) -> str:
     return cleaned
 
 
-def _page_shell(title: str, body: str) -> str:
+def _page_shell(title: str, body: str, *, page_class: str = "") -> str:
+    main_class = f' class="{html.escape(page_class, quote=True)}"' if page_class else ""
     return f"""<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -225,9 +226,10 @@ def _page_shell(title: str, body: str) -> str:
     .admin-action {{ margin: 0; }}
     .admin-hide {{ border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
     .logout {{ margin-top: 18px; border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
+    .players-page {{ max-width: 1400px; }}
     .search {{ margin: 14px 0; }}
     .table-wrap {{ overflow-x: auto; border: 1px solid #e1e5e9; border-radius: 10px; }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 900px; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 0; }}
     th, td {{ border-bottom: 1px solid #e1e5e9; padding: 8px; text-align: right; vertical-align: middle; }}
     th {{ background: #f4f5f7; white-space: nowrap; font-size: 13px; }}
     tr:last-child td {{ border-bottom: 0; }}
@@ -236,7 +238,7 @@ def _page_shell(title: str, body: str) -> str:
     a {{ color: #168acd; }}
   </style>
 </head>
-<body><main><div class="card">{body}</div></main></body>
+<body><main{main_class}><div class="card">{body}</div></main></body>
 </html>"""
 
 
@@ -318,12 +320,12 @@ def _players_page(players: list[dict], message: str = "") -> str:
         rows.append(
             f"""
             <tr>
-              <td class="english" dir="ltr"><input type="hidden" name="player_id" value="{player_id}">{value('first_name')}</td>
-              <td class="english" dir="ltr">{value('second_name')}</td>
-              <td class="english" dir="ltr">{value('web_name')}</td>
-              <td><input name="first_name_fa" value="{value('first_name_fa')}" autocomplete="off"></td>
-              <td><input name="second_name_fa" value="{value('second_name_fa')}" autocomplete="off"></td>
               <td><input name="web_name_fa" value="{value('web_name_fa')}" autocomplete="off"></td>
+              <td><input name="second_name_fa" value="{value('second_name_fa')}" autocomplete="off"></td>
+              <td><input name="first_name_fa" value="{value('first_name_fa')}" autocomplete="off"><input type="hidden" name="player_id" value="{player_id}"></td>
+              <td class="english" dir="ltr">{value('web_name')}</td>
+              <td class="english" dir="ltr">{value('second_name')}</td>
+              <td class="english" dir="ltr">{value('first_name')}</td>
             </tr>
             """
         )
@@ -337,8 +339,8 @@ def _players_page(players: list[dict], message: str = "") -> str:
   <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>نام انگلیسی</th><th>نام خانوادگی انگلیسی</th><th>نام نمایشی انگلیسی</th>
-        <th>نام فارسی</th><th>نام خانوادگی فارسی</th><th>نام نمایشی فارسی</th>
+        <th>نام نمایشی فارسی</th><th>نام خانوادگی فارسی</th><th>نام فارسی</th>
+        <th>نام نمایشی انگلیسی</th><th>نام خانوادگی انگلیسی</th><th>نام انگلیسی</th>
       </tr></thead>
       <tbody id="player-rows">{"".join(rows) or '<tr><td colspan="6">بازیکنی پیدا نشد.</td></tr>'}</tbody>
     </table>
@@ -356,7 +358,7 @@ search.addEventListener('input', () => {{
 }});
 </script>
 """
-    return _page_shell("ویرایش نام بازیکنان", body)
+    return _page_shell("ویرایش نام بازیکنان", body, page_class="players-page")
 
 
 def _admin_index_page(pages: list[dict], hidden_paths: set[str] | None = None) -> str:
