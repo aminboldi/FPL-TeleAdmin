@@ -70,6 +70,44 @@ def _translate_team_abbreviations(text: str) -> str:
     return "".join(parts)
 
 
+def _translate_player_names(
+    text: str, player_glossary: list[dict[str, str]] | None,
+) -> str:
+    """Replace known English player names in visible text with Persian names."""
+    if not text or not player_glossary:
+        return text
+
+    replacements: dict[str, str] = {}
+    for player in player_glossary:
+        for source_key, target_key in (
+            ("canonical", "canonical_fa"),
+            ("display", "display_fa"),
+        ):
+            source = str(player.get(source_key) or "").strip()
+            target = str(player.get(target_key) or "").strip()
+            if source and target and source.casefold() != target.casefold():
+                replacements[source] = target
+    if not replacements:
+        return text
+
+    # Prefer full names before surnames and replace only visible text, never
+    # HTML tags or attributes such as image and hyperlink URLs.
+    patterns = [
+        (
+            re.compile(rf"(?<![\w]){re.escape(source)}(?![\w])", re.IGNORECASE),
+            target,
+        )
+        for source, target in sorted(
+            replacements.items(), key=lambda item: len(item[0]), reverse=True
+        )
+    ]
+    parts = re.split(r"(<[^>]*>)", text)
+    for index in range(0, len(parts), 2):
+        for pattern, target in patterns:
+            parts[index] = pattern.sub(target, parts[index])
+    return "".join(parts)
+
+
 class TranslationError(Exception):
     pass
 
@@ -104,20 +142,28 @@ class Translator:
         )
         self.google_model = google_model
 
-    async def translate(self, text: str) -> str:
+    async def translate(
+        self, text: str, *, player_glossary: list[dict[str, str]] | None = None,
+    ) -> str:
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
-            return _translate_team_abbreviations(_normalize_digits(
-                await self._call_model(self.google_client, self.google_model, text)
-            ))
+            translated = await self._call_model(
+                self.google_client, self.google_model, text
+            )
+            return _translate_player_names(
+                _translate_team_abbreviations(_normalize_digits(translated)),
+                player_glossary,
+            )
         except Exception:
             try:
-                return _translate_team_abbreviations(_normalize_digits(
-                    await self._call_model(
-                        self.openrouter_client, self.fallback_model, text
-                    )
-                ))
+                translated = await self._call_model(
+                    self.openrouter_client, self.fallback_model, text
+                )
+                return _translate_player_names(
+                    _translate_team_abbreviations(_normalize_digits(translated)),
+                    player_glossary,
+                )
             except Exception:
                 raise TranslationError(
                     "Translation failed with both primary and fallback models"
@@ -180,7 +226,20 @@ class Translator:
             lines.append("- " + " | ".join(details))
         return "\n".join(lines)
 
-    async def translate_article(self, text: str, *, transcript: bool = False) -> dict[str, str]:
+    async def translate_article(
+        self,
+        text: str,
+        *,
+        transcript: bool = False,
+        player_glossary: list[dict[str, str]] | None = None,
+    ) -> dict[str, str]:
+        def finish(article: dict[str, str]) -> dict[str, str]:
+            return {
+                key: _translate_player_names(value, player_glossary)
+                if isinstance(value, str) else value
+                for key, value in article.items()
+            }
+
         formatting_instructions = _TRANSCRIPT_FORMATTING_INSTRUCTIONS if transcript else ""
         try:
             if not self.google_client:
@@ -196,7 +255,7 @@ class Translator:
                 await self.summarize_article(article.get("body", ""))
                 or article.get("summary", "")
             )
-            return article
+            return finish(article)
         except Exception:
             try:
                 article = self._normalize_article(
@@ -210,7 +269,7 @@ class Translator:
                     await self.summarize_article(article.get("body", ""))
                     or article.get("summary", "")
                 )
-                return article
+                return finish(article)
             except Exception:
                 pass
         # Fallback: translate normally. Summary generation is deliberately
@@ -223,7 +282,7 @@ class Translator:
         lines = body.split("\n")
         title = lines[0].strip()[:100] if lines else ""
         summary = await self.summarize_article(body)
-        return {"title": title, "summary": summary, "body": body}
+        return finish({"title": title, "summary": summary, "body": body})
 
     async def summarize_article(self, translated_html: str) -> str:
         """Create a concise Telegram preview from the complete translated article."""

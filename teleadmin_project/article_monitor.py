@@ -14,6 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import runtime_config
+import articles
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +195,7 @@ def _is_premier_league_article(url: str) -> bool:
     return (
         parsed.hostname in {"premierleague.com", "www.premierleague.com"}
         and re.match(r"^/(?:en/)?news/\d+", parsed.path) is not None
+        and not articles.is_excluded_premier_league_article(url)
     )
 
 

@@ -22,6 +22,7 @@ _HEADERS = {
 _PL_URL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?premierleague\.com/(?:en/)?news/\d+[^\s]*"
 )
+_PL_WHO_AM_I_PATH_RE = re.compile(r"(?:^|/)who-am-i(?:[-/]|$)", re.IGNORECASE)
 
 _SHORT_URL_RE = re.compile(
     r"(?:https?://)?preml\.ge/\S+"
@@ -196,6 +197,15 @@ def is_pl_article_url(text: str, entities: list | None = None) -> bool:
             ):
                 return True
     return False
+
+
+def is_excluded_premier_league_article(url: str) -> bool:
+    """Return whether a Premier League URL is outside the FPL feed scope."""
+    parsed = urlparse(url)
+    return (
+        parsed.hostname in {"premierleague.com", "www.premierleague.com"}
+        and _PL_WHO_AM_I_PATH_RE.search(unquote(parsed.path)) is not None
+    )
 
 def resolve_url(text: str, entities: list | None = None) -> str | None:
     for m in _SHORT_URL_RE.finditer(text or ""):
@@ -438,19 +448,26 @@ def _clean_fff_article_html(source_html: str) -> str:
         for item in children[end_index:]:
             item.extract()
     else:
-        # The first divider whose remainder contains the offer copy is the
-        # end of the actual article. Remove that divider and all following
-        # siblings.
-        for index, child in enumerate(children):
-            if child.name != "hr":
-                continue
-            remainder = " ".join(
-                _fff_normalized_text(item) for item in children[index + 1:]
-            )
-            if _FFFIX_END_MARKER in remainder:
-                for item in children[index:]:
-                    item.extract()
-                break
+        # Locate the offer itself, then remove the nearest preceding divider
+        # and everything after it. Checking the whole remainder from each
+        # divider is incorrect: the first article divider also has the offer
+        # somewhere later in its remainder and would truncate the article
+        # after its introduction.
+        offer_index = next(
+            (
+                index for index, child in enumerate(children)
+                if _FFFIX_END_MARKER in _fff_normalized_text(child)
+            ),
+            None,
+        )
+        if offer_index is not None:
+            cut_index = offer_index
+            for index in range(offer_index - 1, -1, -1):
+                if children[index].name == "hr":
+                    cut_index = index
+                    break
+            for item in children[cut_index:]:
+                item.extract()
 
     # Keep the extractor focused on the article body even if the page adds
     # related cards or a site-wide offer inside the outer article wrapper.
@@ -579,14 +596,15 @@ def fetch_general_article(url: str) -> dict | None:
     source_html = response.text
     is_fff_article = _is_fff_article_url(response.url)
     is_ffscout_article = _is_ffscout_article_url(response.url)
+    is_allaboutfpl_article = _is_allaboutfpl_article_url(response.url)
     if is_fff_article:
         source_html = _clean_fff_article_html(source_html)
     elif is_ffscout_article:
         source_html = _clean_ffscout_article_html(source_html)
-    elif _is_allaboutfpl_article_url(response.url):
+    elif is_allaboutfpl_article:
         source_html = _clean_allaboutfpl_article_html(source_html)
 
-    if is_fff_article or is_ffscout_article:
+    if is_fff_article or is_ffscout_article or is_allaboutfpl_article:
         # These site-specific cleaners already isolate the article body.
         # Running the cleaned DOM through reader mode can flatten inline
         # images to the end, so retain its original order directly.
@@ -647,6 +665,9 @@ def fetch_general_article(url: str) -> dict | None:
 
 def fetch_article(url: str) -> dict | None:
     """Use the site-specific extractor when available, reader mode otherwise."""
+    if is_excluded_premier_league_article(url):
+        logger.info("Skipping excluded Premier League article %s", url)
+        return None
     if is_pl_article_url(url):
         return _fetch_pl_article(url)
     return fetch_general_article(url)

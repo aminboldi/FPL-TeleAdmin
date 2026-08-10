@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import requests
+import shutil
 import sqlite3
 import unicodedata
 from pathlib import Path
@@ -10,7 +12,16 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent / "fpl.db"
+_DEFAULT_DB_PATH = Path(__file__).parent / "fpl.db"
+_RUNTIME_CONFIG_PATH = os.getenv("RUNTIME_CONFIG_PATH")
+DB_PATH = Path(
+    os.getenv("FPL_DATABASE_PATH")
+    or (
+        Path(_RUNTIME_CONFIG_PATH).parent / "fpl.db"
+        if _RUNTIME_CONFIG_PATH
+        else _DEFAULT_DB_PATH
+    )
+)
 _FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 _FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 
@@ -125,6 +136,10 @@ CREATE INDEX IF NOT EXISTS idx_fixtures_teams ON fixtures(team_h, team_a);
 
 
 def _connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if DB_PATH != _DEFAULT_DB_PATH and not DB_PATH.exists() and _DEFAULT_DB_PATH.exists():
+        shutil.copy2(_DEFAULT_DB_PATH, DB_PATH)
+        logger.info("Initialized persistent FPL database from bundled database at %s", DB_PATH)
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -382,6 +397,58 @@ def query_scalar(sql: str, params: tuple = ()) -> Any:
     with _connect() as conn:
         row = conn.execute(sql, params).fetchone()
         return row[0] if row else None
+
+
+def list_players_for_edit() -> list[dict]:
+    """Return the player name fields used by the protected web editor."""
+    return query(
+        """
+        SELECT id, first_name, second_name, web_name,
+               first_name_fa, second_name_fa, web_name_fa
+        FROM players
+        ORDER BY second_name COLLATE NOCASE,
+                 first_name COLLATE NOCASE,
+                 id
+        """
+    )
+
+
+def update_player_farsi_names(
+    updates: list[tuple[int, str | None, str | None, str | None]],
+) -> int:
+    """Update only Persian player-name fields in one transaction."""
+    if not updates:
+        return 0
+
+    normalized = []
+    seen_ids = set()
+    for player_id, first_name_fa, second_name_fa, web_name_fa in updates:
+        player_id = int(player_id)
+        if player_id in seen_ids:
+            raise ValueError("duplicate player id")
+        seen_ids.add(player_id)
+
+        def clean(value):
+            value = str(value or "").strip()
+            return value or None
+
+        normalized.append(
+            (clean(first_name_fa), clean(second_name_fa), clean(web_name_fa), player_id)
+        )
+
+    with _connect() as conn:
+        for values in normalized:
+            result = conn.execute(
+                """
+                UPDATE players
+                SET first_name_fa = ?, second_name_fa = ?, web_name_fa = ?
+                WHERE id = ?
+                """,
+                values,
+            )
+            if result.rowcount != 1:
+                raise ValueError(f"unknown player id: {values[-1]}")
+    return len(normalized)
 
 
 def get_db_path() -> Path:

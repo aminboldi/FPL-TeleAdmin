@@ -1128,7 +1128,9 @@ async def _import_youtube_transcript(url: str) -> str:
         player_rows = await asyncio.to_thread(
             db.query,
             """
-            SELECT p.first_name, p.second_name, p.web_name, p.alias,
+            SELECT p.first_name, p.second_name, p.web_name,
+                   p.first_name_fa, p.second_name_fa, p.web_name_fa,
+                   p.alias,
                    t.short_name AS team
             FROM players AS p
             JOIN teams AS t ON t.id = p.team_id
@@ -1145,11 +1147,18 @@ async def _import_youtube_transcript(url: str) -> str:
         first_name = str(player.get("first_name") or "").strip()
         second_name = str(player.get("second_name") or "").strip()
         canonical = " ".join(part for part in (first_name, second_name) if part)
+        first_name_fa = str(player.get("first_name_fa") or "").strip()
+        second_name_fa = str(player.get("second_name_fa") or "").strip()
+        canonical_fa = " ".join(
+            part for part in (first_name_fa, second_name_fa) if part
+        )
         if canonical:
             player_glossary.append(
                 {
                     "canonical": canonical,
                     "display": str(player.get("web_name") or "").strip(),
+                    "canonical_fa": canonical_fa,
+                    "display_fa": str(player.get("web_name_fa") or "").strip(),
                     "aliases": str(player.get("alias") or "").strip(),
                     "team": str(player.get("team") or "").strip(),
                 }
@@ -1158,12 +1167,19 @@ async def _import_youtube_transcript(url: str) -> str:
     _refresh_translator_model()
     translated_title = youtube_posts.clean_video_title(
         _fix_unclosed_tags(
-            _strip_quotes(await translator.translate(_escape_html(metadata.title)))
+            _strip_quotes(
+                await translator.translate(
+                    _escape_html(metadata.title),
+                    player_glossary=player_glossary,
+                )
+            )
         )
     )
     if len(transcript) <= _YOUTUBE_INLINE_TRANSCRIPT_LIMIT:
         article = await translator.translate_article(
-            _escape_html(transcript), transcript=True
+            _escape_html(transcript),
+            transcript=True,
+            player_glossary=player_glossary,
         )
         translated_transcript = _telegraph_to_telegram_html(
             _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
@@ -1197,7 +1213,11 @@ async def _import_youtube_transcript(url: str) -> str:
                 f"✅ متن فارسی کوتاه برای بررسی، {QUEUED_POST_CONFIRMATION}"
             )
 
-    article = await translator.translate_article(_escape_html(transcript), transcript=True)
+    article = await translator.translate_article(
+        _escape_html(transcript),
+        transcript=True,
+        player_glossary=player_glossary,
+    )
     article_title = _article_title(
         translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
     )

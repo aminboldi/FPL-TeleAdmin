@@ -15,6 +15,7 @@ from telegraph.utils import ALLOWED_TAGS, html_to_nodes
 
 import articles
 import article_catalog
+import database
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +24,17 @@ _ADMIN_PATH = "/telegraph/admin"
 _ADMIN_LOGIN_PATH = "/telegraph/admin/login"
 _ADMIN_LOGOUT_PATH = "/telegraph/admin/logout"
 _ADMIN_HIDE_PATH = "/telegraph/admin/catalog-visibility"
+_PLAYERS_PATH = "/players"
+_PLAYERS_LOGIN_PATH = "/players/login"
 _LINK_LIFETIME_SECONDS = 15 * 60
 _OPEN_EDITOR_LIFETIME_SECONDS = 2 * 60 * 60
 _ADMIN_SESSION_LIFETIME_SECONDS = 12 * 60 * 60
 _MAX_REQUEST_BYTES = 256 * 1024
 _CATALOG_PAGE_SIZE = 24
+_EDITOR_BLOCK_TAGS = {
+    "address", "article", "blockquote", "div", "figure", "h1", "h2",
+    "h3", "h4", "h5", "h6", "hr", "ol", "p", "pre", "section", "ul",
+}
 _STATIC_ASSETS = {
     "/logo.webp": (Path(__file__).resolve().parent.parent / "logo.webp", "image/webp"),
     "/fav-icon.png": (Path(__file__).resolve().parent.parent / "fav-icon.png", "image/png"),
@@ -112,7 +119,7 @@ def _admin_authenticated(headers: dict[str, str]) -> bool:
 def _admin_cookie(token: str, *, max_age: int) -> str:
     secure = "; Secure" if _public_base_url().startswith("https://") else ""
     return (
-        f"telegraph_admin={token}; Path=/telegraph/admin; Max-Age={max_age}; "
+        f"telegraph_admin={token}; Path=/; Max-Age={max_age}; "
         f"HttpOnly; SameSite=Strict{secure}"
     )
 
@@ -131,6 +138,20 @@ def _grant_for(token: str, *, open_editor: bool = False) -> _EditGrant | None:
 def _clean_editor_html(value: str) -> str:
     """Normalize contenteditable output to tags accepted by Telegraph."""
     soup = BeautifulSoup(value, "html.parser")
+
+    # Some contenteditable/browser combinations can serialize a heading edit
+    # as ``<h3>Heading<p>Following paragraph</p></h3>`` even though the
+    # editor renders the paragraph separately. Move direct block children out
+    # of headings before sending the HTML to Telegraph.
+    for heading in list(soup.find_all(("h1", "h2", "h3", "h4", "h5", "h6"))):
+        anchor = heading
+        for child in list(heading.find_all(recursive=False)):
+            if child.name not in _EDITOR_BLOCK_TAGS:
+                continue
+            child.extract()
+            anchor.insert_after(child)
+            anchor = child
+
     for tag in list(soup.find_all(True)):
         name = tag.name.lower()
         if name in {"script", "style", "form", "input", "button"}:
@@ -204,6 +225,14 @@ def _page_shell(title: str, body: str) -> str:
     .admin-action {{ margin: 0; }}
     .admin-hide {{ border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
     .logout {{ margin-top: 18px; border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
+    .search {{ margin: 14px 0; }}
+    .table-wrap {{ overflow-x: auto; border: 1px solid #e1e5e9; border-radius: 10px; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 900px; }}
+    th, td {{ border-bottom: 1px solid #e1e5e9; padding: 8px; text-align: right; vertical-align: middle; }}
+    th {{ background: #f4f5f7; white-space: nowrap; font-size: 13px; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    td.english {{ direction: ltr; text-align: left; white-space: nowrap; color: #59636e; }}
+    td input {{ width: 150px; box-sizing: border-box; padding: 8px; border: 1px solid #ccd0d5; border-radius: 7px; font: inherit; }}
     a {{ color: #168acd; }}
   </style>
 </head>
@@ -247,6 +276,15 @@ document.getElementById('link-button').addEventListener('mousedown', e => {{
   if (url) document.execCommand('createLink', false, url);
 }});
 document.getElementById('edit-form').addEventListener('submit', e => {{
+  const blockTags = new Set(['address', 'article', 'blockquote', 'div', 'figure', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'ol', 'p', 'pre', 'section', 'ul']);
+  editor.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(heading => {{
+    let anchor = heading;
+    Array.from(heading.children).forEach(child => {{
+      if (!blockTags.has(child.tagName.toLowerCase())) return;
+      anchor.parentNode.insertBefore(child, anchor.nextSibling);
+      anchor = child;
+    }});
+  }});
   document.getElementById('content').value = editor.innerHTML;
   if (!confirm('تغییرات در مقالهٔ فعلی ذخیره شود؟')) e.preventDefault();
 }});
@@ -254,18 +292,71 @@ document.getElementById('edit-form').addEventListener('submit', e => {{
     return _page_shell("ویرایش مقاله", body)
 
 
-def _admin_login_page(error: str = "") -> str:
+def _admin_login_page(error: str = "", *, action: str = _ADMIN_LOGIN_PATH) -> str:
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    title = "ورود به ویرایش نام بازیکنان" if action == _PLAYERS_LOGIN_PATH else "مدیریت مقالات Telegraph"
     body = f"""
-<h1>مدیریت مقالات Telegraph</h1>
+<h1>{title}</h1>
 {error_html}
-<form method="post" action="{_ADMIN_LOGIN_PATH}">
+<form method="post" action="{html.escape(action, quote=True)}">
   <label for="password">رمز عبور</label>
   <input id="password" name="password" type="password" autocomplete="current-password" required>
   <button class="save" type="submit">ورود</button>
 </form>
 """
-    return _page_shell("ورود به مدیریت مقالات", body)
+    return _page_shell(title, body)
+
+
+def _players_page(players: list[dict], message: str = "") -> str:
+    rows = []
+    for player in players:
+        player_id = int(player["id"])
+
+        def value(field: str) -> str:
+            return html.escape(str(player.get(field) or ""), quote=True)
+
+        rows.append(
+            f"""
+            <tr>
+              <td class="english" dir="ltr"><input type="hidden" name="player_id" value="{player_id}">{value('first_name')}</td>
+              <td class="english" dir="ltr">{value('second_name')}</td>
+              <td class="english" dir="ltr">{value('web_name')}</td>
+              <td><input name="first_name_fa" value="{value('first_name_fa')}" autocomplete="off"></td>
+              <td><input name="second_name_fa" value="{value('second_name_fa')}" autocomplete="off"></td>
+              <td><input name="web_name_fa" value="{value('web_name_fa')}" autocomplete="off"></td>
+            </tr>
+            """
+        )
+    message_html = f'<p class="success">{html.escape(message)}</p>' if message else ""
+    body = f"""
+<h1>ویرایش نام بازیکنان</h1>
+<p class="note">نام‌های انگلیسی فقط برای مرجع نمایش داده می‌شوند. تغییرات مستقیماً در پایگاه‌دادهٔ تولیدی ذخیره می‌شوند و پس از استقرار مجدد نیز باقی می‌مانند.</p>
+{message_html}
+<input id="player-search" class="search" type="search" placeholder="جست‌وجوی بازیکن" autocomplete="off">
+<form method="post" action="{_PLAYERS_PATH}" id="players-form">
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>نام انگلیسی</th><th>نام خانوادگی انگلیسی</th><th>نام نمایشی انگلیسی</th>
+        <th>نام فارسی</th><th>نام خانوادگی فارسی</th><th>نام نمایشی فارسی</th>
+      </tr></thead>
+      <tbody id="player-rows">{"".join(rows) or '<tr><td colspan="6">بازیکنی پیدا نشد.</td></tr>'}</tbody>
+    </table>
+  </div>
+  <button class="save" type="submit">ذخیرهٔ تغییرات</button>
+</form>
+<form method="post" action="{_ADMIN_LOGOUT_PATH}"><button class="logout" type="submit">خروج</button></form>
+<script>
+const search = document.getElementById('player-search');
+search.addEventListener('input', () => {{
+  const term = search.value.trim().toLowerCase();
+  document.querySelectorAll('#player-rows tr').forEach(row => {{
+    row.hidden = term && !row.innerText.toLowerCase().includes(term);
+  }});
+}});
+</script>
+"""
+    return _page_shell("ویرایش نام بازیکنان", body)
 
 
 def _admin_index_page(pages: list[dict], hidden_paths: set[str] | None = None) -> str:
@@ -577,6 +668,81 @@ async def handle_http(reader, writer) -> None:
         if path in {"/health", "/healthz"} and method in {"GET", "HEAD"}:
             await _send_response(writer, 200, "OK", head=method == "HEAD")
             return
+        if path in {_PLAYERS_PATH, _PLAYERS_PATH + "/"}:
+            if not _admin_password():
+                await _send_response(
+                    writer, 404,
+                    _message_page("ویرایش بازیکنان فعال نیست؛ TELEGRAPH_EDITOR_PASSWORD را تنظیم کنید."),
+                    head=method == "HEAD",
+                )
+                return
+            if method in {"GET", "HEAD"}:
+                if not _admin_authenticated(headers):
+                    await _send_response(
+                        writer, 200,
+                        _admin_login_page(action=_PLAYERS_LOGIN_PATH),
+                        head=method == "HEAD",
+                    )
+                    return
+                try:
+                    players = await asyncio.to_thread(database.list_players_for_edit)
+                except Exception as exc:
+                    logger.exception("Failed to load players for editor")
+                    await _send_response(
+                        writer, 500,
+                        _message_page(f"دریافت فهرست بازیکنان ناموفق بود: {exc}"),
+                        head=method == "HEAD",
+                    )
+                    return
+                query = parse_qs(urlparse(target).query)
+                saved = query.get("saved", [""])[0]
+                message = f"{saved} نام بازیکن ذخیره شد." if saved.isdigit() else ""
+                await _send_response(
+                    writer, 200, _players_page(players, message), head=method == "HEAD"
+                )
+                return
+            if method != "POST":
+                await _send_response(writer, 405, "Method not allowed")
+                return
+            if not _admin_authenticated(headers):
+                await _send_response(
+                    writer, 401,
+                    _admin_login_page("ابتدا وارد شوید.", action=_PLAYERS_LOGIN_PATH),
+                )
+                return
+            if not headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
+                await _send_response(writer, 400, _message_page("فرمت درخواست نامعتبر است."))
+                return
+            try:
+                fields = parse_qs(
+                    body.decode("utf-8"), keep_blank_values=True, max_num_fields=10000
+                )
+                player_ids = fields.get("player_id", [])
+                first_names = fields.get("first_name_fa", [])
+                second_names = fields.get("second_name_fa", [])
+                web_names = fields.get("web_name_fa", [])
+                if not (
+                    player_ids
+                    and len(player_ids) == len(first_names)
+                    and len(player_ids) == len(second_names)
+                    and len(player_ids) == len(web_names)
+                ):
+                    raise ValueError("اطلاعات نام بازیکنان ناقص است.")
+                updates = [
+                    (int(player_id), first_name, second_name, web_name)
+                    for player_id, first_name, second_name, web_name in zip(
+                        player_ids, first_names, second_names, web_names
+                    )
+                ]
+                changed = await asyncio.to_thread(database.update_player_farsi_names, updates)
+            except Exception as exc:
+                logger.exception("Failed to save player names")
+                await _send_response(writer, 400, _message_page(f"ذخیره نام‌ها ناموفق بود: {exc}"))
+                return
+            await _send_response(
+                writer, 303, "", extra_headers=(f"Location: {_PLAYERS_PATH}?saved={changed}",)
+            )
+            return
         if path in {_ADMIN_PATH, _ADMIN_PATH + "/"}:
             if not _admin_password():
                 await _send_response(
@@ -635,7 +801,7 @@ async def handle_http(reader, writer) -> None:
                 extra_headers=(f"Location: {_ADMIN_PATH}",),
             )
             return
-        if path == _ADMIN_LOGIN_PATH:
+        if path in {_ADMIN_LOGIN_PATH, _PLAYERS_LOGIN_PATH}:
             if not _admin_password():
                 await _send_response(writer, 404, "Not found")
                 return
@@ -643,12 +809,21 @@ async def handle_http(reader, writer) -> None:
                 await _send_response(writer, 405, "Method not allowed")
                 return
             if not headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
-                await _send_response(writer, 400, _admin_login_page("فرمت درخواست نامعتبر است."))
+                await _send_response(
+                    writer, 400,
+                    _admin_login_page(
+                        "فرمت درخواست نامعتبر است.",
+                        action=path,
+                    ),
+                )
                 return
             fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=4)
             password = fields.get("password", [""])[0]
             if not secrets.compare_digest(password, _admin_password()):
-                await _send_response(writer, 401, _admin_login_page("رمز عبور نادرست است."))
+                await _send_response(
+                    writer, 401,
+                    _admin_login_page("رمز عبور نادرست است.", action=path),
+                )
                 return
             now = time.time()
             for token, expires_at in list(_admin_sessions.items()):
@@ -659,7 +834,7 @@ async def handle_http(reader, writer) -> None:
             await _send_response(
                 writer, 303, "",
                 extra_headers=(
-                    f"Location: {_ADMIN_PATH}",
+                    f"Location: {_PLAYERS_PATH if path == _PLAYERS_LOGIN_PATH else _ADMIN_PATH}",
                     f"Set-Cookie: {_admin_cookie(token, max_age=_ADMIN_SESSION_LIFETIME_SECONDS)}",
                 ),
             )

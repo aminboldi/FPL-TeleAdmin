@@ -44,6 +44,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - `OPEN_ROUTER_MODEL`, source/target/notification channels, `PRICE_PREDICTIONS_ENABLED`, `ARTICLE_MONITOR_ENABLED`, `EPL_LEAGUE_CODE`, `EPL_LEAGUE_ID`, `IRAN_LEAGUE_ID`
 - The database has an audit log and every setting change requires a Telegram confirmation.
 - `runtime_config.db` is ignored by git. In Coolify it must live in persistent storage: mount a volume at `/app/teleadmin_project/data` and set `RUNTIME_CONFIG_PATH=/app/teleadmin_project/data/runtime_config.db`.
+- The FPL database automatically uses a sibling `fpl.db` in that persistent directory when `RUNTIME_CONFIG_PATH` is set. `FPL_DATABASE_PATH` can override it explicitly. The first connection copies the bundled database into the persistent location, preserving the existing Persian names and aliases before future FPL refreshes.
 - Without `RUNTIME_CONFIG_PATH`, the bot still runs using a non-persistent DB beside the code; settings reset after a redeploy.
 - `article_catalog.py` stores the Telegraph article index in the same database. The public root URL serves searchable article cards; new Telegraph pages are indexed automatically and existing account pages are imported on first catalog visit. Keep `runtime_config.db` on the persistent Coolify volume so the catalog survives redeploys.
 - The public catalog is served at the app root (`/`), not `/articles`. `telegraph_editor.py` also serves the repository-root assets `/logo.webp` and `/fav-icon.png`; both files must remain in the repository for the branded header and favicon to work in deployment.
@@ -51,6 +52,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`, `/y`, `/a`, `/articles`, `/edit`.
 - `/a https://...` (or `a/https://...`) extracts an arbitrary article in reader mode, translates it, publishes it to Telegraph, and places the channel post in the normal half-hour review queue.
 - `/edit` lists the ten most recently published pages under the shared Telegraph account. After an admin selects one, it sends a private editor link that must be opened within 15 minutes; an opened editor remains valid for two hours or until a successful save. The editor loads and saves the existing page through Telegraph's `getPage`/`editPage` APIs, so the page URL stays unchanged and the raw `TELEGRAPH_ACCESS_TOKEN` never reaches the browser. The link is a temporary capability and must stay in the private admin chat.
+- `/players` is a password-protected web table using the same `TELEGRAPH_EDITOR_PASSWORD`. English FPL names are read-only; Persian first, second, and display names are written directly to the live FPL database. Use the production URL for edits so they are immediately shared with the bot.
 - Dashboard-generated content always requires an explicit publish confirmation. Lineups are source-driven and publish automatically when detected.
 
 ## X post import
@@ -68,6 +70,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - English transcripts use a quota-aware RapidAPI chain with `X_RAPIDAPI_KEY`, in this order: `youtube-captions-transcript-subtitles-video-combiner`, `youtube-transcripts`, `youtube-transcript3`, `youtube-2-transcript`, and `youtube-transcripts-playlists-channels-search1`. Provider HTTP/auth/quota failures are persisted in `youtube_transcript_provider_health` and skipped until the next UTC calendar month; a valid no-captions response is treated as video-specific and allows the next provider. `transcriptapi` is not subscribed and is excluded.
 - The two caption providers are intentionally first because they retrieve YouTube subtitle tracks when available; their normalized SRT/segment output is preferred over generated speech recognition. The additional RapidAPI speech-recognition endpoints require an uploaded `audio_file`, so they are not usable as direct YouTube fallbacks without a separate audio-download/encoding pipeline.
 - If every transcript provider is exhausted for an automatically monitored upload, the admin bot sends a one-time private failure notification and leaves the video unseen so a later poll can retry it.
+- Before translation, the transcript is passed through an AI correction pass using the full FPL player glossary (`first_name`, `second_name`, `web_name`, aliases, and club) to normalize likely ASR name errors to canonical English names. After translation and final transcript formatting, the visible text is deterministically mapped to `first_name_fa`/`second_name_fa` or `web_name_fa`; HTML tags and attributes (including URLs) are never changed. Keep both stages: correction improves recognition, while the final mapping guarantees Persian player names.
 - Every transcript uses the structured article translator. It reconstructs raw captions into paragraphs, inferred topic headings, and genuine lists; short inline posts convert that structure into Telegram-safe bold headings, spacing, and bullets, while long posts retain Telegraph HTML.
 
 ## Deployment
@@ -112,9 +115,12 @@ There are no tests, no CI, no pre-commit hooks, and no typechecker config. Verif
 
 SQLite database at `teleadmin_project/fpl.db`. Schema and query helpers in `database.py`. Populated from FPL API at `https://fantasy.premierleague.com/api/`.
 
+In production, when `RUNTIME_CONFIG_PATH` points to the persistent Coolify volume, the effective path is the sibling `fpl.db` there rather than the code checkout. This is what makes `/players` edits survive redeploys and keeps the web editor and bot on the same database.
+
 - Player name quirks: `search_name` column stores ASCII-normalized `second_name` (strips diacritics). Use this for lookups, not raw `second_name`.
 - Team Farsi names live in `teams.name_fa` / `teams.short_name_fa`
 - Player Farsi names in `players.first_name_fa`, `second_name_fa`, `web_name_fa` (populated by `translate_names.py`)
+- YouTube transcript imports use those player Farsi columns as the authoritative final English-name → Persian-name mapping. Missing values mean a player name cannot be deterministically translated, so keep these columns populated when refreshing the player database.
 - Player community aliases in `players.alias` (populated by `generate_aliases.py`)
 - Country flags stored in `players.flag` — resolved from `regions.json` at DB import time via `database._region_to_flag()`
 
