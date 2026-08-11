@@ -100,7 +100,16 @@ def clean_video_title(title: str) -> str:
 
 
 class _ProviderFailure(Exception):
-    """A provider-level failure that should disable the service for this month."""
+    """A provider-level failure.
+
+    Most RapidAPI errors are temporary (or an endpoint contract change), so
+    they must not make a provider unavailable for the rest of the month.
+    Only an explicit plan/quota exhaustion response earns a monthly disable.
+    """
+
+    def __init__(self, message: str, *, exhausted_quota: bool = False):
+        super().__init__(message)
+        self.exhausted_quota = exhausted_quota
 
 
 class _NoTranscript(Exception):
@@ -269,9 +278,18 @@ def _request_provider_json(
     except requests.RequestException as exc:
         raise _ProviderFailure(f"{provider}: network error") from exc
     if response.status_code >= 400:
-        if response.status_code in {401, 403, 429}:
-            raise _ProviderFailure(f"{provider}: HTTP {response.status_code}")
-        raise _ProviderFailure(f"{provider}: HTTP {response.status_code}")
+        detail = re.sub(r"\s+", " ", response.text).strip()[:300]
+        # RapidAPI also uses 429 for short-term throttling.  Disable only when
+        # its response actually says that the subscribed plan/quota is spent.
+        quota_message = detail.casefold()
+        exhausted_quota = response.status_code in {402, 429} and any(
+            marker in quota_message
+            for marker in ("quota", "monthly limit", "plan limit", "subscription limit", "exceeded your plan")
+        )
+        raise _ProviderFailure(
+            f"{provider}: HTTP {response.status_code}" + (f" ({detail})" if detail else ""),
+            exhausted_quota=exhausted_quota,
+        )
     try:
         payload = response.json()
     except ValueError:
@@ -343,7 +361,16 @@ def _fetch_main_transcript(url: str, rapidapi_key: str) -> str:
     except requests.RequestException as exc:
         raise _ProviderFailure("youtube-transcript3: network error") from exc
     if response.status_code >= 400:
-        raise _ProviderFailure(f"youtube-transcript3: HTTP {response.status_code}")
+        detail = re.sub(r"\s+", " ", response.text).strip()[:300]
+        quota_message = detail.casefold()
+        exhausted_quota = response.status_code in {402, 429} and any(
+            marker in quota_message
+            for marker in ("quota", "monthly limit", "plan limit", "subscription limit", "exceeded your plan")
+        )
+        raise _ProviderFailure(
+            f"youtube-transcript3: HTTP {response.status_code}" + (f" ({detail})" if detail else ""),
+            exhausted_quota=exhausted_quota,
+        )
     try:
         payload = response.json()
     except ValueError as exc:
@@ -424,8 +451,11 @@ def fetch_english_transcript(url: str, rapidapi_key: str | None) -> str:
             continue
         except _ProviderFailure as exc:
             failures.append(str(exc))
-            runtime_config.disable_transcript_provider(provider, month, str(exc))
-            logger.warning("Disabling transcript provider %s until next month: %s", provider, exc)
+            if exc.exhausted_quota:
+                runtime_config.disable_transcript_provider(provider, month, str(exc))
+                logger.warning("Disabling quota-exhausted transcript provider %s until next month: %s", provider, exc)
+            else:
+                logger.warning("Transcript provider %s failed but remains retryable: %s", provider, exc)
             continue
         logger.info("Transcript provider %s returned %d characters", provider, len(text))
         return text

@@ -24,6 +24,12 @@ _MAX_CANDIDATES_PER_SOURCE = 12
 # `type=Fantasy` channel is the official PL classification for FPL articles.
 _PL_NEWS_URL = "https://www.premierleague.com/en/news?type=Fantasy"
 _PL_CONTENT_API_BASE = "https://api.premierleague.com/content/premierleague/playlist/EN"
+_PL_SITEMAP_INDEX_URL = "https://www.premierleague.com/en/sitemap/index.xml"
+_PL_FANTASY_SLUG_RE = re.compile(
+    r"(?:fantasy|\bfpl\b|the-scout|scout-selection|gameweek|captain|"
+    r"wildcard|bench-boost|triple-captain|free-hit|price-reveal)",
+    re.IGNORECASE,
+)
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -128,7 +134,8 @@ def _premier_league_candidates() -> list[Candidate]:
     HTML contains the fantasy playlist configuration, but not the current
     article links. Keep scraping that same filtered HTML as a fallback for
     older/site-degraded responses, then use the playlist API that the page
-    itself calls for the live cards. Never fall back to the unfiltered feed.
+    itself calls for the live cards. If both expose no cards, use the official
+    sitemap's clearly Fantasy-related URLs; never use the unfiltered listing.
     """
     page_html = _fetch(_PL_NEWS_URL)
     html_candidates = _listing_candidates_from_html(
@@ -141,8 +148,8 @@ def _premier_league_candidates() -> list[Candidate]:
     )
     playlist_id = str(grid.get("data-playlist-id", "")).strip() if grid else ""
     if not playlist_id.isdigit():
-        logger.warning("Premier League news page did not expose a playlist ID")
-        return html_candidates
+        logger.warning("Premier League news page did not expose a playlist ID; trying the official sitemap")
+        return html_candidates or _premier_league_sitemap_candidates()
 
     api_url = (
         f"{_PL_CONTENT_API_BASE}/{playlist_id}"
@@ -152,7 +159,7 @@ def _premier_league_candidates() -> list[Candidate]:
         payload = json.loads(_fetch(api_url))
     except Exception:
         logger.exception("Failed to read the Premier League news playlist API")
-        return html_candidates
+        return html_candidates or _premier_league_sitemap_candidates()
 
     candidates = []
     seen: set[str] = set()
@@ -187,7 +194,68 @@ def _premier_league_candidates() -> list[Candidate]:
         )
         if len(candidates) >= _MAX_CANDIDATES_PER_SOURCE:
             break
-    return (candidates or html_candidates)[:_MAX_CANDIDATES_PER_SOURCE]
+    return (candidates or html_candidates or _premier_league_sitemap_candidates())[:_MAX_CANDIDATES_PER_SOURCE]
+
+
+def _xml_loc_entries(xml: str) -> list[tuple[str, str]]:
+    """Return (URL, lastmod) pairs from either a sitemap index or urlset."""
+    root = ET.fromstring(xml)
+    entries = []
+    for element in root:
+        loc = element.findtext("{*}loc", default="").strip()
+        if not loc:
+            continue
+        entries.append((loc, element.findtext("{*}lastmod", default="").strip()))
+    return entries
+
+
+def _premier_league_sitemap_candidates() -> list[Candidate]:
+    """Fallback when the JS-only Fantasy listing exposes no usable feed.
+
+    This deliberately reads only PL's own sitemap and only keeps news slugs
+    with a strong Fantasy/Scout signal.  It is a safety net for an empty
+    official playlist, not a replacement for the site's Fantasy taxonomy.
+    """
+    try:
+        sitemap_entries = _xml_loc_entries(_fetch(_PL_SITEMAP_INDEX_URL))
+    except Exception:
+        logger.exception("Failed to read the Premier League sitemap index")
+        return []
+
+    # A sitemap index normally has a small number of dated news shards.  The
+    # newest ones are at the end, but accept either ordering to tolerate a
+    # future PL sitemap change.
+    shard_urls = [
+        url for url, _ in sitemap_entries
+        if "sitemap" in url.casefold() and any(
+            marker in url.casefold() for marker in ("news", "article", "content")
+        )
+    ]
+    if not shard_urls:
+        shard_urls = [url for url, _ in sitemap_entries if "sitemap" in url.casefold()]
+
+    candidates: list[Candidate] = []
+    seen: set[str] = set()
+    for shard_url in reversed(shard_urls[-6:]):
+        try:
+            entries = _xml_loc_entries(_fetch(shard_url))
+        except Exception:
+            logger.warning("Could not read Premier League sitemap shard %s", shard_url)
+            continue
+        for url, lastmod in reversed(entries):
+            url = _normalize_url(url)
+            if (
+                url in seen
+                or not _is_premier_league_article(url)
+                or not _PL_FANTASY_SLUG_RE.search(urlparse(url).path)
+            ):
+                continue
+            seen.add(url)
+            slug = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+            candidates.append(Candidate("premierleague", slug.replace("-", " "), url, lastmod))
+
+    candidates.sort(key=lambda candidate: candidate.published_at or candidate.url, reverse=True)
+    return candidates[:_MAX_CANDIDATES_PER_SOURCE]
 
 
 def _is_premier_league_article(url: str) -> bool:

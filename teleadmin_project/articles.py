@@ -88,6 +88,23 @@ _ARTICLE_CATALOGUE_URL = "https://epl-fantasy.ir"
 _ARTICLE_CATALOGUE_FOOTER = (
     f'<p><a href="{_ARTICLE_CATALOGUE_URL}">آرشیو مقالات کانال</a></p>'
 )
+_SLUG_WORDS = {
+    "آخرین": "akharin", "فانتزی": "fantasy", "درفت": "draft",
+    "رتبه": "rank", "فصل": "season", "هفته": "week", "مقاله": "article",
+    "ویدیو": "video", "بازیکن": "player", "بازی": "match", "تیم": "team",
+}
+_PERSIAN_TO_FINGLISH = str.maketrans({
+    "ا": "a", "آ": "a", "ب": "b", "پ": "p", "ت": "t", "ث": "s",
+    "ج": "j", "چ": "ch", "ح": "h", "خ": "kh", "د": "d", "ذ": "z",
+    "ر": "r", "ز": "z", "ژ": "zh", "س": "s", "ش": "sh", "ص": "s",
+    "ض": "z", "ط": "t", "ظ": "z", "ع": "", "غ": "gh", "ف": "f",
+    "ق": "gh", "ک": "k", "گ": "g", "ل": "l", "م": "m", "ن": "n",
+    "و": "v", "ه": "h", "ی": "y", "ى": "y", "ئ": "y", "ؤ": "v",
+    "ة": "h", "ء": "", "ە": "h", "٠": "0", "١": "1", "٢": "2",
+    "٣": "3", "٤": "4", "٥": "5", "٦": "6", "٧": "7", "٨": "8",
+    "٩": "9", "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+})
 
 _telegraph: Telegraph | None = None
 
@@ -178,22 +195,26 @@ def edit_telegraph_page(page_url_or_path: str, title: str, html_content: str) ->
     return _get_telegraph().edit_page(
         path=_telegraph_path(page_url_or_path),
         title=title,
-        html_content=html_content,
+        html_content=normalize_telegraph_structure(html_content),
     )
 
 
 def is_pl_article_url(text: str, entities: list | None = None) -> bool:
-    if text and (_PL_URL_RE.search(text) or _SHORT_URL_RE.search(text) or _TCO_URL_RE.search(text)):
+    # A t.co URL is not evidence that its destination is a PL article: it is
+    # used by every X post.  Treating it as one sent arbitrary X links through
+    # the brittle PL-only parser.  ``fetch_general_article`` follows redirects
+    # safely for those links instead.
+    if text and (_PL_URL_RE.search(text) or _SHORT_URL_RE.search(text)):
         return True
     for m in re.finditer(r"https?://\S+", text or ""):
         raw = m.group(0)
-        if _PL_URL_RE.search(raw) or _SHORT_URL_RE.search(raw) or _TCO_URL_RE.search(raw):
+        if _PL_URL_RE.search(raw) or _SHORT_URL_RE.search(raw):
             return True
     if entities:
         for e in entities:
             url = getattr(e, "url", None)
             if url and (
-                _PL_URL_RE.search(url) or _SHORT_URL_RE.search(url) or _TCO_URL_RE.search(url)
+                _PL_URL_RE.search(url) or _SHORT_URL_RE.search(url)
             ):
                 return True
     return False
@@ -268,7 +289,13 @@ def _fetch_pl_article(url: str) -> dict | None:
 
     content_el = soup.select_one(".article__content")
     if not content_el:
-        return None
+        # The PL frontend has changed its article classes several times.  The
+        # generic extractor is intentionally our compatibility path: it uses
+        # the semantic article/main content rather than a private CSS class,
+        # retains the official metadata, and follows future server-rendered
+        # layouts without requiring another scraper rewrite.
+        logger.info("PL legacy article container missing; using reader-mode fallback for %s", final_url)
+        return fetch_general_article(final_url)
 
     # The PL site uses content cards/widgets for promotions and related
     # articles. Remove them before walking the article body. Related Content
@@ -297,6 +324,10 @@ def _fetch_pl_article(url: str) -> dict | None:
         raw_text = content_el.get_text(separator="\n", strip=True)
         if raw_text:
             parts = [{"type": "p", "text": raw_text}]
+
+    if not title or not parts:
+        logger.info("PL legacy article extraction was incomplete; using reader-mode fallback for %s", final_url)
+        return fetch_general_article(final_url)
 
     return {
         "title": title,
@@ -1006,6 +1037,80 @@ def restore_missing_images(html_content: str, image_urls: list[str]) -> str:
     return restore_images_in_place(html_content, image_urls)
 
 
+def normalize_telegraph_structure(html_content: str) -> str:
+    """Make generated article HTML safe for Telegraph's block layout.
+
+    Models occasionally put prose directly between headings instead of in
+    ``<p>`` elements.  Telegraph accepts those text nodes but renders them as
+    one run-on block, and the editor cannot repair it until after publication.
+    Normalize at the final publishing boundary so every pipeline gets the
+    same guarantee.  A long, sentence-like heading is prose as well, so it is
+    demoted before Telegraph turns it into an oversized heading.
+    """
+    soup = BeautifulSoup(str(html_content or ""), "html.parser")
+    root = soup.body or soup
+
+    block_tags = {"blockquote", "div", "figure", "h1", "h2", "h3", "h4", "h5", "h6", "ol", "p", "pre", "section", "ul"}
+    # Browser/editor HTML and model output can both produce a paragraph as a
+    # child of a heading.  Telegraph treats the entire nested structure as a
+    # heading unless the block is moved out first.
+    for heading in list(root.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])):
+        anchor = heading
+        for child in list(heading.find_all(recursive=False)):
+            if child.name not in block_tags:
+                continue
+            child.extract()
+            anchor.insert_after(child)
+            anchor = child
+
+    # Headings should be short labels.  This catches a model that wraps a
+    # whole paragraph in h3/h4 while preserving genuine section headings.
+    for heading in list(root.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])):
+        visible_text = heading.get_text(" ", strip=True)
+        if len(visible_text) > 140 or re.search(r"[.!؟؛]\s", visible_text):
+            heading.name = "p"
+
+    # Combine consecutive root-level text nodes into a real paragraph.  Do
+    # not wrap whitespace-only nodes: they are just serialization formatting.
+    pending: list[str] = []
+
+    def flush(before=None) -> None:
+        nonlocal pending
+        text = " ".join(part.strip() for part in pending if part.strip())
+        pending = []
+        if not text:
+            return
+        paragraph = soup.new_tag("p")
+        paragraph.string = text
+        if before is None:
+            root.append(paragraph)
+        else:
+            before.insert_before(paragraph)
+
+    for child in list(root.contents):
+        if isinstance(child, NavigableString):
+            if child.strip():
+                pending.append(str(child))
+            child.extract()
+            continue
+        flush(child)
+    flush()
+    return "".join(str(child) for child in root.contents).strip()
+
+
+def _telegraph_slug_title(title: str) -> str:
+    """Return a Latin-only temporary title used solely to create a page path."""
+    text = str(title or "").strip()
+    for source, replacement in _SLUG_WORDS.items():
+        text = re.sub(rf"(?<!\w){re.escape(source)}(?!\w)", replacement, text)
+    text = text.translate(_PERSIAN_TO_FINGLISH)
+    # Telegraph derives the path from its createPage title. Keep only stable
+    # Latin word characters so Persian titles never become percent-encoded.
+    text = re.sub(r"[^A-Za-z0-9]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:180] or "FPL Article"
+
+
 def publish_to_telegraph(
     title: str,
     html_content: str,
@@ -1018,11 +1123,27 @@ def publish_to_telegraph(
 ) -> str | None:
     try:
         tg = _get_telegraph()
+        html_content = normalize_telegraph_structure(html_content)
         html_content = (
             f"{html_content.rstrip()}\n\n{_ARTICLE_CATALOGUE_FOOTER}"
         )
-        page = tg.create_page(title=title, html_content=html_content)
+        page = tg.create_page(
+            title=_telegraph_slug_title(title), html_content=html_content,
+        )
         url = page.get("url", "")
+        path = page.get("path", "")
+        if path:
+            # Editing changes the visible title but deliberately retains the
+            # Latin path allocated by createPage.
+            try:
+                tg.edit_page(path=path, title=title, html_content=html_content)
+            except Exception:
+                # The page already exists, so preserve it and its usable URL
+                # if a transient edit request fails rather than publishing a
+                # duplicate on a later retry.
+                logger.exception("Telegraph created %s but could not restore its visible title", url)
+        else:
+            logger.warning("Telegraph created a page without a path; keeping its temporary title")
         logger.info("Telegraph page created: %s", url)
         try:
             import article_catalog
