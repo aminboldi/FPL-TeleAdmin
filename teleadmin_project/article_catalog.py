@@ -98,8 +98,14 @@ def record_page(
     published_at: str | None = None,
     summary_source: str = "ai",
     source_url: str = "",
+    hidden: bool = True,
 ) -> None:
-    """Insert or update a locally indexed Telegraph page."""
+    """Insert or update a locally indexed Telegraph page.
+
+    Newly created Telegraph pages stay private to the catalog until the
+    matching article link has actually appeared in the main Telegram channel.
+    Existing records retain their visibility when their metadata is refreshed.
+    """
     path = _path_from_url(url)
     if not path:
         return
@@ -111,8 +117,8 @@ def record_page(
             """
             INSERT INTO telegraph_articles
                 (path, url, title, summary, summary_source, source_tag,
-                 source_url, image_url, published_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_url, image_url, hidden, published_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 url=excluded.url,
                 title=excluded.title,
@@ -151,6 +157,7 @@ def record_page(
                 _plain_text(source_tag),
                 str(source_url or "").strip(),
                 str(image_url or "").strip(),
+                1 if hidden else 0,
                 published_at,
                 now,
             ),
@@ -170,6 +177,7 @@ def list_source_tags() -> list[str]:
 
 def list_pages(
     *, query: str = "", source_tag: str = "", limit: int = 24, offset: int = 0,
+    include_hidden: bool = False,
 ) -> list[dict]:
     init()
     limit = max(1, min(int(limit), 100))
@@ -183,7 +191,8 @@ def list_pages(
     if source_tag.strip():
         clauses.append("source_tag = ?")
         params.append(source_tag.strip())
-    clauses.insert(0, "hidden=0")
+    if not include_hidden:
+        clauses.insert(0, "hidden=0")
     where = f"WHERE {' AND '.join(clauses)}"
     with _connect() as conn:
         rows = conn.execute(
@@ -284,6 +293,28 @@ def set_hidden(url: str, hidden: bool = True) -> bool:
     return cursor.rowcount > 0
 
 
+def publish_in_catalog(url: str, *, since: datetime | None = None) -> bool:
+    """Make a recent, already-indexed article public after its channel post exists."""
+    path = _path_from_url(url)
+    if not path:
+        return False
+    init()
+    clauses = ["path=?", "hidden=1"]
+    values: list[str | int] = [path]
+    if since is not None:
+        if since.tzinfo is None:
+            raise ValueError("since must be timezone-aware")
+        clauses.append("published_at>=?")
+        values.append(since.astimezone(timezone.utc).isoformat())
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE telegraph_articles SET hidden=0, updated_at=? WHERE "
+            + " AND ".join(clauses),
+            (datetime.now(timezone.utc).isoformat(), *values),
+        )
+    return cursor.rowcount > 0
+
+
 def hidden_paths() -> set[str]:
     """Return paths hidden from the public catalog."""
     init()
@@ -350,6 +381,10 @@ def sync_from_telegraph() -> int:
                 page.get("image_url", ""),
                 published_at=imported_at,
                 summary_source="telegraph",
+                # A Telegraph account can contain drafts or pages that were
+                # never posted to the channel, so importing must not expose
+                # previously unknown pages.
+                hidden=True,
             )
             imported += 1
         if len(pages) < limit:

@@ -218,13 +218,15 @@ def _page_shell(title: str, body: str, *, page_class: str = "") -> str:
     .success {{ color: #116329; background: #effaf1; border-radius: 8px; padding: 12px; }}
     .admin-list {{ display: grid; gap: 10px; margin-top: 18px; }}
     .admin-row {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid #e1e5e9; border-radius: 10px; padding: 12px; }}
-    .admin-row h2 {{ margin: 0 0 4px; font-size: 16px; }}
+    .admin-title {{ flex: 1 1 auto; min-width: 0; }}
+    .admin-row h2 {{ margin: 0 0 4px; font-size: 16px; overflow-wrap: anywhere; }}
     .admin-row .note {{ overflow-wrap: anywhere; margin: 0; }}
     .admin-row.hidden {{ opacity: .68; }}
     .admin-actions {{ display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; flex: 0 0 auto; }}
     .admin-edit {{ flex: 0 0 auto; background: #310b34; color: #fff; border-radius: 7px; padding: 9px 14px; text-decoration: none; font-weight: 700; }}
     .admin-action {{ margin: 0; }}
     .admin-hide {{ border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
+    .admin-action-icon {{ display: none; }}
     .logout {{ margin-top: 18px; border: 1px solid #ccd0d5; border-radius: 7px; padding: 9px 14px; background: #fff; cursor: pointer; font: inherit; }}
     .players-page {{ max-width: 1400px; }}
     .search {{ margin: 14px 0; }}
@@ -236,6 +238,36 @@ def _page_shell(title: str, body: str, *, page_class: str = "") -> str:
     td.english {{ direction: ltr; text-align: left; white-space: nowrap; color: #59636e; }}
     td input {{ width: 150px; box-sizing: border-box; padding: 8px; border: 1px solid #ccd0d5; border-radius: 7px; font: inherit; }}
     a {{ color: #168acd; }}
+    @media (max-width: 560px) {{
+      main {{ margin-top: 14px; padding-inline: 10px; }}
+      .card {{ padding: 14px; }}
+      /* Mobile browsers own the copy/paste selection popover and do not let
+         pages suppress it. Keep article formatting controls away from that
+         popover, in a persistent bottom bar instead of above the editor. */
+      #edit-form {{ padding-bottom: 72px; }}
+      .toolbar {{
+        position: fixed;
+        z-index: 10;
+        right: 10px;
+        bottom: calc(10px + env(safe-area-inset-bottom));
+        left: 10px;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        margin: 0;
+        padding: 6px;
+        background: #fff;
+        border: 1px solid #ccd0d5;
+        border-radius: 10px;
+        box-shadow: 0 3px 14px #0002;
+        -webkit-overflow-scrolling: touch;
+      }}
+      .toolbar button {{ flex: 0 0 auto; }}
+      .admin-row {{ align-items: flex-start; gap: 8px; }}
+      .admin-actions {{ gap: 4px; }}
+      .admin-edit, .admin-hide {{ min-width: 38px; min-height: 38px; box-sizing: border-box; padding: 8px; display: grid; place-items: center; }}
+      .admin-action-text {{ display: none; }}
+      .admin-action-icon {{ display: inline; font-size: 18px; line-height: 1; }}
+    }}
   </style>
 </head>
 <body><main{main_class}><div class="card">{body}</div></main></body>
@@ -377,13 +409,13 @@ def _admin_index_page(pages: list[dict], hidden_paths: set[str] | None = None) -
         rows.append(
             f"""
             <article class="admin-row{hidden_class}">
-              <div><h2>{title}</h2><p class="note">{safe_page_url}</p></div>
+              <div class="admin-title"><h2>{title}</h2><p class="note">{safe_page_url}</p></div>
               <div class="admin-actions">
-                <a class="admin-edit" href="{editor_url}" target="_blank" rel="noopener">ویرایش</a>
+                <a class="admin-edit" href="{editor_url}" target="_blank" rel="noopener" aria-label="ویرایش" title="ویرایش"><span class="admin-action-text">ویرایش</span><span class="admin-action-icon" aria-hidden="true">✎</span></a>
                 <form class="admin-action" method="post" action="{_ADMIN_HIDE_PATH}">
                   <input type="hidden" name="url" value="{safe_page_url}">
                   <input type="hidden" name="hidden" value="{visibility_value}">
-                  <button class="admin-hide" type="submit">{visibility_label}</button>
+                  <button class="admin-hide" type="submit" aria-label="{visibility_label}" title="{visibility_label}"><span class="admin-action-text">{visibility_label}</span><span class="admin-action-icon" aria-hidden="true">{'◉' if is_hidden else '⊘'}</span></button>
                 </form>
               </div>
             </article>

@@ -75,6 +75,7 @@ _ALBUM_TIMEOUT = 5
 _ARTICLE_SOURCE_THRESHOLD = 940
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
 _YOUTUBE_DESCRIPTION_PREVIEW_LIMIT = 500
+_CATALOG_VISIBILITY_LOOKBACK = timedelta(days=3)
 # Photo captions are limited to 1,024 rendered characters.  This leaves room
 # for the YouTube header, title, original-video link, and AI signature.
 _YOUTUBE_INLINE_TRANSCRIPT_LIMIT = 800
@@ -377,15 +378,94 @@ def _strip_hashtags(text: str) -> str:
 
 
 def _extract_urls(event) -> list[str]:
+    return _extract_urls_from_message(event.message)
+
+
+def _extract_urls_from_message(message) -> list[str]:
+    """Return raw and entity-backed URLs from any Telegram message object."""
     urls = []
-    if event.message.text:
-        urls.extend(m.group(0) for m in _URL_RE.finditer(event.message.text))
-    if event.message.entities:
-        for entity in event.message.entities:
+    text = getattr(message, "text", None) or getattr(message, "message", None) or ""
+    if text:
+        urls.extend(m.group(0) for m in _URL_RE.finditer(text))
+    entities = getattr(message, "entities", None)
+    if entities:
+        for entity in entities:
             url = getattr(entity, "url", None)
             if url:
                 urls.append(url)
     return urls
+
+
+def _channel_key(value) -> str:
+    """Normalize Telegram's bare and -100-prefixed channel identifiers."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lstrip("-").isdigit():
+        text = str(abs(int(text)))
+        return text[3:] if text.startswith("100") else text
+    return text.lstrip("@").lower()
+
+
+async def _is_target_channel_message(event) -> bool:
+    target = _target_channel()
+    if not target:
+        return False
+    target_key = _channel_key(target)
+    channel_id = getattr(getattr(event.message, "peer_id", None), "channel_id", None)
+    if channel_id is not None and _channel_key(channel_id) == target_key:
+        return True
+    if str(target).lstrip("-").isdigit():
+        return False
+    chat = await event.get_chat()
+    return _channel_key(getattr(chat, "username", "")) == target_key
+
+
+async def _publish_channel_article_links(message) -> int:
+    """Expose indexed Telegraph pages whose links are in a channel message."""
+    import article_catalog
+
+    published = 0
+    since = datetime.now(timezone.utc) - _CATALOG_VISIBILITY_LOOKBACK
+    for url in _extract_urls_from_message(message):
+        host = (urlparse(url).hostname or "").lower()
+        if host not in {"telegra.ph", "www.telegra.ph", "graph.org", "www.graph.org"}:
+            continue
+        if await asyncio.to_thread(article_catalog.publish_in_catalog, url, since=since):
+            published += 1
+    return published
+
+
+async def _handle_target_channel_message(event) -> None:
+    """Synchronize catalog visibility with posts actually present in target."""
+    if not await _is_target_channel_message(event):
+        return
+    published = await _publish_channel_article_links(event.message)
+    if published:
+        logger.info("Made %d article(s) visible from target-channel post", published)
+
+
+async def _sync_catalog_visibility_from_target() -> None:
+    """Catch up with already-published target posts after a restart."""
+    target = _target_channel()
+    if not target:
+        return
+    try:
+        # Populate the local index first. This matters after a fresh deploy
+        # where the database is empty but the Telegraph account has history.
+        import article_catalog
+        await asyncio.to_thread(article_catalog.sync_from_telegraph)
+        published = 0
+        cutoff = datetime.now(timezone.utc) - _CATALOG_VISIBILITY_LOOKBACK
+        async for message in client.iter_messages(target):
+            message_date = getattr(message, "date", None)
+            if message_date is not None and message_date.astimezone(timezone.utc) < cutoff:
+                break
+            published += await _publish_channel_article_links(message)
+        if published:
+            logger.info("Made %d article(s) visible from target-channel history", published)
+    except Exception:
+        logger.exception("Could not read target channel for catalog visibility sync")
 
 
 def _canonical_link_url(url: str) -> str:
@@ -1417,7 +1497,10 @@ async def _recent_telegraph_pages() -> list[dict]:
     import article_catalog
 
     await asyncio.to_thread(article_catalog.sync_from_telegraph)
-    return await asyncio.to_thread(article_catalog.list_pages, limit=50)
+    # The private editor must also show queued (not-yet-public) articles.
+    return await asyncio.to_thread(
+        article_catalog.list_pages, limit=50, include_hidden=True
+    )
 
 
 async def _enrich_article_catalog() -> None:
@@ -1589,6 +1672,12 @@ async def main():
 
     await client.start()
     client.add_event_handler(_handle_configured_source_message, events.NewMessage(incoming=True))
+    # Scheduled posts are emitted as normal channel messages when Telegram
+    # publishes them. Edits are also observed in case a Telegraph link is
+    # added or corrected after posting.
+    client.add_event_handler(_handle_target_channel_message, events.NewMessage())
+    client.add_event_handler(_handle_target_channel_message, events.MessageEdited())
+    await _sync_catalog_visibility_from_target()
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
     admin_client = None
