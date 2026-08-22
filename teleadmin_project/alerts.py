@@ -23,8 +23,8 @@ def _normalize(text: str) -> str:
 
 
 _ACTION_RE = re.compile(
-    r"^(Goal|Assist|Red card|Penalty missed|Penalty saved|Red Card|Penalty Missed|Penalty Saved)\s*[-–—]\s*(.+)$",
-    re.MULTILINE | re.IGNORECASE,
+    r"(?<!\w)(Goal|Assist|Red card|Penalty missed|Penalty saved)\s*[-–—]\s*",
+    re.IGNORECASE,
 )
 
 _SCORE_RE = re.compile(
@@ -37,7 +37,40 @@ _SCORE_SIMPLE_RE = re.compile(
     re.MULTILINE,
 )
 
+# Some direct bot inputs arrive as one line rather than the line-broken
+# format used by source channels. Keep the score body deliberately ASCII:
+# source alerts use English team names, and this prevents action/player text
+# from being mistaken for the home team.
+_INLINE_SCORE_RE = re.compile(
+    r"(?<!\S)(?=(?P<home>[A-Za-z][A-Za-z0-9 .&'’]*?)\s+"
+    r"(?P<home_score>\d+)\s*[-–—]\s*(?P<away_score>\d+)\s+"
+    r"(?P<away>[A-Za-z][A-Za-z0-9 .&'’]*?)"
+    r"(?:\s*\((?P<minute>\d+(?:\+\d+)?)\s*(?:mins?|min)?\s*\))?"
+    r"(?=\s*(?:#|\[|$)))",
+    re.IGNORECASE,
+)
+
 _HASHTAG_RE = re.compile(r"#FPL\s*#(\w{3})(\w{3})", re.IGNORECASE)
+
+
+def _strip_markdown_links(text: str) -> str:
+    """Keep visible text from markdown links while dropping their URLs."""
+    return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+
+
+def _find_score(text: str):
+    """Find the score, including when actions and score share one line."""
+    line_match = _SCORE_RE.search(text)
+    if line_match:
+        return line_match
+
+    inline_matches = list(_INLINE_SCORE_RE.finditer(text))
+    if inline_matches:
+        # A preceding player name can also form a syntactically valid home
+        # team candidate ("ENCISO Ipswich 1-0 ..."). The rightmost match is
+        # the actual score because it starts at the real team name.
+        return inline_matches[-1]
+    return _SCORE_SIMPLE_RE.search(text)
 
 
 @dataclass
@@ -62,17 +95,35 @@ class ParsedAlert:
 def is_game_alert(text: str) -> bool:
     if not text:
         return False
+    text = _strip_markdown_links(text)
     has_action = bool(_ACTION_RE.search(text))
-    has_score = bool(_SCORE_RE.search(text) or _SCORE_SIMPLE_RE.search(text))
+    has_score = bool(_find_score(text))
     return has_action and has_score
 
 
 def parse(text: str) -> ParsedAlert | None:
+    text = _strip_markdown_links(text)
     alert = ParsedAlert()
 
-    for m in _ACTION_RE.finditer(text):
+    score_m = _find_score(text)
+    action_matches = list(_ACTION_RE.finditer(text))
+    for index, m in enumerate(action_matches):
+        if score_m and m.start() >= score_m.start():
+            continue
+
+        next_action_start = (
+            action_matches[index + 1].start()
+            if index + 1 < len(action_matches)
+            else len(text)
+        )
+        end = next_action_start
+        if score_m and m.end() <= score_m.start() < end:
+            end = score_m.start()
+
         action_type = m.group(1).capitalize()
-        raw = m.group(2).strip()
+        raw = text[m.end():end].strip()
+        if not raw:
+            continue
         detail = None
 
         if action_type in ("Goal", "Goal_penalty"):
@@ -91,16 +142,22 @@ def parse(text: str) -> ParsedAlert | None:
 
         alert.actions.append(Action(type=action_type, player_name=raw, detail=detail))
 
-    score_m = _SCORE_RE.search(text) or _SCORE_SIMPLE_RE.search(text)
     if score_m:
-        alert.home_team = score_m.group(1).strip()
-        alert.home_score = int(score_m.group(2))
-        alert.away_score = int(score_m.group(3))
-        alert.away_team = score_m.group(4).strip()
-        try:
-            alert.minute = score_m.group(5)
-        except IndexError:
-            alert.minute = "?"
+        if score_m.re is _INLINE_SCORE_RE:
+            alert.home_team = score_m.group("home").strip()
+            alert.home_score = int(score_m.group("home_score"))
+            alert.away_score = int(score_m.group("away_score"))
+            alert.away_team = score_m.group("away").strip()
+            alert.minute = score_m.group("minute") or "?"
+        else:
+            alert.home_team = score_m.group(1).strip()
+            alert.home_score = int(score_m.group(2))
+            alert.away_score = int(score_m.group(3))
+            alert.away_team = score_m.group(4).strip()
+            try:
+                alert.minute = score_m.group(5)
+            except IndexError:
+                alert.minute = "?"
 
     hash_m = _HASHTAG_RE.search(text)
     if hash_m:

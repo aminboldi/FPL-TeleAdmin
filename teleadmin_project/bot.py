@@ -96,11 +96,10 @@ _pending_dashboard_content: str | None = None
 _admin_bot_client: TelegramClient | None = None
 _schedule_slot_lock = asyncio.Lock()
 # Telegram can briefly omit a message immediately after it is scheduled. Keep
-# such reservations locally for a short grace period, but let the live
-# scheduled-message history become authoritative afterward. This means a
-# manually deleted future post frees its half-hour slot again.
-_QUEUE_RESERVATION_GRACE_SECONDS = 45
-_queue_reservations: dict[str, dict[tuple[int, int, int, int, int], tuple[datetime, float]]] = {}
+# the last allocated slot locally so successive posts advance even when the
+# scheduled-message history has not caught up yet. The history remains the
+# restart-safe source of truth because this cursor only lives in memory.
+_last_reserved_queue_slots: dict[str, datetime] = {}
 _youtube_failure_notified: set[str] = set()
 _automatic_alert_lock = asyncio.Lock()
 
@@ -638,24 +637,20 @@ async def _next_queue_slot(target_channel: str) -> datetime:
     occupied = [message.date for message in scheduled if getattr(message, "date", None)]
     target_key = str(target_channel)
     now = datetime.now(tz=timezone.utc)
-    scheduled_keys = {
-        post_queue._slot_key(value) for value in occupied if value.tzinfo is not None
-    }
-    reservations = _queue_reservations.setdefault(target_key, {})
-    for slot_key, (reserved_slot, reserved_at) in list(reservations.items()):
-        if (
-            slot_key in scheduled_keys
-            or now.timestamp() - reserved_at >= _QUEUE_RESERVATION_GRACE_SECONDS
+    last_reserved = _last_reserved_queue_slots.get(target_key)
+    if last_reserved is not None:
+        last_key = post_queue._slot_key(last_reserved)
+        if any(
+            value.tzinfo is not None and post_queue._slot_key(value) == last_key
+            for value in occupied
         ):
-            reservations.pop(slot_key, None)
-            continue
-        occupied.append(reserved_slot)
-
+            _last_reserved_queue_slots.pop(target_key, None)
     slot = post_queue.next_available_slot(
         now,
         occupied,
+        after=_last_reserved_queue_slots.get(target_key),
     )
-    reservations[post_queue._slot_key(slot)] = (slot, now.timestamp())
+    _last_reserved_queue_slots[target_key] = slot
     return slot
 
 
@@ -683,11 +678,8 @@ async def _send_to_target(
         except Exception:
             if schedule_time:
                 target_key = str(target_channel)
-                reservations = _queue_reservations.get(target_key)
-                if reservations is not None:
-                    reservations.pop(post_queue._slot_key(schedule_time), None)
-                    if not reservations:
-                        _queue_reservations.pop(target_key, None)
+                if _last_reserved_queue_slots.get(target_key) == schedule_time:
+                    _last_reserved_queue_slots.pop(target_key, None)
             raise
 
 
