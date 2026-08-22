@@ -1,4 +1,6 @@
 """Parse English game-action alerts and format them in Farsi."""
+import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -108,6 +110,29 @@ def parse(text: str) -> ParsedAlert | None:
     if not alert.actions:
         return None
     return alert
+
+
+def dedup_key(alert: ParsedAlert) -> str:
+    """Return a stable identity for the same match action across source feeds.
+
+    The minute is intentionally excluded because different feeds can report
+    the same action a few seconds apart with different stoppage-time text.
+    """
+    def value(text: str) -> str:
+        return re.sub(r"\s+", " ", _normalize(text or "")).strip().casefold()
+
+    payload = {
+        "home": value(alert.home_team) or value(alert.home_team_code),
+        "away": value(alert.away_team) or value(alert.away_team_code),
+        "home_score": alert.home_score,
+        "away_score": alert.away_score,
+        "actions": sorted(
+            (value(action.type), value(action.player_name), value(action.detail or ""))
+            for action in alert.actions
+        ),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _resolve_player(

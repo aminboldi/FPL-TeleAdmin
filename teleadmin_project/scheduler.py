@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta, timezone
 import database as db
 import livefpl
 import runtime_config
+import alerts
+import official_lineups
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,8 @@ _EO_POSTED_KEY = "eo_posted"
 _PRICE_CHANGES_RESUME_DATE = date(2026, 8, 21)
 _DB_REFRESH_INTERVAL = 6 * 60 * 60
 _DB_REFRESH_RETRY_INTERVAL = 30 * 60
+_SCHEDULER_INTERVAL = 30
+_LINEUP_LEAD_TIME = timedelta(minutes=75)
 
 
 def _now_iran() -> datetime:
@@ -48,13 +52,21 @@ async def run_scheduler(client, target_channel: str, league_code: str, price_pre
             target_channel = runtime_config.get("TARGET_CHANNEL_ID") or target_channel
             price_predictions_enabled = runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED")
             if not target_channel:
-                await asyncio.sleep(60)
+                await asyncio.sleep(_SCHEDULER_INTERVAL)
                 continue
 
-            games = livefpl._fetch_games() if livefpl._games_cache is None else None
-            if games is None:
-                livefpl._games_cache = livefpl._fetch_games()
-                games = livefpl._games_cache
+            # Official lineups normally become available 75 minutes before
+            # kickoff.  Once that window opens, this job retries every 30s
+            # until both starting XIs are present and successfully posted.
+            await _check_official_lineups(client, target_channel)
+
+            # LiveFPL changes as matches progress.  A one-time startup fetch
+            # leaves all games permanently at their initial status and makes
+            # both Done-game posts and the post-deadline EO snapshot invisible.
+            games = await asyncio.to_thread(livefpl.refresh_games)
+            if not games:
+                await asyncio.sleep(_SCHEDULER_INTERVAL)
+                continue
 
             await _check_game_points(client, target_channel, games)
 
@@ -66,15 +78,77 @@ async def run_scheduler(client, target_channel: str, league_code: str, price_pre
         except Exception as e:
             logger.error("Scheduler error: %s", e)
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(_SCHEDULER_INTERVAL)
+
+
+async def _check_official_lineups(client, target_channel):
+    now_utc = datetime.now(tz=timezone.utc)
+    fixtures = livefpl.get_fixtures()
+
+    for fixture in fixtures:
+        posted_key = f"official_lineup_{fixture['id']}"
+        if _already_posted(posted_key):
+            continue
+        if fixture.get("finished"):
+            continue
+
+        try:
+            kickoff = datetime.strptime(
+                fixture["kickoff_time"][:19], "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        # Poll from 75 minutes before kickoff until the fixture is finished.
+        # This keeps retrying through a transient outage at kickoff without
+        # retrying old completed fixtures forever.
+        if now_utc < kickoff - _LINEUP_LEAD_TIME:
+            continue
+
+        try:
+            parsed = await asyncio.to_thread(
+                official_lineups.fetch_starting_lineups, fixture
+            )
+        except Exception as exc:
+            logger.warning(
+                "Official lineup fetch failed for %s vs %s: %s",
+                fixture["home_en"], fixture["away_en"], exc,
+            )
+            continue
+
+        if not parsed:
+            logger.info(
+                "Official lineups not ready for %s vs %s; retrying in %ss",
+                fixture["home_en"], fixture["away_en"], _SCHEDULER_INTERVAL,
+            )
+            continue
+
+        text = alerts.format_lineup(parsed)
+        if not text:
+            logger.warning(
+                "Official lineup formatting returned no text for %s vs %s",
+                fixture["home_en"], fixture["away_en"],
+            )
+            continue
+
+        await client.send_message(target_channel, text, parse_mode="html")
+        _mark_posted(posted_key)
+        logger.info(
+            "Posted official lineups for %s vs %s",
+            fixture["home_en"], fixture["away_en"],
+        )
+        await asyncio.sleep(2)
 
 
 async def _check_game_points(client, target_channel, games):
-    fixtures = livefpl.get_finished_fixtures()
+    # LiveFPL is the authoritative source for the current match status.  The
+    # official FPL API can leave `finished=false` while bonus/stat processing
+    # is still provisional, so filtering the DB here drops valid Done games.
+    fixtures = livefpl.get_fixtures()
     fixture_map = {(f["home_en"], f["away_en"]): f for f in fixtures}
 
     for g in games:
-        if g[4] != "Done":
+        if not livefpl.is_game_finished(g):
             continue
 
         home_en = g[0]
@@ -100,14 +174,17 @@ async def _check_game_points(client, target_channel, games):
 
 
 async def _check_eo_post(client, target_channel):
-    if _already_posted(_EO_POSTED_KEY):
-        return
-
     # Get the latest deadline that has passed
     gw = db.query_one(
-        "SELECT id, deadline_time FROM gameweeks WHERE finished=1 OR is_current=1 ORDER BY id DESC LIMIT 1"
+        "SELECT id, deadline_time FROM gameweeks "
+        "WHERE datetime(deadline_time) <= datetime('now') "
+        "ORDER BY id DESC LIMIT 1"
     )
     if not gw:
+        return
+
+    posted_key = f"{_EO_POSTED_KEY}_{gw['id']}"
+    if _already_posted(posted_key):
         return
 
     deadline_utc = datetime.strptime(
@@ -120,12 +197,12 @@ async def _check_eo_post(client, target_channel):
     if now_utc < post_time:
         return
 
-    text = livefpl.build_eo_text()
+    text = livefpl.build_eo_text(gameweek_id=gw["id"])
     if not text:
         return
 
     await client.send_message(target_channel, text, parse_mode="html")
-    _mark_posted(_EO_POSTED_KEY)
+    _mark_posted(posted_key)
     logger.info("Posted EO leaderboard for GW%d", gw["id"])
 
 

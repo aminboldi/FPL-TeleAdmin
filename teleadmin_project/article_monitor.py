@@ -277,9 +277,11 @@ def _is_fff_article(url: str) -> bool:
 
 
 def discover_candidates() -> list[Candidate]:
-    """Fetch the latest candidates from all four supported sources."""
+    """Fetch the latest candidates from the configured automatic sources."""
+    # Premier League URLs remain supported for explicit/manual imports, but
+    # the site's automatic feed is intentionally disabled due to poor FPL
+    # article classification.
     sources = (
-        ("premierleague", _premier_league_candidates),
         ("fantasyfootballfix", lambda: _listing_candidates(
             "fantasyfootballfix", "https://www.fantasyfootballfix.com/blog-index/", _is_fff_article
         )),

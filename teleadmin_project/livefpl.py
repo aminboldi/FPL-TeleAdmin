@@ -278,7 +278,7 @@ def _eo_player_line(player: dict | None, name: str, eo: float) -> str:
     return line
 
 
-def build_eo_text() -> str | None:
+def build_eo_text(gameweek_id: int | None = None) -> str | None:
     global _games_cache
     if _games_cache is None:
         try:
@@ -302,7 +302,16 @@ def build_eo_text() -> str | None:
     names = [name for name, _ in sorted_players]
     db_players = _resolve_players(names)
 
-    lines = ["\u0645\u0627\u0644\u06a9\u06cc\u062a \u0645\u0648\u062b\u0631 (EO) \u0628\u0627\u0632\u06cc\u06a9\u0646\u0627\u0646 \u2014 GW38", ""]
+    if gameweek_id is None:
+        gameweek_id = db.query_scalar(
+            "SELECT id FROM gameweeks WHERE is_current = 1 OR is_next = 1 "
+            "ORDER BY is_current DESC, id DESC LIMIT 1"
+        )
+    gameweek_label = f"GW{gameweek_id}" if gameweek_id else "EO"
+    lines = [
+        f"\u0645\u0627\u0644\u06a9\u06cc\u062a \u0645\u0648\u062b\u0631 (EO) \u0628\u0627\u0632\u06cc\u06a9\u0646\u0627\u0646 \u2014 {gameweek_label}",
+        "",
+    ]
 
     for idx, (name, (eo, team)) in enumerate(sorted_players):
         if round(eo) < _EO_THRESHOLD:
@@ -336,7 +345,25 @@ _games_cache = None
 def _fetch_games():
     resp = requests.get(_API_URL, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    games = resp.json()
+    if not isinstance(games, list):
+        raise ValueError("LiveFPL games response has an unexpected shape")
+    return games
+
+
+def refresh_games() -> list | None:
+    """Fetch the current LiveFPL snapshot, retaining the last good snapshot on failure."""
+    global _games_cache
+    try:
+        _games_cache = _fetch_games()
+    except Exception as exc:
+        logger.warning("Failed to refresh LiveFPL games API: %s", exc)
+    return _games_cache
+
+
+def is_game_finished(game: list) -> bool:
+    """Handle the status values used by current and older LiveFPL responses."""
+    return len(game) > 4 and str(game[4]).strip().lower() in {"done", "finished"}
 
 
 def build_price_changes_text() -> str | None:
@@ -428,7 +455,29 @@ def get_finished_fixtures(gameweek_id: int | None = None) -> list[dict]:
            FROM fixtures f
            JOIN teams ht ON f.team_h = ht.id
            JOIN teams at ON f.team_a = at.id
-           WHERE f.gameweek_id = ? AND f.finished = 1
+           WHERE f.gameweek_id = ?
+             AND (
+                 f.finished = 1
+                 OR (
+                     f.finished = 0
+                     AND f.team_h_score IS NOT NULL
+                     AND f.team_a_score IS NOT NULL
+                     AND f.minutes >= 90
+                 )
+             )
            ORDER BY f.kickoff_time""",
         (gameweek_id,),
+    )
+
+
+def get_fixtures() -> list[dict]:
+    """Return all known fixtures for matching against LiveFPL's current snapshot."""
+    return db.query(
+        """SELECT f.*, ht.short_name_fa as home_fa, at.short_name_fa as away_fa,
+                  ht.name as home_en, at.name as away_en,
+                  ht.short_name as home_code, at.short_name as away_code
+           FROM fixtures f
+           JOIN teams ht ON f.team_h = ht.id
+           JOIN teams at ON f.team_a = at.id
+           ORDER BY f.kickoff_time"""
     )

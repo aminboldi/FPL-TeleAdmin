@@ -546,6 +546,69 @@ def _clean_ffscout_article_html(source_html: str) -> str:
     return str(entry)
 
 
+def _ffscout_credentials() -> tuple[str, str] | None:
+    email = os.getenv("FFSCOUT_EMAIL", "").strip()
+    password = os.getenv("FSCOUT_PASS", "")
+    return (email, password) if email and password else None
+
+
+def _fetch_ffscout_article(url: str) -> requests.Response:
+    """Fetch FFScout with the optional credentials configured in .env."""
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    response = session.get(url, timeout=20, allow_redirects=True)
+
+    credentials = _ffscout_credentials()
+    if not credentials:
+        return response
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    login_form = soup.find(
+        "form",
+        action=lambda value: value and "wp-login.php" in value,
+    )
+    if login_form is None:
+        logger.info("FFScout login form was not present for %s", url)
+        return response
+
+    data = {}
+    for field in login_form.find_all("input"):
+        name = field.get("name")
+        field_type = (field.get("type") or "text").lower()
+        if name and field_type not in {"submit", "button"}:
+            data[name] = field.get("value", "")
+    data["log"], data["pwd"] = credentials
+    if login_form.find("input", attrs={"name": "rememberme"}):
+        data["rememberme"] = "forever"
+
+    submit = login_form.find("input", attrs={"name": "wp-submit"})
+    if submit:
+        data["wp-submit"] = submit.get("value") or "Log In"
+    login_url = urljoin(response.url, login_form.get("action") or "/wp-login.php")
+    login_response = session.post(
+        login_url,
+        data=data,
+        headers={"Referer": response.url},
+        timeout=20,
+        allow_redirects=True,
+    )
+    login_text = login_response.text.lower()
+    login_failed = any(
+        marker in login_text
+        for marker in (
+            "incorrect password",
+            "invalid username",
+            "login failed",
+            "error: the password",
+        )
+    )
+    if login_failed:
+        logger.warning("FFScout login was rejected; using the public response for %s", url)
+        return response
+
+    return session.get(url, timeout=20, allow_redirects=True)
+
+
 def _is_allaboutfpl_article_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.hostname in _ALLABOUTFPL_HOSTS
@@ -613,7 +676,10 @@ def fetch_general_article(url: str) -> dict | None:
     if not url.startswith(("http://", "https://")):
         return None
     try:
-        response = requests.get(url, headers=_HEADERS, timeout=20, allow_redirects=True)
+        if _is_ffscout_article_url(url):
+            response = _fetch_ffscout_article(url)
+        else:
+            response = requests.get(url, headers=_HEADERS, timeout=20, allow_redirects=True)
     except requests.RequestException as exc:
         logger.info("Could not fetch general article %s: %s", url, exc)
         return None

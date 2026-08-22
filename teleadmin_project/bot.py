@@ -19,6 +19,7 @@ from telethon.tl.types import (
     Channel,
     MessageEntityBlockquote,
     MessageEntityTextUrl,
+    User,
 )
 
 from config import load_config
@@ -73,6 +74,11 @@ _ALBUM_TIMEOUT = 5
 # characters for a source→Persian expansion and an optional visible link label.
 # HTML tags and link URLs are not counted after Telegram parses the caption.
 _ARTICLE_SOURCE_THRESHOLD = 940
+# Media captions are limited to 1,024 rendered characters. Keep the short
+# article heuristic conservative because Persian translation can expand and
+# the caption also contains the article header, source link, and signature.
+_SHORT_ARTICLE_SOURCE_LIMIT = 700
+_SHORT_ARTICLE_CAPTION_LIMIT = 950
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
 _YOUTUBE_DESCRIPTION_PREVIEW_LIMIT = 500
 _CATALOG_VISIBILITY_LOOKBACK = timedelta(days=3)
@@ -96,6 +102,7 @@ _schedule_slot_lock = asyncio.Lock()
 _QUEUE_RESERVATION_GRACE_SECONDS = 45
 _queue_reservations: dict[str, dict[tuple[int, int, int, int, int], tuple[datetime, float]]] = {}
 _youtube_failure_notified: set[str] = set()
+_automatic_alert_lock = asyncio.Lock()
 
 
 def _target_channel() -> str:
@@ -114,12 +121,12 @@ def _catalog_source_tag(event, fallback: str = "Telegram") -> str:
 def _telegram_source_list() -> str:
     sources = runtime_config.telegram_sources()
     if not sources:
-        return "هیچ کانال تلگرامی به‌عنوان منبع ثبت نشده است."
+        return "هیچ منبع تلگرامی به‌عنوان منبع ثبت نشده است."
     rows = [
         f"<blockquote><b>{_escape_html(source['title'])}</b>\n<code>{_escape_html(source['source_ref'])}</code></blockquote>"
         for source in sources
     ]
-    return "<b>📡 کانال‌های منبع تلگرام</b>\n\n" + "\n".join(rows)
+    return "<b>📡 منابع تلگرام</b>\n\n" + "\n".join(rows)
 
 
 def _normalise_source_reference(value: str) -> str:
@@ -140,9 +147,16 @@ async def _resolve_telegram_source(value: str) -> tuple[int, str, str]:
         entity = await client.get_entity(reference)
     except Exception as exc:
         raise ValueError("کانال پیدا نشد؛ مطمئن شوید حساب TeleAdmin به آن دسترسی دارد.") from exc
-    if not isinstance(entity, Channel) or not entity.broadcast:
-        raise ValueError("فقط کانال‌های تلگرامی می‌توانند منبع باشند.")
-    title = (entity.title or entity.username or str(entity.id)).strip()
+    is_broadcast_channel = isinstance(entity, Channel) and entity.broadcast
+    is_alert_bot = isinstance(entity, User) and entity.bot
+    if not (is_broadcast_channel or is_alert_bot):
+        raise ValueError("فقط کانال‌های پخش یا ربات‌های هشدار می‌توانند منبع باشند.")
+    title = (
+        getattr(entity, "title", None)
+        or getattr(entity, "first_name", None)
+        or getattr(entity, "username", None)
+        or str(entity.id)
+    ).strip()
     source_ref = f"@{entity.username}" if entity.username else str(entity.id)
     return entity.id, title, source_ref
 
@@ -151,7 +165,7 @@ async def _add_telegram_source(value: str, actor_id: int) -> str:
     channel_id, title, source_ref = await _resolve_telegram_source(value)
     if not runtime_config.add_telegram_source(channel_id, title, source_ref, actor_id):
         return f"<b>{_escape_html(title)}</b> از قبل در فهرست منابع است."
-    return f"✅ کانال <b>{_escape_html(title)}</b> به فهرست منابع اضافه شد."
+    return f"✅ منبع <b>{_escape_html(title)}</b> به فهرست منابع اضافه شد."
 
 
 async def _remove_telegram_source(value: str, actor_id: int) -> str:
@@ -167,12 +181,13 @@ async def _remove_telegram_source(value: str, actor_id: int) -> str:
     removed = runtime_config.remove_telegram_source(channel_id, actor_id)
     if not removed:
         return f"<b>{_escape_html(title)}</b> در فهرست منابع نیست."
-    return f"✅ کانال <b>{_escape_html(removed)}</b> از فهرست منابع حذف شد."
+    return f"✅ منبع <b>{_escape_html(removed)}</b> از فهرست منابع حذف شد."
 
 
 async def _handle_configured_source_message(event) -> None:
-    channel_id = getattr(getattr(event.message, "peer_id", None), "channel_id", None)
-    if channel_id is None or not runtime_config.is_telegram_source(channel_id):
+    peer = getattr(event.message, "peer_id", None)
+    source_id = getattr(peer, "channel_id", None) or getattr(peer, "user_id", None)
+    if source_id is None or not runtime_config.is_telegram_source(source_id):
         return
     await handle_new_message(event)
 
@@ -202,6 +217,14 @@ def _strip_quotes(text: str) -> str:
 
 def _strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
+
+
+def _rendered_text_length(text: str) -> int:
+    return len(html_lib.unescape(_strip_html_tags(text)))
+
+
+def _strip_article_images(text: str) -> str:
+    return re.sub(r"<img\b[^>]*>", "", text, flags=re.IGNORECASE)
 
 
 def _article_title(text: str, fallback: str = "مقاله فانتزی") -> str:
@@ -260,6 +283,21 @@ def _format_telegraph_post(
         f"👈👈متن کامل فارسی مقاله👉👉</a></b>"
     )
     return f"{post}\n\n{AI_SIGNATURE}"
+
+
+def _format_short_article_post(
+    title: str, body: str, original_url: str, *, source_name: str = "",
+) -> str:
+    source_suffix = f" {_escape_html(source_name)}" if source_name else ""
+    body = _telegraph_to_telegram_html(_strip_article_images(body))
+    parts = [
+        f"<b>✍ مقاله جدید{source_suffix}</b>",
+        f"<b>{_escape_html(title)}</b>",
+        body,
+        f'<a href="{_escape_html(original_url)}">منبع اصلی مقاله</a>',
+        AI_SIGNATURE,
+    ]
+    return "\n\n".join(part for part in parts if part)
 
 
 def _format_youtube_telegraph_post(
@@ -745,8 +783,19 @@ async def _post_price_changes(farsi_text: str | list, fallers: list | None = Non
     logger.info("Posted price changes to %s", _target_channel())
 
 
-async def _send_alert(farsi_text: str, event):
+def _alert_seen(key: str) -> bool:
+    return db.query_scalar("SELECT value FROM last_updated WHERE key = ?", (key,)) is not None
+
+
+def _mark_alert_seen(key: str) -> None:
+    with db._connect() as conn:
+        db._set_updated(conn, key)
+
+
+async def _send_alert(farsi_text: str, event, *, dedup_key: str | None = None):
     await _send_to_target(farsi_text, event=event)
+    if dedup_key:
+        _mark_alert_seen(dedup_key)
     logger.info("Sent game alert to %s", _target_channel())
     await _send_notification(event, farsi_text)
 
@@ -758,18 +807,19 @@ async def _try_handle_automatic_content(text: str, event) -> bool:
         if parsed:
             farsi = alerts.format_farsi(parsed)
             if farsi:
-                logger.info("Detected game-action alert, formatting directly")
-                await _send_alert(farsi, event)
+                alert_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                key = f"automatic_game_alert_{alert_day}_{alerts.dedup_key(parsed)}"
+                async with _automatic_alert_lock:
+                    if _alert_seen(key):
+                        logger.info("Skipping duplicate game alert from a later source message")
+                        return True
+                    logger.info("Detected game-action alert, formatting directly")
+                    await _send_alert(farsi, event, dedup_key=key)
                 return True
 
     if alerts.is_lineup(text):
-        parsed = alerts.parse_lineup(text)
-        if parsed:
-            farsi = alerts.format_lineup(parsed)
-            if farsi:
-                logger.info("Detected lineup, formatting directly")
-                await _send_alert(farsi, event)
-                return True
+        logger.info("Ignoring source-channel lineup; official scheduler owns lineup posts")
+        return True
 
     if price_changes.is_price_change(text):
         parsed = price_changes.parse_price_change(text)
@@ -849,9 +899,8 @@ async def _finish_album(gid: int):
             if parsed:
                 caption = alerts.format_farsi(parsed) or raw_text
         elif alerts.is_lineup(raw_text):
-            parsed = alerts.parse_lineup(raw_text)
-            if parsed:
-                caption = alerts.format_lineup(parsed) or raw_text
+            logger.info("Ignoring source-channel lineup album")
+            return
         else:
             try:
                 first_evt = events[0]
@@ -1073,11 +1122,18 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
         )
     else:
         raw_html = articles.build_general_article_html(article)
+
+    short_html = _strip_article_images(raw_html)
+    source_length = _rendered_text_length(short_html)
+    is_short_article = source_length <= _SHORT_ARTICLE_SOURCE_LIMIT
     raw_html = articles.remove_images_from_html(
         raw_html, [feature_image], article.get("url", url)
     )
 
-    translation_html, inline_images = articles.prepare_article_html(raw_html)
+    if is_short_article:
+        translation_html, inline_images = short_html, []
+    else:
+        translation_html, inline_images = articles.prepare_article_html(raw_html)
     result = await translator.translate_article(translation_html)
     title = _article_title(
         _fix_unclosed_tags(_strip_quotes(result.get("title", ""))), article["title"]
@@ -1086,6 +1142,39 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     translated = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
     if not translated.strip():
         raise RuntimeError("Article translation was empty.")
+
+    if is_short_article:
+        caption = _format_short_article_post(
+            title,
+            translated,
+            article["url"],
+            source_name=article.get("source_name", ""),
+        )
+        if _rendered_text_length(caption) <= _SHORT_ARTICLE_CAPTION_LIMIT:
+            feature_path = await asyncio.to_thread(
+                _download_remote_media, feature_image, "photo"
+            )
+            try:
+                await _send_to_target(
+                    caption, file_path=feature_path, event=event, queue=True
+                )
+                if event:
+                    await _send_notification(event, caption, is_media=True)
+                else:
+                    await _send_notification(None, caption, source="Article", is_media=True)
+            finally:
+                Path(feature_path).unlink(missing_ok=True)
+            logger.info(
+                "Published short article as a featured-image post (%d source chars, %d caption chars)",
+                source_length,
+                _rendered_text_length(caption),
+            )
+            return True
+        logger.info(
+            "Short article expanded beyond the media-caption limit (%d chars); using Telegraph",
+            _rendered_text_length(caption),
+        )
+
     # Prefer the image positions represented in the extracted article HTML.
     # The article-level image list is only a fallback for pages whose reader
     # mode omitted all inline images (for example, lazy-loaded images).
@@ -1637,8 +1726,9 @@ async def _prepare_dashboard_content(kind: str) -> str:
     elif kind == "lineups":
         return (
             "<b>📋 ترکیب‌ها</b>\n\n"
-            "ترکیب‌ها به‌صورت خودکار از کانال‌های منبع دریافت، با نام و قیمت فارسی "
-            "فرمت و بدون تأخیر منتشر می‌شوند. برای این بخش انتشار دستی لازم نیست."
+            "ترکیب‌ها ۷۵ دقیقه پیش از شروع هر بازی از منبع رسمی لیگ برتر بررسی، "
+            "با نام و قیمت فارسی فرمت و به‌صورت خودکار منتشر می‌شوند. "
+            "برای این بخش انتشار دستی لازم نیست."
         )
     else:
         raise RuntimeError("نوع محتوا پشتیبانی نمی‌شود.")
