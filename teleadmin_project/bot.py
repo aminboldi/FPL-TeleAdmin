@@ -1435,6 +1435,9 @@ async def _translate_dashboard_submission(event) -> str:
     """Translate an admin's private bot submission through the normal pipeline."""
     _refresh_translator_model()
     text = event.message.text or ""
+    if text and await _try_handle_automatic_content(text, event):
+        return "✅ هشدار خودکار بدون ترجمه ارسال شد."
+
     html = _strip_quotes(_strip_hashtags(_message_to_html(text, event.message.entities)))
     links = _extract_urls(event)
     link_url = await _display_link_url(links)

@@ -55,7 +55,9 @@ _HASHTAG_RE = re.compile(r"#FPL\s*#(\w{3})(\w{3})", re.IGNORECASE)
 
 def _strip_markdown_links(text: str) -> str:
     """Keep visible text from markdown links while dropping their URLs."""
-    return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    # X/Telegram copies can leave markdown escape slashes in plain text.
+    return text.replace("\\", "")
 
 
 def _find_score(text: str):
@@ -121,7 +123,7 @@ def parse(text: str) -> ParsedAlert | None:
             end = score_m.start()
 
         action_type = m.group(1).capitalize()
-        raw = text[m.end():end].strip()
+        raw = re.sub(r"\s+", " ", text[m.end():end]).strip()
         if not raw:
             continue
         detail = None
