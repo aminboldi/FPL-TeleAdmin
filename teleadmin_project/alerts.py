@@ -27,6 +27,8 @@ _ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]")
+
 _SCORE_RE = re.compile(
     r"^(.+?)\s+(\d+)\s*[-–—]\s*(\d+)\s+(.+?)\s*\((\d+(?:\+\d+)?)\s*(?:mins?|min)?\s*\)\s*$",
     re.MULTILINE,
@@ -98,6 +100,12 @@ def is_game_alert(text: str) -> bool:
     if not text:
         return False
     text = _strip_markdown_links(text)
+    if _EMOJI_RE.search(text):
+        return False
+    action_matches = list(_ACTION_RE.finditer(text))
+    action_names = {match.group(1).casefold() for match in action_matches}
+    if "assist" in action_names and "goal" not in action_names:
+        return False
     has_action = bool(_ACTION_RE.search(text))
     has_score = bool(_find_score(text))
     return has_action and has_score
@@ -105,10 +113,15 @@ def is_game_alert(text: str) -> bool:
 
 def parse(text: str) -> ParsedAlert | None:
     text = _strip_markdown_links(text)
+    if _EMOJI_RE.search(text):
+        return None
     alert = ParsedAlert()
 
     score_m = _find_score(text)
     action_matches = list(_ACTION_RE.finditer(text))
+    action_names = {match.group(1).casefold() for match in action_matches}
+    if "assist" in action_names and "goal" not in action_names:
+        return None
     for index, m in enumerate(action_matches):
         if score_m and m.start() >= score_m.start():
             continue
