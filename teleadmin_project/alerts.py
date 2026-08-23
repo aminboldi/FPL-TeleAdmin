@@ -205,14 +205,21 @@ def _resolve_player(
            JOIN positions pos ON players.position_id = pos.id
            JOIN teams t ON players.team_id = t.id
            WHERE lower(web_name) = lower(?)
-              OR lower(alias) = lower(?)
               OR lower(search_name) LIKE lower(?)
+              OR alias IS NOT NULL
            ORDER BY
              CASE WHEN t.short_name IN (?, ?) THEN 0 ELSE 1 END,
              total_points DESC""",
-        (normalized, normalized, f"%{normalized}%", home_team_code, away_team_code),
+        (normalized, f"%{normalized}%", home_team_code, away_team_code),
     )
-    return results[0] if results else None
+    for player in results:
+        if (
+            _normalize(player["web_name"]).casefold() == normalized.casefold()
+            or db.alias_matches(player.get("alias"), name)
+            or normalized.casefold() in _normalize(player["search_name"]).casefold()
+        ):
+            return player
+    return None
 
 
 def _price_display(player: dict) -> str:
@@ -406,6 +413,14 @@ def is_lineup(text: str) -> bool:
     if not text:
         return False
     return bool(_LINEUP_HEADER_RE.search(text))
+
+
+def lineup_dedup_key(parsed: dict, day: str) -> str:
+    """Identify one fixture's lineup across source feeds and the API watcher."""
+    return (
+        f"automatic_lineup_{day}_"
+        f"{parsed.get('home_code', '').upper()}_{parsed.get('away_code', '').upper()}"
+    )
 
 
 def parse_lineup(text: str) -> dict | None:

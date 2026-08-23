@@ -57,7 +57,8 @@ def init() -> None:
                 channel_id INTEGER PRIMARY KEY,
                 title TEXT NOT NULL,
                 source_ref TEXT NOT NULL,
-                added_at TEXT NOT NULL
+                added_at TEXT NOT NULL,
+                automatic_only INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS article_monitor_seen (
                 url TEXT PRIMARY KEY,
@@ -82,6 +83,13 @@ def init() -> None:
             );
             """
         )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(telegram_sources)").fetchall()
+        }
+        if "automatic_only" not in columns:
+            conn.execute(
+                "ALTER TABLE telegram_sources ADD COLUMN automatic_only INTEGER NOT NULL DEFAULT 0"
+            )
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             "DELETE FROM settings WHERE key IN (?, ?, ?)",
@@ -355,11 +363,11 @@ def telegram_sources() -> list[dict]:
     init()
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT channel_id, title, source_ref, added_at "
+            "SELECT channel_id, title, source_ref, added_at, automatic_only "
             "FROM telegram_sources ORDER BY title COLLATE NOCASE"
         ).fetchall()
     return [
-        dict(zip(("channel_id", "title", "source_ref", "added_at"), row))
+        dict(zip(("channel_id", "title", "source_ref", "added_at", "automatic_only"), row))
         for row in rows
     ]
 
@@ -372,41 +380,70 @@ def is_telegram_source(channel_id: int) -> bool:
         ).fetchone() is not None
 
 
+def telegram_source_is_automatic_only(channel_id: int) -> bool:
+    init()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT automatic_only FROM telegram_sources WHERE channel_id=?",
+            (channel_id,),
+        ).fetchone()
+    return bool(row and row[0])
+
+
 def telegram_source_by_reference(reference: str) -> dict | None:
     """Look up a source by its saved @username or numeric channel ID."""
     init()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT channel_id, title, source_ref, added_at FROM telegram_sources "
+            "SELECT channel_id, title, source_ref, added_at, automatic_only FROM telegram_sources "
             "WHERE source_ref=? OR CAST(channel_id AS TEXT)=?",
             (reference, reference.lstrip("-")),
         ).fetchone()
     if not row:
         return None
-    return dict(zip(("channel_id", "title", "source_ref", "added_at"), row))
+    return dict(zip(("channel_id", "title", "source_ref", "added_at", "automatic_only"), row))
 
 
 def add_telegram_source(
     channel_id: int, title: str, source_ref: str, actor_id: int,
+    *, automatic_only: bool = False,
 ) -> bool:
     """Persist a source channel. Returns whether it was newly added."""
     init()
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         existing = conn.execute(
-            "SELECT title FROM telegram_sources WHERE channel_id=?", (channel_id,)
+            "SELECT title, automatic_only FROM telegram_sources WHERE channel_id=?", (channel_id,)
         ).fetchone()
         if existing:
+            if automatic_only and not existing[1]:
+                conn.execute(
+                    "UPDATE telegram_sources SET automatic_only=1 WHERE channel_id=?",
+                    (channel_id,),
+                )
+                conn.execute(
+                    "INSERT INTO audit_log (actor_id, key, old_value, new_value, changed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (actor_id, "TELEGRAM_SOURCE", f"updated: {existing[0]}", "automatic_only", now),
+                )
             return False
         conn.execute(
-            "INSERT INTO telegram_sources (channel_id, title, source_ref, added_at) "
-            "VALUES (?, ?, ?, ?)",
-            (channel_id, title, source_ref, now),
+            "INSERT INTO telegram_sources "
+            "(channel_id, title, source_ref, added_at, automatic_only) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (channel_id, title, source_ref, now, int(automatic_only)),
         )
         conn.execute(
             "INSERT INTO audit_log (actor_id, key, old_value, new_value, changed_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (actor_id, "TELEGRAM_SOURCE", "", f"added: {title} ({source_ref})", now),
+            (
+                actor_id,
+                "TELEGRAM_SOURCE",
+                "",
+                f"added: {title} ({source_ref})"
+                + (" [automatic-only]" if automatic_only else ""),
+                now,
+            ),
         )
     return True
 

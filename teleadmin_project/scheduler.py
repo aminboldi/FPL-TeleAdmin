@@ -131,8 +131,18 @@ async def _check_official_lineups(client, target_channel):
             )
             continue
 
+        lineup_key = alerts.lineup_dedup_key(parsed, fixture["kickoff_time"][:10])
+        if _already_posted(lineup_key):
+            _mark_posted(posted_key)
+            logger.info(
+                "Skipping official lineup already posted by a source for %s vs %s",
+                fixture["home_en"], fixture["away_en"],
+            )
+            continue
+
         await client.send_message(target_channel, text, parse_mode="html")
         _mark_posted(posted_key)
+        _mark_posted(lineup_key)
         logger.info(
             "Posted official lineups for %s vs %s",
             fixture["home_en"], fixture["away_en"],

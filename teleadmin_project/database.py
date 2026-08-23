@@ -295,6 +295,18 @@ def _normalize(text: str) -> str:
     )
 
 
+def alias_matches(alias: str | None, name: str) -> bool:
+    """Match one incoming name against comma-separated manual aliases."""
+    target = _normalize(str(name or "")).strip().casefold()
+    if not target:
+        return False
+    return any(
+        _normalize(part).strip().casefold() == target
+        for part in str(alias or "").split(",")
+        if part.strip()
+    )
+
+
 def _region_to_flag(region_id: int | None) -> str:
     if not region_id:
         return ""
@@ -403,7 +415,7 @@ def list_players_for_edit() -> list[dict]:
     """Return the player name fields used by the protected web editor."""
     return query(
         """
-        SELECT id, first_name, second_name, web_name,
+        SELECT id, first_name, second_name, web_name, alias,
                first_name_fa, second_name_fa, web_name_fa
         FROM players
         ORDER BY web_name COLLATE NOCASE,
@@ -415,15 +427,15 @@ def list_players_for_edit() -> list[dict]:
 
 
 def update_player_farsi_names(
-    updates: list[tuple[int, str | None, str | None, str | None]],
+    updates: list[tuple[int, str | None, str | None, str | None, str | None]],
 ) -> int:
-    """Update only Persian player-name fields in one transaction."""
+    """Update Persian names and comma-separated aliases in one transaction."""
     if not updates:
         return 0
 
     normalized = []
     seen_ids = set()
-    for player_id, first_name_fa, second_name_fa, web_name_fa in updates:
+    for player_id, first_name_fa, second_name_fa, web_name_fa, alias in updates:
         player_id = int(player_id)
         if player_id in seen_ids:
             raise ValueError("duplicate player id")
@@ -433,8 +445,23 @@ def update_player_farsi_names(
             value = str(value or "").strip()
             return value or None
 
+        aliases = []
+        seen_aliases = set()
+        for item in str(alias or "").split(","):
+            item = item.strip()
+            key = _normalize(item).casefold()
+            if item and key not in seen_aliases:
+                aliases.append(item)
+                seen_aliases.add(key)
+
         normalized.append(
-            (clean(first_name_fa), clean(second_name_fa), clean(web_name_fa), player_id)
+            (
+                clean(first_name_fa),
+                clean(second_name_fa),
+                clean(web_name_fa),
+                ", ".join(aliases) or None,
+                player_id,
+            )
         )
 
     with _connect() as conn:
@@ -442,7 +469,7 @@ def update_player_farsi_names(
             result = conn.execute(
                 """
                 UPDATE players
-                SET first_name_fa = ?, second_name_fa = ?, web_name_fa = ?
+                SET first_name_fa = ?, second_name_fa = ?, web_name_fa = ?, alias = ?
                 WHERE id = ?
                 """,
                 values,

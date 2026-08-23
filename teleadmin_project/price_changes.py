@@ -111,6 +111,8 @@ def _resolve_player(name: str, team_code: str) -> dict | None:
     for player in results:
         if normalize(player["web_name"]).lower() == norm:
             return player
+        if db.alias_matches(player.get("alias"), name):
+            return player
         full_name = normalize(
             f"{player['first_name']} {player['second_name']}"
         ).lower()

@@ -358,13 +358,14 @@ def _players_page(players: list[dict], message: str = "") -> str:
               <td class="english" dir="ltr">{value('web_name')}</td>
               <td class="english" dir="ltr">{value('second_name')}</td>
               <td class="english" dir="ltr">{value('first_name')}</td>
+              <td><input name="alias" value="{value('alias')}" autocomplete="off" dir="ltr" placeholder="Alias 1, Alias 2"></td>
             </tr>
             """
         )
     message_html = f'<p class="success">{html.escape(message)}</p>' if message else ""
     body = f"""
 <h1>ویرایش نام بازیکنان</h1>
-<p class="note">نام‌های انگلیسی فقط برای مرجع نمایش داده می‌شوند. تغییرات مستقیماً در پایگاه‌دادهٔ تولیدی ذخیره می‌شوند و پس از استقرار مجدد نیز باقی می‌مانند.</p>
+<p class="note">نام‌های انگلیسی فقط برای مرجع نمایش داده می‌شوند. نام‌های مستعار را با کاما جدا کنید؛ تغییرات مستقیماً در پایگاه‌دادهٔ تولیدی ذخیره می‌شوند و پس از استقرار مجدد نیز باقی می‌مانند.</p>
 {message_html}
 <input id="player-search" class="search" type="search" placeholder="جست‌وجوی بازیکن" autocomplete="off">
 <form method="post" action="{_PLAYERS_PATH}" id="players-form">
@@ -372,9 +373,9 @@ def _players_page(players: list[dict], message: str = "") -> str:
     <table>
       <thead><tr>
         <th>نام نمایشی فارسی</th><th>نام خانوادگی فارسی</th><th>نام فارسی</th>
-        <th>نام نمایشی انگلیسی</th><th>نام خانوادگی انگلیسی</th><th>نام انگلیسی</th>
+        <th>نام نمایشی انگلیسی</th><th>نام خانوادگی انگلیسی</th><th>نام انگلیسی</th><th>نام‌های مستعار انگلیسی</th>
       </tr></thead>
-      <tbody id="player-rows">{"".join(rows) or '<tr><td colspan="6">بازیکنی پیدا نشد.</td></tr>'}</tbody>
+      <tbody id="player-rows">{"".join(rows) or '<tr><td colspan="7">بازیکنی پیدا نشد.</td></tr>'}</tbody>
     </table>
   </div>
   <button class="save" type="submit">ذخیرهٔ تغییرات</button>
@@ -755,17 +756,19 @@ async def handle_http(reader, writer) -> None:
                 first_names = fields.get("first_name_fa", [])
                 second_names = fields.get("second_name_fa", [])
                 web_names = fields.get("web_name_fa", [])
+                aliases = fields.get("alias", [])
                 if not (
                     player_ids
                     and len(player_ids) == len(first_names)
                     and len(player_ids) == len(second_names)
                     and len(player_ids) == len(web_names)
+                    and len(player_ids) == len(aliases)
                 ):
                     raise ValueError("اطلاعات نام بازیکنان ناقص است.")
                 updates = [
-                    (int(player_id), first_name, second_name, web_name)
-                    for player_id, first_name, second_name, web_name in zip(
-                        player_ids, first_names, second_names, web_names
+                    (int(player_id), first_name, second_name, web_name, alias)
+                    for player_id, first_name, second_name, web_name, alias in zip(
+                        player_ids, first_names, second_names, web_names, aliases
                     )
                 ]
                 changed = await asyncio.to_thread(database.update_player_farsi_names, updates)

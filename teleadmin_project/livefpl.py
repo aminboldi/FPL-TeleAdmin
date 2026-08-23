@@ -56,9 +56,9 @@ def _resolve_players(names: list[str]) -> dict[str, dict | None]:
            JOIN positions pos ON players.position_id = pos.id
            JOIN teams t ON players.team_id = t.id
            WHERE lower(search_name) IN ({placeholders})
-              OR lower(alias) IN ({placeholders})
-              OR lower(web_name) IN ({placeholders})""",
-        tuple(lower_names + lower_names + lower_names),
+              OR lower(web_name) IN ({placeholders})
+              OR alias IS NOT NULL""",
+        tuple(lower_names + lower_names),
     )
 
     mapping: dict[str, dict] = {}
@@ -67,7 +67,7 @@ def _resolve_players(names: list[str]) -> dict[str, dict | None]:
             norm = normalize(name).lower()
             if (
                 normalize(player["web_name"]).lower() == norm
-                or normalize(player.get("alias") or "").lower() == norm
+                or db.alias_matches(player.get("alias"), name)
                 or normalize(player["search_name"]).lower() == norm
             ):
                 mapping[name] = player

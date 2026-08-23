@@ -85,6 +85,7 @@ _CATALOG_VISIBILITY_LOOKBACK = timedelta(days=3)
 # Photo captions are limited to 1,024 rendered characters.  This leaves room
 # for the YouTube header, title, original-video link, and AI signature.
 _YOUTUBE_INLINE_TRANSCRIPT_LIMIT = 800
+_AUTOMATIC_ONLY_SOURCE_REFS = ("@FPLFootball",)
 
 _album_buffer: dict[int, list] = {}
 _album_tasks: dict[int, asyncio.Task] = {}
@@ -122,7 +123,10 @@ def _telegram_source_list() -> str:
     if not sources:
         return "هیچ منبع تلگرامی به‌عنوان منبع ثبت نشده است."
     rows = [
-        f"<blockquote><b>{_escape_html(source['title'])}</b>\n<code>{_escape_html(source['source_ref'])}</code></blockquote>"
+        f"<blockquote><b>{_escape_html(source['title'])}</b>\n"
+        f"<code>{_escape_html(source['source_ref'])}</code>"
+        + ("\nفقط هشدار و ترکیب خودکار" if source.get("automatic_only") else "")
+        + "</blockquote>"
         for source in sources
     ]
     return "<b>📡 منابع تلگرام</b>\n\n" + "\n".join(rows)
@@ -162,9 +166,15 @@ async def _resolve_telegram_source(value: str) -> tuple[int, str, str]:
 
 async def _add_telegram_source(value: str, actor_id: int) -> str:
     channel_id, title, source_ref = await _resolve_telegram_source(value)
-    if not runtime_config.add_telegram_source(channel_id, title, source_ref, actor_id):
+    automatic_only = source_ref.casefold() in {
+        value.casefold() for value in _AUTOMATIC_ONLY_SOURCE_REFS
+    }
+    if not runtime_config.add_telegram_source(
+        channel_id, title, source_ref, actor_id, automatic_only=automatic_only
+    ):
         return f"<b>{_escape_html(title)}</b> از قبل در فهرست منابع است."
-    return f"✅ منبع <b>{_escape_html(title)}</b> به فهرست منابع اضافه شد."
+    mode = " (فقط هشدار و ترکیب خودکار)" if automatic_only else ""
+    return f"✅ منبع <b>{_escape_html(title)}</b>{mode} به فهرست منابع اضافه شد."
 
 
 async def _remove_telegram_source(value: str, actor_id: int) -> str:
@@ -188,7 +198,27 @@ async def _handle_configured_source_message(event) -> None:
     source_id = getattr(peer, "channel_id", None) or getattr(peer, "user_id", None)
     if source_id is None or not runtime_config.is_telegram_source(source_id):
         return
-    await handle_new_message(event)
+    await handle_new_message(
+        event,
+        automatic_only=runtime_config.telegram_source_is_automatic_only(source_id),
+    )
+
+
+async def _ensure_automatic_sources() -> None:
+    """Register built-in contingency feeds after the user session is ready."""
+    for source_ref in _AUTOMATIC_ONLY_SOURCE_REFS:
+        try:
+            channel_id, title, resolved_ref = await _resolve_telegram_source(source_ref)
+            runtime_config.add_telegram_source(
+                channel_id,
+                title,
+                resolved_ref,
+                actor_id=0,
+                automatic_only=True,
+            )
+            logger.info("Automatic-only Telegram source ready: %s (%s)", title, resolved_ref)
+        except Exception as exc:
+            logger.warning("Could not register automatic-only source %s: %s", source_ref, exc)
 
 
 def _refresh_translator_model() -> None:
@@ -267,12 +297,10 @@ def _youtube_thumbnail_url(url: str) -> str:
 
 
 def _format_telegraph_post(
-    title: str, summary: str, telegraph_url: str, *, source_name: str = "",
+    title: str, summary: str, telegraph_url: str,
 ) -> str:
     summary_text = html_lib.unescape(_strip_html_tags(summary)).strip()
-    source_suffix = f" {_escape_html(source_name)}" if source_name else ""
     post = (
-        f"<b>✍ مقاله جدید{source_suffix}</b>\n\n"
         f"<b>{_escape_html(title)}</b>\n\n"
         f"- - - - - - - - -\n\n"
         f"{_escape_html(summary_text)}"
@@ -287,13 +315,15 @@ def _format_telegraph_post(
 def _format_short_article_post(
     title: str, body: str, original_url: str, *, source_name: str = "",
 ) -> str:
-    source_suffix = f" {_escape_html(source_name)}" if source_name else ""
     body = _telegraph_to_telegram_html(_strip_article_images(body))
+    source_label = (
+        f"منبع اصلی مقاله در {_escape_html(source_name)}"
+        if source_name else "منبع اصلی مقاله"
+    )
     parts = [
-        f"<b>✍ مقاله جدید{source_suffix}</b>",
         f"<b>{_escape_html(title)}</b>",
         body,
-        f'<a href="{_escape_html(original_url)}">منبع اصلی مقاله</a>',
+        f'<a href="{_escape_html(original_url)}">{source_label}</a>',
         AI_SIGNATURE,
     ]
     return "\n\n".join(part for part in parts if part)
@@ -810,7 +840,25 @@ async def _try_handle_automatic_content(text: str, event) -> bool:
                 return True
 
     if alerts.is_lineup(text):
-        logger.info("Ignoring source-channel lineup; official scheduler owns lineup posts")
+        parsed = alerts.parse_lineup(text)
+        if not parsed:
+            logger.warning("Detected lineup with an unsupported format; ignoring it")
+            return True
+        message_date = getattr(getattr(event, "message", None), "date", None)
+        day = (
+            message_date.astimezone(timezone.utc).strftime("%Y-%m-%d")
+            if message_date and message_date.tzinfo
+            else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        )
+        dedup_key = alerts.lineup_dedup_key(parsed, day)
+        async with _automatic_alert_lock:
+            if _alert_seen(dedup_key):
+                logger.info("Skipping duplicate lineup from another source")
+                return True
+            farsi = alerts.format_lineup(parsed)
+            if farsi:
+                logger.info("Detected lineup, formatting directly")
+                await _send_alert(farsi, event, dedup_key=dedup_key)
         return True
 
     if price_changes.is_price_change(text):
@@ -886,13 +934,12 @@ async def _finish_album(gid: int):
 
     caption = raw_text
     if raw_text:
+        if await _try_handle_automatic_content(raw_text, events[0]):
+            return
         if alerts.is_game_alert(raw_text):
             parsed = alerts.parse(raw_text)
             if parsed:
                 caption = alerts.format_farsi(parsed) or raw_text
-        elif alerts.is_lineup(raw_text):
-            logger.info("Ignoring source-channel lineup album")
-            return
         else:
             try:
                 first_evt = events[0]
@@ -919,7 +966,7 @@ async def _finish_album(gid: int):
     await _send_notification(events[0], caption)
 
 
-async def handle_new_message(event):
+async def handle_new_message(event, *, automatic_only: bool = False):
     _refresh_translator_model()
     text = event.message.text
     media = event.message.media
@@ -931,7 +978,11 @@ async def handle_new_message(event):
     # These source formats must stay out of the generic chunk/LLM pipeline:
     # price risers and fallers arrive as separate messages, while lineups and
     # live alerts need their database-backed Farsi formatting immediately.
-    if text and not grouped_id and await _try_handle_automatic_content(text, event):
+    if text and await _try_handle_automatic_content(text, event):
+        return
+
+    if automatic_only:
+        logger.info("Ignoring non-automatic post from automatic-only source")
         return
 
     # Merge text chunks split by Telegram's character limit
@@ -1177,7 +1228,9 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     translated = articles.restore_images_in_place(
         translated, source_images, source_html=translation_html
     )
-    translated = articles.append_original_article_link(translated, article["url"])
+    translated = articles.append_original_article_link(
+        translated, article["url"], article.get("source_name", "")
+    )
 
     feature_path = await asyncio.to_thread(
         _download_remote_media, feature_image, "photo"
@@ -1199,7 +1252,6 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
             title,
             summary,
             telegraph_url,
-            source_name=article.get("source_name", ""),
         )
         await _send_to_target(
             caption, file_path=feature_path, event=event, queue=True
@@ -1756,6 +1808,7 @@ async def main():
     logger.info("  Model  : %s", runtime_config.get("OPEN_ROUTER_MODEL"))
 
     await client.start()
+    await _ensure_automatic_sources()
     client.add_event_handler(_handle_configured_source_message, events.NewMessage(incoming=True))
     # Scheduled posts are emitted as normal channel messages when Telegram
     # publishes them. Edits are also observed in case a Telegraph link is

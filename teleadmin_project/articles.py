@@ -815,12 +815,18 @@ def remove_images_from_html(
     return "".join(str(child) for child in root.contents).strip()
 
 
-def append_original_article_link(html_content: str, original_url: str) -> str:
+def append_original_article_link(
+    html_content: str, original_url: str, source_name: str = "",
+) -> str:
     """Append the source link to the end of a Telegraph article only."""
     safe_url = escape(original_url, quote=True)
+    source_label = (
+        f"منبع اصلی مقاله در {escape(source_name)}"
+        if source_name else "منبع اصلی مقاله"
+    )
     return (
         f'{html_content.rstrip()}\n\n'
-        f'<p><a href="{safe_url}">منبع اصلی مقاله</a></p>'
+        f'<p><a href="{safe_url}">{source_label}</a></p>'
     )
 
 
