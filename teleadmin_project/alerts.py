@@ -216,14 +216,13 @@ def _resolve_player(
     allowed_team_codes: tuple[str, ...] | None = None,
 ) -> dict | None:
     """Resolve a player, optionally restricting candidates to fixture clubs."""
-    normalized = _normalize(name)
-    if not normalized.strip():
+    normalized = db.normalize_player_name(name)
+    if not normalized:
         return None
-    where = (
-        "(lower(web_name) = lower(?) "
-        "OR lower(search_name) LIKE lower(?) OR alias IS NOT NULL)"
-    )
-    params: list[str] = [normalized, f"%{normalized}%"]
+    # Fetch the small relevant club set first, then normalize in Python.
+    # SQLite cannot perform accent-insensitive comparisons reliably.
+    where = "1 = 1"
+    params: list[str] = []
     if strict_team_code:
         # Lineup feeds identify the club for every player.  Restricting the
         # candidate set prevents a same-name player at another club from
@@ -249,11 +248,7 @@ def _resolve_player(
         tuple(params),
     )
     for player in results:
-        if (
-            _normalize(player["web_name"]).casefold() == normalized.casefold()
-            or db.alias_matches(player.get("alias"), name)
-            or normalized.casefold() in _normalize(player["search_name"]).casefold()
-        ):
+        if db.player_name_matches(player, name, allow_partial=True):
             return player
     return None
 

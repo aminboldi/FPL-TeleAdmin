@@ -329,16 +329,45 @@ def _normalize(text: str) -> str:
     )
 
 
+def normalize_player_name(text: str | None) -> str:
+    """Return a case- and accent-insensitive player-name key."""
+    return " ".join(_normalize(str(text or "")).split()).casefold()
+
+
 def alias_matches(alias: str | None, name: str) -> bool:
     """Match one incoming name against comma-separated manual aliases."""
-    target = _normalize(str(name or "")).strip().casefold()
+    target = normalize_player_name(name)
     if not target:
         return False
     return any(
-        _normalize(part).strip().casefold() == target
+        normalize_player_name(part) == target
         for part in str(alias or "").split(",")
         if part.strip()
     )
+
+
+def player_name_matches(player: dict, name: str, *, allow_partial: bool = False) -> bool:
+    """Match API/feed spellings against every useful FPL name field.
+
+    Normalizing both sides in Python is intentional: SQLite's built-in
+    ``lower``/``LIKE`` operations do not remove accents, so a SQL pre-filter
+    can discard Estêvão before an accent-insensitive comparison is reached.
+    """
+    target = normalize_player_name(name)
+    if not target:
+        return False
+    values = {
+        normalize_player_name(player.get(field))
+        for field in ("first_name", "second_name", "web_name", "search_name")
+    }
+    values.add(
+        normalize_player_name(
+            f"{player.get('first_name') or ''} {player.get('second_name') or ''}"
+        )
+    )
+    if target in values or alias_matches(player.get("alias"), name):
+        return True
+    return allow_partial and any(target in value for value in values if value)
 
 
 def _region_to_flag(region_id: int | None) -> str:

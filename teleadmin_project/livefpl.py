@@ -41,7 +41,8 @@ def _esc(text: str) -> str:
 
 
 def _resolve_players(
-    names: list[str], team_code: str | None = None
+    names: list[str], team_code: str | None = None,
+    *, prefer_highest_ownership: bool = False,
 ) -> dict[str, dict | None]:
     """Resolve API names, optionally restricting candidates to one team.
 
@@ -50,26 +51,11 @@ def _resolve_players(
     at multiple clubs (for example, Gomez).  Keep the unrestricted form for
     global lists, but make per-team callers constrain the SQL candidates.
     """
-    import unicodedata
-
-    def normalize(text):
-        return "".join(
-            c
-            for c in unicodedata.normalize("NFKD", text)
-            if not unicodedata.combining(c)
-        )
-
     if not names:
         return {}
 
-    placeholders = ",".join("?" for _ in names)
-    lower_names = [normalize(n).lower() for n in names]
-
-    where = (
-        f"(lower(search_name) IN ({placeholders}) "
-        f"OR lower(web_name) IN ({placeholders}) OR alias IS NOT NULL)"
-    )
-    params: list[str] = lower_names + lower_names
+    where = "1 = 1"
+    params: list[str] = []
     if team_code:
         where += " AND upper(t.short_name) = upper(?)"
         params.append(team_code)
@@ -84,17 +70,29 @@ def _resolve_players(
         tuple(params),
     )
 
-    mapping: dict[str, dict] = {}
+    candidates: dict[str, list[dict]] = {name: [] for name in names}
     for player in results:
         for name in names:
-            norm = normalize(name).lower()
-            if (
-                normalize(player["web_name"]).lower() == norm
-                or db.alias_matches(player.get("alias"), name)
-                or normalize(player["search_name"]).lower() == norm
-            ):
-                mapping[name] = player
-                break
+            if db.player_name_matches(player, name):
+                candidates[name].append(player)
+
+    def ownership(player: dict) -> float:
+        try:
+            return float(player.get("selected_by_percent") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    mapping: dict[str, dict] = {}
+    for name, matches in candidates.items():
+        if not matches:
+            continue
+        if prefer_highest_ownership:
+            mapping[name] = max(matches, key=ownership)
+        else:
+            mapping[name] = max(
+                matches,
+                key=lambda player: float(player.get("total_points") or 0),
+            )
 
     return mapping
 
@@ -325,7 +323,9 @@ def build_eo_text(gameweek_id: int | None = None) -> str | None:
 
     sorted_players = sorted(player_eo.items(), key=lambda x: x[1][0], reverse=True)
     names = [name for name, _ in sorted_players]
-    db_players = _resolve_players(names)
+    # LiveFPL's global list has no team context.  Duplicate web names are
+    # resolved to the FPL player with the larger selected-by percentage.
+    db_players = _resolve_players(names, prefer_highest_ownership=True)
 
     if gameweek_id is None:
         gameweek_id = db.query_scalar(
@@ -369,6 +369,8 @@ _games_backoff_until = 0.0
 _games_backoff_seconds = 0.0
 _official_fixtures_backoff_until = 0.0
 _official_fixtures_backoff_seconds = 0.0
+_official_fixtures_log_at = 0.0
+_official_fixtures_log_gameweek: int | None = None
 
 
 def _fetch_games():
@@ -413,11 +415,15 @@ def refresh_games() -> list | None:
 def _current_gameweek_id() -> int | None:
     """Return the active FPL event used by the official live fixture feed."""
     value = db.query_scalar(
-        "SELECT id FROM gameweeks WHERE is_current = 1 OR is_next = 1 "
-        "ORDER BY is_current DESC, id DESC LIMIT 1"
+        "SELECT id FROM gameweeks "
+        "WHERE datetime(deadline_time) <= datetime('now') "
+        "ORDER BY datetime(deadline_time) DESC LIMIT 1"
     )
     if value is None:
-        value = db.query_scalar("SELECT MAX(id) FROM gameweeks WHERE deadline_time <= datetime('now')")
+        value = db.query_scalar(
+            "SELECT id FROM gameweeks WHERE is_current = 1 OR is_next = 1 "
+            "ORDER BY is_current DESC, id DESC LIMIT 1"
+        )
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
@@ -447,6 +453,7 @@ def refresh_official_fixtures(gameweek_id: int | None = None) -> list[dict] | No
     slower/third-party LiveFPL feed entirely.
     """
     global _official_fixtures_backoff_until, _official_fixtures_backoff_seconds
+    global _official_fixtures_log_at, _official_fixtures_log_gameweek
     if gameweek_id is None:
         gameweek_id = _current_gameweek_id()
     if not gameweek_id:
@@ -457,6 +464,21 @@ def refresh_official_fixtures(gameweek_id: int | None = None) -> list[dict] | No
     try:
         result = _fetch_official_fixtures(int(gameweek_id))
         _official_fixtures_backoff_seconds = 0.0
+        if (
+            int(gameweek_id) != _official_fixtures_log_gameweek
+            or now - _official_fixtures_log_at >= 300
+        ):
+            scores = ", ".join(
+                f"{row.get('id')}:{row.get('team_h_score')}-{row.get('team_a_score')}"
+                for row in result
+            ) or "no fixtures"
+            logger.info(
+                "Official FPL goal watcher heartbeat: GW%s; %s",
+                gameweek_id,
+                scores,
+            )
+            _official_fixtures_log_at = now
+            _official_fixtures_log_gameweek = int(gameweek_id)
         return result
     except requests.HTTPError as exc:
         response = getattr(exc, "response", None)
