@@ -102,13 +102,23 @@ class AdminDashboard:
         elif text.lower().startswith("a/http://") or text.lower().startswith("a/https://"):
             text = "/a " + text[2:]
         if not text.startswith("/"):
-            await event.reply("در حال ترجمه و آماده‌سازی پست…")
+            # Forwarded messages may be part of a short burst that the
+            # translation callback merges into one article. Avoid sending one
+            # progress message per forwarded item; the batch returns one
+            # consolidated confirmation instead.
+            is_forwarded = bool(
+                getattr(event.message, "fwd_from", None)
+                or getattr(event.message, "forward", None)
+            )
+            if not is_forwarded:
+                await event.reply("در حال ترجمه و آماده‌سازی پست…")
             try:
                 result = await self.translate_submission(event)
             except Exception as exc:
                 await event.reply(f"❌ {exc}")
             else:
-                await event.reply(result, parse_mode="html")
+                if result:
+                    await event.reply(result, parse_mode="html")
             return
         command, _, arg = text.partition(" ")
         command = command.split("@", 1)[0].lower()
@@ -503,10 +513,10 @@ class AdminDashboard:
             "<b>Telegraph Articles</b>\n/articles — Open the article catalog\n/edit — Select a recent article to edit\n\n"
             "<b>Article from Link</b>\n/a https://example.com/article\nor a/https://example.com/article — Extract, translate, and publish a readable article to Telegraph\n\n"
             "<b>Leagues</b>\n/league epl or /league iran\n/activity epl or /activity iran\n\n"
-            "<b>Content (without AI)</b>\n/fixtures — Gameweek fixtures\n/points — Latest finished-match points\n/eo — Effective ownership\n/prices — LiveFPL price predictions\n/lineups — Automatic lineup status\n\n"
+            "<b>Content (without AI)</b>\n/fixtures — Gameweek fixtures\n/points — Latest finished-match points\n/eo — Effective ownership\n/prices — Official FPL price changes and predictions\n/lineups — Automatic lineup status\n\n"
             "<b>Import from X</b>\n/x https://x.com/account/status/123\nor x/https://x.com/account/status/123\n\n"
             "<b>Import from YouTube</b>\n/y https://youtube.com/watch?v=...\nor y/https://youtu.be/...\n\n"
-            "<b>Direct Translation</b>\nSend text, forwarded posts, or media without a command to translate it and add it to the channel queue.\n\n"
+            "<b>Direct Translation</b>\nSend text, forwarded posts, or media without a command to translate it and add it to the channel queue. A burst of forwarded posts is merged into one Telegraph article, with each post kept as a separate paragraph.\n\n"
             "<b>YouTube Monitoring</b>\n/youtube — List monitored channels\n/youtube add https://youtube.com/@channel\n/youtube remove UC...\n\n"
             "<b>Telegram Sources</b>\n/source — List source channels\n/source add @sourcechannel\n/source remove @sourcechannel\n\n"
             "<b>Settings</b>\n/channels\n/target @channel\n/set PRICE_PREDICTIONS_ENABLED false\n/set ARTICLE_MONITOR_ENABLED false\n/set EPL_LEAGUE_ID 12345\n\n"

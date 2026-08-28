@@ -51,6 +51,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - The BotFather dashboard is enabled only if both `TELEGRAM_BOT_TOKEN` and numeric comma-separated `ADMIN_USER_IDS` are set. It accepts private-chat commands only.
 - Main dashboard commands: `/dashboard`, `/guide`, `/channels`, `/target`, `/source`, `/set`, `/league`, `/activity`, `/balance`, `/fixtures`, `/points`, `/eo`, `/prices`, `/lineups`, `/x`, `/y`, `/a`, `/articles`, `/edit`.
 - `/a https://...` (or `a/https://...`) extracts an arbitrary article in reader mode, translates it, publishes it to Telegraph, and places the channel post in the normal half-hour review queue.
+- Forwarding a burst of Telegram posts to the private admin bot (within a short quiet window) merges their text into one Telegraph article, preserving each forwarded post as a separate source paragraph. A single forwarded post continues through the normal direct-translation path.
 - `/edit` lists the ten most recently published pages under the shared Telegraph account. After an admin selects one, it sends a private editor link that must be opened within 15 minutes; an opened editor remains valid for two hours or until a successful save. The editor loads and saves the existing page through Telegraph's `getPage`/`editPage` APIs, so the page URL stays unchanged and the raw `TELEGRAPH_ACCESS_TOKEN` never reaches the browser. The link is a temporary capability and must stay in the private admin chat.
 - `/players` is a password-protected web table using the same `TELEGRAPH_EDITOR_PASSWORD`. English FPL names are read-only; Persian first, second, and display names are written directly to the live FPL database. Use the production URL for edits so they are immediately shared with the bot.
 - Dashboard-generated content always requires an explicit publish confirmation. Lineups are source-driven and publish automatically when detected.
@@ -156,14 +157,27 @@ Formatting: `alerts.format_farsi()` looks up player names/prices in the DB and o
 
 Alerts are posted immediately (not scheduled for review) since they're time-sensitive live events.
 
+### Live goal alerts
+
+The scheduler runs a separate live-goal watcher every 10 seconds while fixtures
+are in their match window. It compares scorelines and player IDs from the
+official FPL fixture feed (`fixtures/?event={gw}`), posts a goal as soon as the
+score changes, and leaves the assister pending. LiveFPL is not used for goal
+detection. The target message ID is stored in `goal_alerts`; later official
+scorer updates and source-confirmed scorer/assist/own-goal alerts edit that
+same message. Player resolution for every match event is constrained to the
+two clubs in the fixture, preventing same-name players at unrelated clubs
+from being selected. HTTP/API failures retain the last state and retry on the
+next pass. If a VAR correction removes a previously reported goal, the
+watcher edits that post to strike all content above `@EPL_Fantasy` and records
+the cancellation; if the goal is restored, the provisional post can be
+unstruck and refreshed.
+
 ## Price-change alerts
 
-Source channels post price changes in two separate messages (one for risers, one for fallers) in English format (`price-change.txt`). The bot buffers them and merges into a single Farsi post.
+Source-channel price-change posts are ignored. The scheduler curates the report directly from the official FPL bootstrap payload, including confirmed changes and next-update projections.
 
-Detection: `price_changes.is_price_change()` checks for "Price Risers!" or "Price Fallers!" headers.
-Parsing: `price_changes.parse_price_change()` extracts player name, team code, and new price.
-Buffering: `price_changes.accumulate()` collects risers + fallers using today's date as key. Posts immediately when both arrive, or after a 120s timeout with whatever was received.
-Formatting: `price_changes.format_price_changes_farsi()` outputs Farsi format with day-of-week header, risers section, fallers section, and `@EPL_Fantasy` signature. Each player row is wrapped in `<blockquote>`.
+The official report lists every confirmed rise, and only confirmed/predicted falls for players above 1% ownership. Each riser/faller list is sorted by ownership descending, and rows are wrapped in `<blockquote>`.
 
 ## Lineups
 
@@ -182,15 +196,16 @@ The FPL league code is stored in `LEAGUE_CODE` env var (default `433b70`). The f
 
 ## LiveFPL API integration (`livefpl.py`)
 
-The bot fetches data from `livefpl.us` APIs — **no Playwright needed**. Two API endpoints:
+The bot fetches post-match points/EO data from `livefpl.us` and price/live-goal data from the official FPL API — **no Playwright needed**. The endpoints are:
 
 - `https://livefpl.us/api/games.json` — per-game player points, EO%, stats, events. Each player entry: `[web_name, eo%, ?, points, [[stat_name, value, points], ...], element_id, name, pos_code]`. The `minutes` stat in `p[4]` determines who started.
-- `https://livefpl.us/api/prices.json` — player price change predictions. Key fields: `name`, `team`, `type`, `cost`, `progress` (decimal where 1.0 = 100%), `progress_tonight`
+- `https://fantasy.premierleague.com/api/bootstrap-static/` — official player prices, confirmed gameweek changes, and `price_change_percent` / `price_change_projections` predictions.
+- `https://fantasy.premierleague.com/api/fixtures/?event={gw}` — official live scores and fixture `stats` (including goal and own-goal player IDs) used by the goal watcher.
 
 Key functions:
 - `build_game_text(fixture)` — per-game player points with blockquote formatting, color circles, and starter/sub split
 - `build_eo_text()` — global EO leaderboard (players with ≥10% EO, sorted descending)
-- `build_price_changes_text()` — predicted price risers/fallers for tonight
+- `build_price_changes_text()` — confirmed and predicted price risers/fallers from official FPL data
 - `get_finished_fixtures(gameweek_id)` — DB query for finished fixtures
 
 Player matching uses `search_name` (ASCII-normalized) + `alias` + `web_name` against the DB — same as alerts.
@@ -244,9 +259,11 @@ Runs alongside the bot in `asyncio.gather()`. Automated posts:
 
 | Post | Trigger | Source |
 |---|---|---|
-| Price predictions | 23:30 Iran time nightly (or 30min after last live game ends) | `livefpl.build_price_changes_text()` |
+| Price predictions | 23:30 Iran time nightly | official FPL bootstrap via `livefpl.build_price_changes_text()` |
+| Actual price changes | 00:00 GMT daily (with a short API-settling delay) | official FPL bootstrap compared with the last report snapshot |
+| Live goal alerts | Every 10s during live-match windows | official FPL fixture score/scorer data, edited with source confirmation |
 | EO leaderboard | 75 minutes after each deadline | `livefpl.build_eo_text()` |
-| Game points | When game status becomes "Done" in API (polled every 60s) | `livefpl.build_game_text()` |
+| Game points | When game status becomes "Done" in API (polled every 30s) | `livefpl.build_game_text()` |
 | Deadline-passed | At deadline time | `deadlines.py` (unchanged) |
 
 Deduplication uses the `last_updated` DB table (same as deadline posts).
@@ -265,7 +282,7 @@ All messages that go through LLM translation (forwarded source posts, articles, 
 
 Exceptions (sent immediately, no delay):
 - Game-action alerts (`alerts.py`)
-- Price-change alerts from source channels (`price_changes.py`)
+- Official price-change report (`livefpl.py`)
 - Lineups (`alerts.py`)
 - All scheduler/automated posts
 
@@ -304,6 +321,11 @@ When a source message contains a URL, `_maybe_post_article()` runs **after** the
 ### 2. Long-text / merged-chunk articles (>940 chars)
 
 When a single text message exceeds 940 source characters (`_ARTICLE_SOURCE_THRESHOLD`), `translator.translate_article()` is used for structured JSON output, then published to Telegraph.
+
+Plain-text pasted articles have their line breaks converted to explicit `<br>`
+tags before translation. The article prompt asks the model to preserve those
+breaks, and the final Telegraph normalizer also restores newlines when a model
+returns otherwise unstructured prose.
 
 ## Telegraph articles
 

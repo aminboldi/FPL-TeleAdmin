@@ -1152,12 +1152,28 @@ def normalize_telegraph_structure(html_content: str) -> str:
         pending = []
         if not text:
             return
-        paragraph = soup.new_tag("p")
-        paragraph.string = text
+        # Telegram plain-text pastes arrive here as root-level text nodes.
+        # Turn their blank lines into paragraphs and their single line breaks
+        # into explicit Telegraph <br> tags before whitespace collapses.
+        paragraphs = []
+        for block in re.split(r"\n\s*\n+", text.replace("\r\n", "\n")):
+            lines = [line.strip() for line in block.split("\n") if line.strip()]
+            if not lines:
+                continue
+            paragraph = soup.new_tag("p")
+            for index, line in enumerate(lines):
+                if index:
+                    paragraph.append(soup.new_tag("br"))
+                paragraph.append(NavigableString(line))
+            paragraphs.append(paragraph)
         if before is None:
-            root.append(paragraph)
+            for paragraph in paragraphs:
+                root.append(paragraph)
         else:
-            before.insert_before(paragraph)
+            # BeautifulSoup inserts before the anchor each time, so reverse
+            # insertion preserves the source order.
+            for paragraph in reversed(paragraphs):
+                before.insert_before(paragraph)
 
     for child in list(root.contents):
         if isinstance(child, NavigableString):
@@ -1167,6 +1183,25 @@ def normalize_telegraph_structure(html_content: str) -> str:
             continue
         flush(child)
     flush()
+
+    # Models sometimes put all translated prose inside one <p> while keeping
+    # the source's newlines. HTML rendering collapses those newlines, so make
+    # them visible without disturbing inline markup. Preserve pre/code blocks.
+    for node in list(root.find_all(string=True)):
+        if "\n" not in str(node):
+            continue
+        if node.parent.name in {"pre", "code"}:
+            continue
+        pieces = re.split(r"\r?\n", str(node))
+        replacement = NavigableString(pieces[0])
+        node.replace_with(replacement)
+        cursor = replacement
+        for piece in pieces[1:]:
+            line_break = soup.new_tag("br")
+            cursor.insert_after(line_break)
+            text_node = NavigableString(piece)
+            line_break.insert_after(text_node)
+            cursor = text_node
     return "".join(str(child) for child in root.contents).strip()
 
 

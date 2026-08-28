@@ -84,7 +84,7 @@ def _official_match(fixture: dict) -> dict | None:
     return None
 
 
-def _lookup_name(player: dict, home_code: str, away_code: str) -> str:
+def _lookup_name(player: dict, team_code: str, other_team_code: str) -> str:
     """Resolve an official player to the FPL web name used by the DB."""
     candidates = [
         player.get("knownName", ""),
@@ -96,7 +96,12 @@ def _lookup_name(player: dict, home_code: str, away_code: str) -> str:
         if not candidate:
             continue
         for value in (candidate, candidate.split()[-1]):
-            resolved = alerts._resolve_player(value, home_code, away_code)
+            resolved = alerts._resolve_player(
+                value,
+                team_code,
+                other_team_code,
+                strict_team_code=team_code,
+            )
             if resolved:
                 return resolved["web_name"]
     return (player.get("knownName") or player.get("lastName") or player.get("firstName") or "").strip()

@@ -82,6 +82,7 @@ class Action:
     type: str
     player_name: str
     detail: str | None = None
+    team_code: str | None = None
 
 
 @dataclass
@@ -208,22 +209,44 @@ def dedup_key(alert: ParsedAlert) -> str:
 
 
 def _resolve_player(
-    name: str, home_team_code: str, away_team_code: str
+    name: str,
+    home_team_code: str,
+    away_team_code: str,
+    strict_team_code: str | None = None,
+    allowed_team_codes: tuple[str, ...] | None = None,
 ) -> dict | None:
+    """Resolve a player, optionally restricting candidates to fixture clubs."""
     normalized = _normalize(name)
+    if not normalized.strip():
+        return None
+    where = (
+        "(lower(web_name) = lower(?) "
+        "OR lower(search_name) LIKE lower(?) OR alias IS NOT NULL)"
+    )
+    params: list[str] = [normalized, f"%{normalized}%"]
+    if strict_team_code:
+        # Lineup feeds identify the club for every player.  Restricting the
+        # candidate set prevents a same-name player at another club from
+        # winning before the team-priority ordering is even applied.
+        where += " AND upper(t.short_name) = upper(?)"
+        params.append(strict_team_code)
+    elif allowed_team_codes:
+        codes = tuple(code for code in allowed_team_codes if code)
+        if codes:
+            where += " AND upper(t.short_name) IN (" + ",".join("?" for _ in codes) + ")"
+            params.extend(codes)
+    params.extend((home_team_code, away_team_code))
     results = db.query(
-        """SELECT players.*, pos.singular_name AS pos_name, t.short_name AS team_code,
+        f"""SELECT players.*, pos.singular_name AS pos_name, t.short_name AS team_code,
                   t.name_fa, t.short_name_fa
            FROM players
            JOIN positions pos ON players.position_id = pos.id
            JOIN teams t ON players.team_id = t.id
-           WHERE lower(web_name) = lower(?)
-              OR lower(search_name) LIKE lower(?)
-              OR alias IS NOT NULL
+           WHERE {where}
            ORDER BY
              CASE WHEN t.short_name IN (?, ?) THEN 0 ELSE 1 END,
              total_points DESC""",
-        (normalized, f"%{normalized}%", home_team_code, away_team_code),
+        tuple(params),
     )
     for player in results:
         if (
@@ -257,6 +280,20 @@ def _lookup_team(code: str, fallback_name: str) -> dict:
 
 
 def format_farsi(alert: ParsedAlert) -> str | None:
+    # Hashtags normally provide the compact team codes. If a direct/manual
+    # alert omits them, infer the same codes from the two named clubs before
+    # resolving any player so the lookup remains fixture-scoped.
+    for field, team_name in (
+        ("home_team_code", alert.home_team),
+        ("away_team_code", alert.away_team),
+    ):
+        if not getattr(alert, field) and team_name:
+            team = db.query_one(
+                "SELECT short_name FROM teams WHERE lower(name) = lower(?) LIMIT 1",
+                (team_name,),
+            )
+            if team:
+                setattr(alert, field, team["short_name"])
     home = _lookup_team(alert.home_team_code, alert.home_team)
     away = _lookup_team(alert.away_team_code, alert.away_team)
 
@@ -274,9 +311,14 @@ def format_farsi(alert: ParsedAlert) -> str | None:
                 action.player_name,
                 alert.home_team_code,
                 alert.away_team_code,
+                strict_team_code=action.team_code,
+                allowed_team_codes=(alert.home_team_code, alert.away_team_code),
             )
             if not player:
-                lines.append(f"\u26bd {action.player_name} ({_esc('گل بخودی')})")
+                lines.append(
+                    f"\u26bd {_esc(action.player_name) if action.player_name else _esc('در انتظار تأیید')} "
+                    f"({_esc('گل بخودی')})"
+                )
             else:
                 lines.append(
                     f"\u26bd {player['web_name_fa'] or player['web_name']} "
@@ -289,9 +331,13 @@ def format_farsi(alert: ParsedAlert) -> str | None:
                 action.player_name,
                 alert.home_team_code,
                 alert.away_team_code,
+                strict_team_code=action.team_code,
+                allowed_team_codes=(alert.home_team_code, alert.away_team_code),
             )
             if not player:
-                lines.append(f"\u26bd {action.player_name}")
+                lines.append(
+                    f"\u26bd {_esc(action.player_name) if action.player_name else _esc('در انتظار تأیید')}"
+                )
             else:
                 name = player["web_name_fa"] or player["web_name"]
                 price = _price_display(player)
@@ -313,9 +359,13 @@ def format_farsi(alert: ParsedAlert) -> str | None:
                     action.player_name,
                     alert.home_team_code,
                     alert.away_team_code,
+                    strict_team_code=action.team_code,
+                    allowed_team_codes=(alert.home_team_code, alert.away_team_code),
                 )
                 if not player:
-                    lines.append(f"\U0001f170\ufe0f {action.player_name}")
+                    lines.append(
+                        f"\U0001f170\ufe0f {_esc(action.player_name) if action.player_name else _esc('در انتظار تأیید')}"
+                    )
                 else:
                     name = player["web_name_fa"] or player["web_name"]
                     lines.append(
@@ -327,10 +377,12 @@ def format_farsi(alert: ParsedAlert) -> str | None:
                 action.player_name,
                 alert.home_team_code,
                 alert.away_team_code,
+                strict_team_code=action.team_code,
+                allowed_team_codes=(alert.home_team_code, alert.away_team_code),
             )
             if not player:
                 lines.append(
-                    f"\u2666 {_esc('اخراج')} {action.player_name}"
+                    f"\u2666 {_esc('اخراج')} {_esc(action.player_name)}"
                 )
             else:
                 player_team = db.query_one(
@@ -353,9 +405,11 @@ def format_farsi(alert: ParsedAlert) -> str | None:
                 action.player_name,
                 alert.home_team_code,
                 alert.away_team_code,
+                strict_team_code=action.team_code,
+                allowed_team_codes=(alert.home_team_code, alert.away_team_code),
             )
             if not player:
-                lines.append(f"\u274c {action.player_name}")
+                lines.append(f"\u274c {_esc(action.player_name)}")
             else:
                 lines.append(
                     f"\u274c {player['web_name_fa'] or player['web_name']} "
@@ -367,9 +421,11 @@ def format_farsi(alert: ParsedAlert) -> str | None:
                 action.player_name,
                 alert.home_team_code,
                 alert.away_team_code,
+                strict_team_code=action.team_code,
+                allowed_team_codes=(alert.home_team_code, alert.away_team_code),
             )
             if not player:
-                lines.append(f"\U0001f4db {action.player_name}")
+                lines.append(f"\U0001f4db {_esc(action.player_name)}")
             else:
                 lines.append(
                     f"\U0001f4db {player['web_name_fa'] or player['web_name']} "
@@ -379,6 +435,40 @@ def format_farsi(alert: ParsedAlert) -> str | None:
     lines.append("")
     lines.append("@EPL_Fantasy")
     return "\n".join(lines)
+
+
+def format_provisional_goal(
+    *,
+    home_team: str,
+    away_team: str,
+    home_code: str,
+    away_code: str,
+    home_score: int,
+    away_score: int,
+    scorer_name: str = "",
+    scorer_team_code: str = "",
+    own_goal: bool = False,
+) -> str:
+    """Format a fast API goal post before the source alert is confirmed.
+
+    The API can identify a scorer before it exposes a reliable assister.  The
+    assister therefore remains explicitly pending and the whole message can
+    later be replaced with the confirmed source version.
+    """
+    alert = ParsedAlert(
+        actions=[
+            Action("own_goal" if own_goal else "Goal", scorer_name, team_code=scorer_team_code or None),
+            Action("Assist", "tbd"),
+        ],
+        home_team=home_team,
+        away_team=away_team,
+        home_score=int(home_score),
+        away_score=int(away_score),
+        minute="?",
+        home_team_code=home_code,
+        away_team_code=away_code,
+    )
+    return format_farsi(alert) or ""
 
 
 # ── Line-up parsing ──
@@ -474,7 +564,7 @@ def format_lineup(parsed: dict) -> str | None:
         lines.append("")
 
         for name in team_info["players"]:
-            player = _resolve_player(name, code, "")
+            player = _resolve_player(name, code, "", strict_team_code=code)
             if player:
                 player_name = player["web_name_fa"] or player["web_name"]
                 price = _price_display(player)

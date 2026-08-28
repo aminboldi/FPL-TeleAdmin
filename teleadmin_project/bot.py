@@ -49,6 +49,9 @@ logger = logging.getLogger("TeleAdmin")
 
 settings = load_config()
 runtime_config.init()
+# Apply additive SQLite migrations (including live-goal message tracking)
+# before any handlers or scheduler tasks access the database.
+db.init_db()
 
 translator = Translator(
     api_key=settings.openrouter_api_key,
@@ -80,6 +83,7 @@ _ARTICLE_SOURCE_THRESHOLD = 940
 _SHORT_ARTICLE_SOURCE_LIMIT = 700
 _SHORT_ARTICLE_CAPTION_LIMIT = 950
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
+_FORWARDED_BATCH_TIMEOUT = 3  # seconds of quiet before merging forwarded posts
 _YOUTUBE_DESCRIPTION_PREVIEW_LIMIT = 500
 _CATALOG_VISIBILITY_LOOKBACK = timedelta(days=3)
 # Photo captions are limited to 1,024 rendered characters.  This leaves room
@@ -93,6 +97,9 @@ _album_caption: dict[int, str] = {}
 
 _chunk_buffer: dict[int, list] = {}
 _chunk_tasks: dict[int, asyncio.Task] = {}
+_forward_batch_buffer: dict[int, list] = {}
+_forward_batch_tasks: dict[int, asyncio.Task] = {}
+_forward_batch_waiters: dict[int, list[asyncio.Future]] = {}
 _pending_dashboard_content: str | None = None
 _admin_bot_client: TelegramClient | None = None
 _schedule_slot_lock = asyncio.Lock()
@@ -406,6 +413,13 @@ def _fix_unclosed_tags(html: str) -> str:
         result.append("</blockquote>")
         depth -= 1
     return "".join(result)
+
+
+def _prepare_plain_article_layout(html: str) -> str:
+    """Make line breaks in pasted plain text explicit before article translation."""
+    if not html or re.search(r"<(?:blockquote|a)\b", html, flags=re.IGNORECASE):
+        return html
+    return html.replace("\r\n", "\n").replace("\n", "<br>")
 
 _PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
 _ENGLISH_DIGITS = "01234567890123456789"
@@ -797,14 +811,6 @@ async def _send_to_target_at(
         return msg
 
 
-async def _post_price_changes(farsi_text: str | list, fallers: list | None = None):
-    """Post a complete price update or the partial update released by its timer."""
-    if not isinstance(farsi_text, str):
-        farsi_text = price_changes.format_price_changes_farsi(farsi_text, fallers or [])
-    await _send_to_target(farsi_text)
-    logger.info("Posted price changes to %s", _target_channel())
-
-
 def _alert_seen(key: str) -> bool:
     return db.query_scalar("SELECT value FROM last_updated WHERE key = ?", (key,)) is not None
 
@@ -815,11 +821,12 @@ def _mark_alert_seen(key: str) -> None:
 
 
 async def _send_alert(farsi_text: str, event, *, dedup_key: str | None = None):
-    await _send_to_target(farsi_text, event=event)
+    message = await _send_to_target(farsi_text, event=event)
     if dedup_key:
         _mark_alert_seen(dedup_key)
     logger.info("Sent game alert to %s", _target_channel())
     await _send_notification(event, farsi_text)
+    return message
 
 
 async def _try_handle_automatic_content(text: str, event) -> bool:
@@ -832,11 +839,28 @@ async def _try_handle_automatic_content(text: str, event) -> bool:
                 alert_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 key = f"automatic_game_alert_{alert_day}_{alerts.dedup_key(parsed)}"
                 async with _automatic_alert_lock:
+                    # A rapid API watcher may already have posted this
+                    # scoreline with a provisional scorer/assister. Replace
+                    # that message when the source-confirmed alert arrives.
+                    confirmed_target_id = await scheduler.reconcile_confirmed_goal(
+                        client, _target_channel(), parsed, farsi
+                    )
+                    if confirmed_target_id:
+                        _save_mapping(event, confirmed_target_id)
+                        _mark_alert_seen(key)
+                        await _send_notification(event, farsi)
+                        logger.info("Replaced provisional goal alert with source confirmation")
+                        return True
                     if _alert_seen(key):
                         logger.info("Skipping duplicate game alert from a later source message")
                         return True
                     logger.info("Detected game-action alert, formatting directly")
-                    await _send_alert(farsi, event, dedup_key=key)
+                    message = await _send_alert(farsi, event, dedup_key=key)
+                    mapped = message[0] if isinstance(message, (list, tuple)) else message
+                    if mapped is not None:
+                        scheduler.register_confirmed_goal(
+                            _target_channel(), parsed, farsi, mapped.id
+                        )
                 return True
 
     if alerts.is_lineup(text):
@@ -862,16 +886,10 @@ async def _try_handle_automatic_content(text: str, event) -> bool:
         return True
 
     if price_changes.is_price_change(text):
-        parsed = price_changes.parse_price_change(text)
-        if parsed:
-            logger.info(
-                "Detected price change: %s (%d players)",
-                parsed.change_type, len(parsed.players),
-            )
-            combined = price_changes.accumulate(parsed, _post_price_changes)
-            if combined:
-                await _post_price_changes(combined)
-            return True
+        logger.info(
+            "Ignoring source-channel price-change post; the nightly official FPL report is authoritative"
+        )
+        return True
 
     return False
 
@@ -1024,7 +1042,9 @@ async def handle_new_message(event, *, automatic_only: bool = False):
     if html:
         try:
             if len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
-                result = await translator.translate_article(html)
+                result = await translator.translate_article(
+                    _prepare_plain_article_layout(html)
+                )
                 title = _article_title(result.get("title", ""))
                 summary = result.get("summary", "")
                 body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
@@ -1092,7 +1112,9 @@ async def _finish_chunks(chat_id: int):
     translated = None
     if html:
         try:
-            result = await translator.translate_article(html)
+            result = await translator.translate_article(
+                _prepare_plain_article_layout(html)
+            )
             title = _article_title(result.get("title", ""))
             summary = result.get("summary", "")
             body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
@@ -1483,8 +1505,114 @@ async def _import_youtube_transcript(url: str) -> str:
     )
 
 
+def _is_forwarded_message(event) -> bool:
+    """Return whether Telegram marked this private admin message as forwarded."""
+    message = getattr(event, "message", None)
+    return bool(
+        getattr(message, "fwd_from", None)
+        or getattr(message, "forward", None)
+    )
+
+
+def _forwarded_post_html(event) -> tuple[str, list[str]]:
+    """Extract one forwarded post's text while preserving its formatting."""
+    message = event.message
+    text = message.text or ""
+    html = _strip_quotes(_strip_hashtags(_message_to_html(text, message.entities)))
+    links = _extract_urls(event)
+    for url in links:
+        html = html.replace(url, "")
+    html = _prepare_plain_article_layout(html).strip()
+    if html and not re.search(r"<(?:p|h[1-6]|blockquote|ul|ol|pre)\b", html, re.IGNORECASE):
+        html = f"<p>{html}</p>"
+    return html, links
+
+
+async def _translate_forwarded_article(events: list) -> str:
+    """Merge a burst of forwarded posts into one Telegraph article."""
+    first_event = events[0]
+    parts = []
+    all_links: list[str] = []
+    for event in events:
+        html, links = _forwarded_post_html(event)
+        if html:
+            parts.append(html)
+        for link in links:
+            if link not in all_links:
+                all_links.append(link)
+    merged_html = "\n\n".join(parts).strip()
+    if not merged_html:
+        raise ValueError("پست‌های فورواردشده متن قابل استفاده‌ای ندارند.")
+
+    result = await translator.translate_article(merged_html)
+    title = _article_title(_fix_unclosed_tags(_strip_quotes(result.get("title", ""))))
+    summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
+    body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+    telegraph_url = articles.publish_to_telegraph(
+        title,
+        body,
+        summary=summary,
+        source_tag="Telegram",
+    )
+    if telegraph_url:
+        caption = _format_telegraph_post(title, summary, telegraph_url)
+        await _send_to_target(caption, event=first_event, queue=True)
+    else:
+        link_url = await _display_link_url(all_links)
+        caption = _build_caption(body, link_url=link_url, html=True)
+        await _forward_message(caption, first_event)
+    await _send_notification(first_event, caption)
+    return f"✅ {len(events)} پست فورواردشده به یک مقالهٔ واحد تبدیل شد؛ {QUEUED_POST_CONFIRMATION}"
+
+
+async def _finish_forwarded_batch(chat_id: int) -> None:
+    await asyncio.sleep(_FORWARDED_BATCH_TIMEOUT)
+    events = _forward_batch_buffer.pop(chat_id, [])
+    _forward_batch_tasks.pop(chat_id, None)
+    waiters = _forward_batch_waiters.pop(chat_id, [])
+    if not events:
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result("")
+        return
+
+    try:
+        if len(events) == 1:
+            result = await _translate_dashboard_single_submission(events[0])
+        else:
+            result = await _translate_forwarded_article(events)
+    except Exception as exc:
+        result = f"❌ {exc}"
+    for index, waiter in enumerate(waiters):
+        if waiter.done():
+            continue
+        # One confirmation is enough for the whole burst; the other callback
+        # invocations suppress their duplicate dashboard replies.
+        waiter.set_result(result if index == 0 else "")
+
+
+async def _queue_forwarded_submission(event) -> str:
+    chat_id = event.chat_id
+    loop = asyncio.get_running_loop()
+    waiter = loop.create_future()
+    _forward_batch_buffer.setdefault(chat_id, []).append(event)
+    _forward_batch_waiters.setdefault(chat_id, []).append(waiter)
+    previous = _forward_batch_tasks.get(chat_id)
+    if previous:
+        previous.cancel()
+    _forward_batch_tasks[chat_id] = asyncio.create_task(_finish_forwarded_batch(chat_id))
+    return await waiter
+
+
 async def _translate_dashboard_submission(event) -> str:
-    """Translate an admin's private bot submission through the normal pipeline."""
+    """Translate an admin submission, batching forwarded posts into articles."""
+    if _is_forwarded_message(event):
+        return await _queue_forwarded_submission(event)
+    return await _translate_dashboard_single_submission(event)
+
+
+async def _translate_dashboard_single_submission(event) -> str:
+    """Translate one admin's private bot submission through the normal pipeline."""
     _refresh_translator_model()
     text = event.message.text or ""
     if text and await _try_handle_automatic_content(text, event):
@@ -1498,7 +1626,9 @@ async def _translate_dashboard_submission(event) -> str:
     html = html.strip()
 
     if html and len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
-        result = await translator.translate_article(html)
+        result = await translator.translate_article(
+            _prepare_plain_article_layout(html)
+        )
         title = _article_title(_fix_unclosed_tags(_strip_quotes(result.get("title", ""))))
         summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
         body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
@@ -1868,6 +1998,10 @@ async def main():
             target_channel=_target_channel(),
             league_code=runtime_config.get("EPL_LEAGUE_CODE"),
             price_predictions_enabled=runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"),
+        ),
+        scheduler.run_goal_watcher(
+            client=client,
+            target_channel=_target_channel(),
         ),
         youtube_monitor.run_monitor(
             settings.youtube_api_key,

@@ -126,6 +126,31 @@ CREATE TABLE IF NOT EXISTS message_map (
     PRIMARY KEY (source_chat_id, source_msg_id)
 );
 
+-- Fast live-goal posts are created before a source alert is available.  Keep
+-- their target message IDs so later API/source updates can edit the same post
+-- instead of creating duplicates.
+CREATE TABLE IF NOT EXISTS goal_alerts (
+    goal_key        TEXT PRIMARY KEY,
+    fixture_id      INTEGER NOT NULL,
+    target_channel  TEXT NOT NULL,
+    target_msg_id   INTEGER NOT NULL,
+    home_code       TEXT NOT NULL,
+    away_code       TEXT NOT NULL,
+    home_score      INTEGER NOT NULL,
+    away_score      INTEGER NOT NULL,
+    scoring_side    TEXT,
+    side_goal_no    INTEGER,
+    text            TEXT NOT NULL,
+    confirmed       INTEGER NOT NULL DEFAULT 0,
+    scorer_id       INTEGER,
+    scorer_kind     TEXT,
+    cancelled       INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_goal_alerts_fixture
+    ON goal_alerts(fixture_id, home_score, away_score);
+
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
 CREATE INDEX IF NOT EXISTS idx_players_position ON players(position_id);
 CREATE INDEX IF NOT EXISTS idx_players_form ON players(form);
@@ -149,6 +174,15 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        # Additive migration for databases created before VAR-cancellation
+        # tracking was introduced.
+        try:
+            conn.execute(
+                "ALTER TABLE goal_alerts ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
     logger.info("Database schema initialized at %s", DB_PATH)
 
 
@@ -497,6 +531,139 @@ def lookup_target_msg(source_chat_id: int, source_msg_id: int) -> int | None:
         "SELECT target_msg_id FROM message_map WHERE source_chat_id = ? AND source_msg_id = ?",
         (source_chat_id, source_msg_id),
     )
+
+
+def store_goal_alert(
+    goal_key: str,
+    fixture_id: int,
+    target_channel: str,
+    target_msg_id: int,
+    home_code: str,
+    away_code: str,
+    home_score: int,
+    away_score: int,
+    scoring_side: str | None,
+    side_goal_no: int | None,
+    text: str,
+    *,
+    confirmed: bool = False,
+    scorer_id: int | None = None,
+    scorer_kind: str | None = None,
+) -> None:
+    """Persist one live-goal target message and its current API/source state."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO goal_alerts (
+                goal_key, fixture_id, target_channel, target_msg_id,
+                home_code, away_code, home_score, away_score, scoring_side,
+                side_goal_no, text, confirmed, scorer_id, scorer_kind, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(goal_key) DO UPDATE SET
+                target_channel=excluded.target_channel,
+                target_msg_id=excluded.target_msg_id,
+                home_code=excluded.home_code,
+                away_code=excluded.away_code,
+                home_score=excluded.home_score,
+                away_score=excluded.away_score,
+                scoring_side=excluded.scoring_side,
+                side_goal_no=excluded.side_goal_no,
+                text=excluded.text,
+                confirmed=excluded.confirmed,
+                scorer_id=excluded.scorer_id,
+                scorer_kind=excluded.scorer_kind,
+                updated_at=datetime('now')
+            """,
+            (
+                goal_key,
+                int(fixture_id),
+                str(target_channel),
+                int(target_msg_id),
+                str(home_code),
+                str(away_code),
+                int(home_score),
+                int(away_score),
+                scoring_side,
+                side_goal_no,
+                text,
+                int(bool(confirmed)),
+                scorer_id,
+                scorer_kind,
+            ),
+        )
+
+
+def get_goal_alert(goal_key: str) -> dict | None:
+    return query_one("SELECT * FROM goal_alerts WHERE goal_key = ?", (goal_key,))
+
+
+def find_goal_alert(
+    home_code: str,
+    away_code: str,
+    home_score: int,
+    away_score: int,
+) -> dict | None:
+    """Find the latest provisional/confirmed post for one match scoreline."""
+    return query_one(
+        """
+        SELECT * FROM goal_alerts
+        WHERE upper(home_code) = upper(?) AND upper(away_code) = upper(?)
+          AND home_score = ? AND away_score = ?
+        ORDER BY updated_at DESC, goal_key DESC
+        LIMIT 1
+        """,
+        (home_code, away_code, int(home_score), int(away_score)),
+    )
+
+
+def list_pending_goal_alerts(fixture_id: int) -> list[dict]:
+    return query(
+        """
+        SELECT * FROM goal_alerts
+        WHERE fixture_id = ? AND confirmed = 0 AND cancelled = 0
+        ORDER BY home_score, away_score, goal_key
+        """,
+        (int(fixture_id),),
+    )
+
+
+def list_goal_alerts(fixture_id: int) -> list[dict]:
+    return query(
+        "SELECT * FROM goal_alerts WHERE fixture_id = ? ORDER BY home_score, away_score, goal_key",
+        (int(fixture_id),),
+    )
+
+
+def update_goal_alert(
+    goal_key: str,
+    text: str,
+    *,
+    confirmed: bool | None = None,
+    scorer_id: int | None = None,
+    scorer_kind: str | None = None,
+    cancelled: bool | None = None,
+) -> None:
+    """Update a previously sent goal post without changing its Telegram ID."""
+    fields = ["text = ?", "updated_at = datetime('now')"]
+    params: list[Any] = [text]
+    if confirmed is not None:
+        fields.append("confirmed = ?")
+        params.append(int(bool(confirmed)))
+    if scorer_id is not None:
+        fields.append("scorer_id = ?")
+        params.append(scorer_id)
+    if scorer_kind is not None:
+        fields.append("scorer_kind = ?")
+        params.append(scorer_kind)
+    if cancelled is not None:
+        fields.append("cancelled = ?")
+        params.append(int(bool(cancelled)))
+    params.append(goal_key)
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE goal_alerts SET {', '.join(fields)} WHERE goal_key = ?",
+            tuple(params),
+        )
 
 
 _MANUAL_BACKUP = DB_PATH.parent / "manual_data.json"
