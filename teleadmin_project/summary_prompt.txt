@@ -4,7 +4,9 @@ Summarize the full translated article below for the short preview that appears
 above a Telegraph link in a Telegram post.
 
 Requirements:
-- Write natural Persian (Farsi) only.
+- Write natural Persian (Farsi) only, in a casual conversational register —
+  how an Iranian FPL fan talks to other fans, not formal written Persian.
+  Keep it natural rather than slangy, and do not add jokes or opinions.
 - Write 2 or 3 concise sentences, no more than 400 characters.
 - Synthesize the whole article; do not copy the opening paragraph or any other
   contiguous passage.

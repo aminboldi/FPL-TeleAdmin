@@ -169,7 +169,7 @@ def claim_article_monitor_candidate(
         ).fetchone()
         if row:
             status, attempts, updated_at = row
-            if status in {"published", "seeded"}:
+            if status in {"published", "seeded", "abandoned"}:
                 return False
             try:
                 age = (now - datetime.fromisoformat(updated_at)).total_seconds()
@@ -201,18 +201,43 @@ def claim_article_monitor_candidate(
         return True
 
 
-def finish_article_monitor_candidate(url: str, *, success: bool, error: str = "") -> None:
+def finish_article_monitor_candidate(
+    url: str, *, success: bool, error: str = "", max_attempts: int = 0
+) -> bool:
+    """Record the outcome of one import attempt.
+
+    Returns True when this failure exhausted ``max_attempts`` and the URL was
+    abandoned, so the caller can report it once instead of retrying forever.
+    ``max_attempts`` of 0 keeps the previous behaviour of retrying
+    indefinitely on the normal backoff.
+    """
     init()
+    now_text = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
+        if success:
+            conn.execute(
+                "UPDATE article_monitor_seen SET status='published', last_error='', "
+                "updated_at=? WHERE url=?",
+                (now_text, url),
+            )
+            return False
+        row = conn.execute(
+            "SELECT attempts FROM article_monitor_seen WHERE url=?", (url,)
+        ).fetchone()
+        attempts = int((row[0] if row else 0) or 0)
+        abandoned = bool(max_attempts) and attempts >= max_attempts
         conn.execute(
             "UPDATE article_monitor_seen SET status=?, last_error=?, updated_at=? WHERE url=?",
             (
-                "published" if success else "failed",
+                # "abandoned" is not in the retryable set claim() checks, so the
+                # URL is never picked up again.
+                "abandoned" if abandoned else "failed",
                 str(error)[:1000],
-                datetime.now(timezone.utc).isoformat(),
+                now_text,
                 url,
             ),
         )
+        return abandoned
 
 
 def transcript_provider_is_disabled(provider_key: str, month: str) -> bool:

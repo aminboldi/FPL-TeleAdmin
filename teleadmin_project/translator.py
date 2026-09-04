@@ -20,6 +20,21 @@ _summary_prompt_path = Path(__file__).parent / "summary_prompt.txt"
 SUMMARY_PROMPT = _summary_prompt_path.read_text(encoding="utf-8")
 _transcript_format_prompt_path = Path(__file__).parent / "transcript_format_prompt.txt"
 TRANSCRIPT_FORMAT_PROMPT = _transcript_format_prompt_path.read_text(encoding="utf-8")
+_completeness_prompt_path = Path(__file__).parent / "completeness_prompt.txt"
+COMPLETENESS_PROMPT = _completeness_prompt_path.read_text(encoding="utf-8")
+
+# Output-token ceilings. Persian is token-heavy relative to English, so a long
+# transcript or article needs far more room than the English source suggests.
+# These were previously 4096/8192 and silently truncated long content: the
+# article call returned invalid JSON, and the formatting pass cut the body
+# mid-sentence. Every call now also inspects finish_reason, which is the
+# authoritative signal that a response was cut off.
+_MAX_TOKENS_TRANSLATE = 32768
+_MAX_TOKENS_ARTICLE = 32768
+_MAX_TOKENS_FORMAT = 32768
+_MAX_TOKENS_CORRECTION = 32768
+_MAX_TOKENS_SUMMARY = 800
+_MAX_TOKENS_ASSESS = 600
 _TRANSCRIPT_FORMATTING_INSTRUCTIONS = """
 
 Additional instructions for this raw YouTube transcript:
@@ -112,6 +127,52 @@ class TranslationError(Exception):
     pass
 
 
+class TruncatedResponseError(TranslationError):
+    """The model stopped because it hit the output-token ceiling.
+
+    This is reported by the API itself (``finish_reason == "length"``), so it
+    is an exact signal rather than a heuristic. Treating it as an error stops
+    a half-translated article from being published as though it were whole.
+    """
+
+
+class ContentIncompleteError(Exception):
+    """The *source* content is partial — a truncated feed or transcript.
+
+    Distinct from TruncatedResponseError: nothing went wrong with our model
+    call, the material we were given simply does not cover the whole article
+    or video, so it must not be published.
+    """
+
+    def __init__(self, reason: str = ""):
+        super().__init__(reason or "Content appears incomplete")
+        self.reason = reason
+
+
+def _render(prompt: str, **fields: str) -> str:
+    """Fill a prompt template by literal placeholder replacement.
+
+    ``str.format`` cannot be used here: these prompts contain literal JSON
+    examples, and ``{ "title": ... }`` is parsed as a replacement field.
+    ARTICLE_PROMPT.format() therefore raised KeyError on every call, so the
+    structured article path always failed and silently fell back to plain
+    translation. Literal replacement is immune to braces in prompt text.
+    """
+    for name, value in fields.items():
+        prompt = prompt.replace("{" + name + "}", value)
+    return prompt
+
+
+def _response_text(response) -> str:
+    """Return a completion's text, refusing silently truncated output."""
+    choice = response.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        raise TruncatedResponseError(
+            "Model output hit the token ceiling and was cut off"
+        )
+    return (choice.message.content or "").strip()
+
+
 class Translator:
     def __init__(
         self,
@@ -182,7 +243,8 @@ class Translator:
             return source
 
         glossary = self._format_player_glossary(player_glossary)
-        prompt = TRANSCRIPT_CORRECTION_PROMPT.format(
+        prompt = _render(
+            TRANSCRIPT_CORRECTION_PROMPT,
             player_glossary=glossary,
             text=source,
         )
@@ -282,7 +344,76 @@ class Translator:
         lines = body.split("\n")
         title = lines[0].strip()[:100] if lines else ""
         summary = await self.summarize_article(body)
-        return finish({"title": title, "summary": summary, "body": body})
+        return finish({
+            "title": title,
+            "summary": summary,
+            "body": body,
+            "removed_images": set(),
+            "complete": True,
+            "incomplete_reason": "",
+        })
+
+    # Talk-heavy FPL videos. Used only to give the model the arithmetic, since
+    # models are unreliable at computing a ratio themselves.
+    _CHARS_PER_MINUTE_MIN = 750
+    _CHARS_PER_MINUTE_MAX = 1100
+
+    async def assess_completeness(
+        self,
+        text: str,
+        *,
+        kind: str = "article",
+        duration_seconds: int | None = None,
+    ) -> dict:
+        """Ask the model whether the SOURCE material was captured in full.
+
+        Returns ``{"complete": bool, "confidence": str, "reason": str}``. A
+        failed or unparseable assessment returns complete=True: this gate must
+        never become a new reason for content to silently disappear.
+        """
+        source = str(text or "").strip()
+        if not source:
+            return {"complete": False, "confidence": "high", "reason": "empty content"}
+
+        length_facts = f"Captured length: {len(source)} characters."
+        if duration_seconds and duration_seconds > 0:
+            minutes = duration_seconds / 60
+            low = int(minutes * self._CHARS_PER_MINUTE_MIN)
+            high = int(minutes * self._CHARS_PER_MINUTE_MAX)
+            ratio = len(source) / max(1, low)
+            length_facts += (
+                f"\nVideo duration: {int(duration_seconds)} seconds"
+                f" ({minutes:.1f} minutes)."
+                f"\nExpected transcript length for this duration:"
+                f" roughly {low} to {high} characters."
+                f"\nCaptured / minimum-expected ratio: {ratio:.2f}"
+                f" (1.00 or above means the length is plausible)."
+            )
+
+        prompt = _render(
+            COMPLETENESS_PROMPT,
+            kind=kind,
+            length_facts=length_facts,
+            text=source,
+        )
+        for client, model in (
+            (self.google_client, self.google_model),
+            (self.openrouter_client, self.fallback_model),
+        ):
+            if client is None:
+                continue
+            try:
+                value = await self._call_assessment_model(client, model, prompt)
+            except Exception as exc:
+                logger.warning("Completeness check failed on %s: %s", model, exc)
+                continue
+            return {
+                "complete": bool(value.get("complete", True)),
+                "confidence": str(value.get("confidence") or "medium"),
+                "reason": str(value.get("reason") or ""),
+            }
+        # Never let an unavailable checker block publishing.
+        return {"complete": True, "confidence": "low", "reason": "assessment unavailable"}
 
     async def summarize_article(self, translated_html: str) -> str:
         """Create a concise Telegram preview from the complete translated article."""
@@ -364,12 +495,29 @@ class Translator:
         return candidate.rstrip() + "…"
 
     @staticmethod
-    def _normalize_article(article: dict[str, str]) -> dict[str, str]:
-        return {
+    def _normalize_article(article: dict) -> dict:
+        normalized = {
             key: _translate_team_abbreviations(_normalize_digits(value))
             if isinstance(value, str) else value
             for key, value in article.items()
         }
+        # The model reports which image placeholders it deliberately dropped as
+        # promotional. Without this the restore step re-appends those banners
+        # at the end of the article.
+        removed = normalized.get("removed_images")
+        indexes: set[int] = set()
+        if isinstance(removed, (list, tuple, set)):
+            for value in removed:
+                try:
+                    indexes.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        normalized["removed_images"] = indexes
+        normalized["complete"] = bool(normalized.get("complete", True))
+        normalized["incomplete_reason"] = str(
+            normalized.get("incomplete_reason") or ""
+        )
+        return normalized
 
     async def _format_transcript_body(self, body: str) -> str:
         """Enforce readable structure after transcript translation.
@@ -473,12 +621,12 @@ class Translator:
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "user", "content": TRANSLATION_PROMPT.format(text=text)}
+                {"role": "user", "content": _render(TRANSLATION_PROMPT, text=text)}
             ],
             temperature=0.3,
-            max_tokens=4096,
+            max_tokens=_MAX_TOKENS_TRANSLATE,
         )
-        return response.choices[0].message.content.strip()
+        return _response_text(response)
 
     async def _call_transcript_correction(
         self, client: AsyncOpenAI, model: str, prompt: str,
@@ -487,9 +635,9 @@ class Translator:
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=16384,
+            max_tokens=_MAX_TOKENS_CORRECTION,
         )
-        raw = response.choices[0].message.content.strip()
+        raw = _response_text(response)
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
             if raw.endswith("```"):
@@ -504,13 +652,13 @@ class Translator:
             messages=[
                 {
                     "role": "user",
-                    "content": ARTICLE_PROMPT.format(text=text) + formatting_instructions,
+                    "content": _render(ARTICLE_PROMPT, text=text) + formatting_instructions,
                 }
             ],
             temperature=0.3,
-            max_tokens=8192,
+            max_tokens=_MAX_TOKENS_ARTICLE,
         )
-        raw = response.choices[0].message.content.strip()
+        raw = _response_text(response)
 
         # Strip markdown code fences
         if raw.startswith("```"):
@@ -533,12 +681,12 @@ class Translator:
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "user", "content": TRANSCRIPT_FORMAT_PROMPT.format(text=text)}
+                {"role": "user", "content": _render(TRANSCRIPT_FORMAT_PROMPT, text=text)}
             ],
             temperature=0.2,
-            max_tokens=8192,
+            max_tokens=_MAX_TOKENS_FORMAT,
         )
-        return response.choices[0].message.content.strip()
+        return _response_text(response)
 
     async def _call_summary_model(
         self, client: AsyncOpenAI, model: str, text: str,
@@ -546,9 +694,34 @@ class Translator:
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "user", "content": SUMMARY_PROMPT.format(text=text)}
+                {"role": "user", "content": _render(SUMMARY_PROMPT, text=text)}
             ],
             temperature=0.2,
-            max_tokens=600,
+            max_tokens=_MAX_TOKENS_SUMMARY,
         )
-        return response.choices[0].message.content.strip()
+        # A clipped summary is cosmetic, not a lost article, so this call
+        # tolerates the ceiling instead of failing the whole publish.
+        return (response.choices[0].message.content or "").strip()
+
+    async def _call_assessment_model(
+        self, client: AsyncOpenAI, model: str, prompt: str,
+    ) -> dict:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=_MAX_TOKENS_ASSESS,
+        )
+        raw = _response_text(response)
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        raw = raw.strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end != -1:
+            raw = raw[start:end + 1]
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("Assessment response was not a JSON object")
+        return value

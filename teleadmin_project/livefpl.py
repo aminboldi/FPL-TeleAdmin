@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://livefpl.us/api/games.json"
 _FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
-_FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 # Keep a useful watchlist of near-threshold players; the official predictor
 # treats projected progress above 100% as expected to cross the boundary.
 _PRICE_PREDICTION_THRESHOLD = 90.0
@@ -367,10 +366,6 @@ def build_eo_text(gameweek_id: int | None = None) -> str | None:
 _games_cache = None
 _games_backoff_until = 0.0
 _games_backoff_seconds = 0.0
-_official_fixtures_backoff_until = 0.0
-_official_fixtures_backoff_seconds = 0.0
-_official_fixtures_log_at = 0.0
-_official_fixtures_log_gameweek: int | None = None
 
 
 def _fetch_games():
@@ -412,98 +407,6 @@ def refresh_games() -> list | None:
     return _games_cache
 
 
-def _current_gameweek_id() -> int | None:
-    """Return the active FPL event used by the official live fixture feed."""
-    value = db.query_scalar(
-        "SELECT id FROM gameweeks "
-        "WHERE datetime(deadline_time) <= datetime('now') "
-        "ORDER BY datetime(deadline_time) DESC LIMIT 1"
-    )
-    if value is None:
-        value = db.query_scalar(
-            "SELECT id FROM gameweeks WHERE is_current = 1 OR is_next = 1 "
-            "ORDER BY is_current DESC, id DESC LIMIT 1"
-        )
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _fetch_official_fixtures(gameweek_id: int) -> list[dict]:
-    response = requests.get(
-        _FPL_FIXTURES_URL,
-        params={"event": int(gameweek_id)},
-        headers={"User-Agent": "TeleAdmin/1.0"},
-        timeout=15,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
-        raise ValueError("Official FPL fixtures response has an unexpected shape")
-    return payload
-
-
-def refresh_official_fixtures(gameweek_id: int | None = None) -> list[dict] | None:
-    """Fetch live scores and event stats from the official FPL fixture API.
-
-    The ``fixtures/?event=`` feed is the same official data used to populate
-    FPL live events.  It includes current scores and ``stats`` entries with
-    player IDs for goals and own goals, allowing the goal watcher to avoid the
-    slower/third-party LiveFPL feed entirely.
-    """
-    global _official_fixtures_backoff_until, _official_fixtures_backoff_seconds
-    global _official_fixtures_log_at, _official_fixtures_log_gameweek
-    if gameweek_id is None:
-        gameweek_id = _current_gameweek_id()
-    if not gameweek_id:
-        return []
-    now = time.monotonic()
-    if now < _official_fixtures_backoff_until:
-        return None
-    try:
-        result = _fetch_official_fixtures(int(gameweek_id))
-        _official_fixtures_backoff_seconds = 0.0
-        if (
-            int(gameweek_id) != _official_fixtures_log_gameweek
-            or now - _official_fixtures_log_at >= 300
-        ):
-            scores = ", ".join(
-                f"{row.get('id')}:{row.get('team_h_score')}-{row.get('team_a_score')}"
-                for row in result
-            ) or "no fixtures"
-            logger.info(
-                "Official FPL goal watcher heartbeat: GW%s; %s",
-                gameweek_id,
-                scores,
-            )
-            _official_fixtures_log_at = now
-            _official_fixtures_log_gameweek = int(gameweek_id)
-        return result
-    except requests.HTTPError as exc:
-        response = getattr(exc, "response", None)
-        if response is not None and response.status_code == 429:
-            retry_after = None
-            try:
-                retry_after = float(response.headers.get("Retry-After", ""))
-            except (TypeError, ValueError):
-                pass
-            _official_fixtures_backoff_seconds = max(
-                10.0,
-                min(300.0, retry_after if retry_after is not None else (_official_fixtures_backoff_seconds * 2 or 30.0)),
-            )
-            _official_fixtures_backoff_until = now + _official_fixtures_backoff_seconds
-            logger.warning(
-                "Official FPL fixtures returned HTTP 429; backing off for %.0fs",
-                _official_fixtures_backoff_seconds,
-            )
-        else:
-            logger.warning("Failed to refresh official FPL fixtures: %s", exc)
-    except Exception as exc:
-        logger.warning("Failed to refresh official FPL fixtures: %s", exc)
-    return None
-
-
 def is_game_finished(game: list) -> bool:
     """Handle the status values used by current and older LiveFPL responses."""
     return len(game) > 4 and str(game[4]).strip().lower() in {"done", "finished"}
@@ -519,34 +422,69 @@ def _fetch_fpl_bootstrap() -> dict:
     return payload
 
 
-def _price_snapshot() -> dict:
-    """Read the last successfully published price snapshot."""
+def fetch_price_payload() -> dict | None:
+    """Fetch the official bootstrap once so callers can reuse a single payload.
+
+    Diffing prices, rendering the report, and saving the new baseline must all
+    come from the *same* snapshot of the API.  Re-fetching between those steps
+    silently loses any change that lands in between.
+    """
+    try:
+        return _fetch_fpl_bootstrap()
+    except Exception as exc:
+        logger.error("Failed to fetch official FPL price data: %s", exc)
+        return None
+
+
+def extract_prices(payload: dict) -> dict[str, int]:
+    """Map player id -> now_cost (in tenths) from a bootstrap payload."""
+    return {
+        str(player["id"]): int(player["now_cost"])
+        for player in payload.get("elements") or []
+        if isinstance(player, dict)
+        and player.get("id") is not None
+        and player.get("now_cost") is not None
+    }
+
+
+def load_price_snapshot() -> dict[str, int] | None:
+    """Return the last recorded prices, or None when no baseline exists yet.
+
+    None and {} mean different things: None means "never seeded, do not report
+    a diff", while {} would mean "seeded but empty".
+    """
     try:
         raw = db.query_scalar(
             "SELECT value FROM last_updated WHERE key = ?", (_PRICE_SNAPSHOT_KEY,)
         )
-        value = json.loads(raw) if raw else {}
-        return value if isinstance(value, dict) else {}
     except Exception:
         # The table is created during normal bot startup. Keep a dashboard
         # preview usable while a brand-new database is being initialized.
-        return {}
-
-
-def save_price_snapshot() -> bool:
-    """Persist current official prices after a successful nightly post."""
+        return None
+    if not raw:
+        return None
     try:
-        payload = _fetch_fpl_bootstrap()
-        prices = {
-            str(player["id"]): int(player["now_cost"])
-            for player in payload["elements"]
-            if isinstance(player, dict)
-            and player.get("id") is not None
-            and player.get("now_cost") is not None
-        }
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    prices = value.get("prices") if isinstance(value, dict) else None
+    if not isinstance(prices, dict):
+        return None
+    result: dict[str, int] = {}
+    for key, cost in prices.items():
+        try:
+            result[str(key)] = int(cost)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def save_price_snapshot(prices: dict[str, int]) -> bool:
+    """Persist the prices a report was built from, as the next baseline."""
+    try:
         snapshot = {
             "captured_at": datetime.now(timezone.utc).isoformat(),
-            "prices": prices,
+            "prices": {str(k): int(v) for k, v in prices.items()},
         }
         with db._connect() as conn:
             conn.execute(
@@ -558,6 +496,23 @@ def save_price_snapshot() -> bool:
     except Exception as exc:
         logger.warning("Could not save official price snapshot: %s", exc)
         return False
+
+
+def diff_prices(
+    previous: dict[str, int], payload: dict
+) -> list[tuple[int, dict]]:
+    """Return (delta_in_tenths, player) for every player whose price moved."""
+    changes = []
+    for player in payload.get("elements") or []:
+        if not isinstance(player, dict) or player.get("now_cost") is None:
+            continue
+        old = previous.get(str(player.get("id")))
+        if old is None:
+            continue
+        delta = int(player["now_cost"]) - int(old)
+        if delta:
+            changes.append((delta, player))
+    return changes
 
 
 def _load_db_players(player_ids: list[int]) -> dict[int, dict]:
@@ -628,22 +583,31 @@ def _price_ownership(player: dict) -> float:
 
 
 def build_price_changes_text(
-    *, include_actual: bool = True, include_potential: bool = True
+    *,
+    include_actual: bool = True,
+    include_potential: bool = True,
+    payload: dict | None = None,
+    previous_prices: dict[str, int] | None = None,
 ) -> str | None:
-    """Build a nightly report from the official FPL price-change data.
+    """Build a price report from the official FPL price-change data.
 
-    The payload contains both confirmed changes accumulated in the current
-    gameweek and projections for the next midnight update. A persisted
-    snapshot makes the confirmed section daily rather than repeating every
-    change from the start of the gameweek. All risers are retained; fallers
-    are limited to players with more than 1% ownership and every list is
-    ordered by ownership descending.
+    ``payload`` lets the caller supply an already-fetched bootstrap so the
+    diff, the report, and the saved baseline all describe the same instant.
+
+    The confirmed section is a true diff against ``previous_prices`` (the last
+    saved baseline).  Without a baseline it is omitted rather than guessed:
+    ``cost_change_event`` counts the whole gameweek, not the last day, so
+    using it as a stand-in produces a wrong "today's changes" list.
+
+    All risers are retained; fallers are limited to players above 1% ownership
+    and every list is ordered by ownership descending.
     """
-    try:
-        payload = _fetch_fpl_bootstrap()
-    except Exception as exc:
-        logger.error("Failed to fetch official FPL price data: %s", exc)
-        return None
+    if payload is None:
+        payload = fetch_price_payload()
+        if payload is None:
+            return None
+    if previous_prices is None and include_actual:
+        previous_prices = load_price_snapshot()
 
     players = [player for player in payload["elements"] if isinstance(player, dict)]
     team_rows = payload.get("teams") or []
@@ -658,21 +622,9 @@ def build_price_changes_text(
 
     actual_risers = []
     actual_fallers = []
-    if include_actual:
-        previous = _price_snapshot().get("prices")
-        previous = previous if isinstance(previous, dict) else {}
-        for player in players:
-            player_id = str(player.get("id"))
-            current = player.get("now_cost")
-            if current is None:
-                continue
-            old = previous.get(player_id)
-            if old is None:
-                # On the first report, use the official current-gameweek
-                # change field so actual changes are visible immediately.
-                delta_units = player.get("cost_change_event") or 0
-            else:
-                delta_units = int(current) - int(old)
+    have_baseline = bool(previous_prices)
+    if include_actual and have_baseline:
+        for delta_units, player in diff_prices(previous_prices, payload):
             if delta_units > 0:
                 actual_risers.append((delta_units, player))
             elif delta_units < 0 and _price_ownership(player) > 1:
@@ -731,6 +683,8 @@ def build_price_changes_text(
                     )
                 )
             lines.append("")
+    elif include_actual and not have_baseline:
+        lines.extend(["✅ تغییرات واقعی: هنوز مبنایی برای مقایسه ثبت نشده است.", ""])
     elif include_actual:
         lines.extend(["✅ تغییرات واقعی: موردی از آخرین گزارش ثبت نشده است.", ""])
 

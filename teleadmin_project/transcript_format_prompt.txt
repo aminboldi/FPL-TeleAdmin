@@ -7,6 +7,13 @@ Rules:
 - Return only the article body as valid Telegraph HTML; no JSON, Markdown,
   code fences, explanation, or quotation marks.
 - Do not omit, paraphrase, reorder, or add substantive information.
+- Keep the existing casual, conversational Persian register. Do not make the
+  wording more formal, and do not rewrite phrasing that is already natural.
+- Remove any promotional or non-editorial leftovers: sponsor and affiliate
+  plugs, discount codes, 'like and subscribe' or channel-membership appeals,
+  Patreon/Discord invitations, giveaway rules, and sign-off requests to
+  comment. Keep all football and FPL content, including the presenter's
+  own opinions and recommendations.
 - Split long continuous text into short logical <p> paragraphs, normally one to
   three related sentences each.
 - Identify genuine topic changes and add concise factual <h3> or <h4> headings.

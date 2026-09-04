@@ -141,6 +141,10 @@ class VideoMetadata:
     thumbnail_url: str
     description: str
     channel_title: str
+    # Used to sanity-check a fetched transcript against how long the video
+    # actually is, so a provider that returns only the opening minutes is not
+    # published as a complete article.
+    duration_seconds: int | None = None
 
 
 def description_before_first_link_sentence(description: str) -> str:
@@ -233,6 +237,9 @@ def fetch_video_metadata(url: str, youtube_api_key: str | None) -> VideoMetadata
         thumbnail_url=thumbnail_url,
         description=description,
         channel_title=channel_title,
+        duration_seconds=_duration_seconds(
+            str((video.get("contentDetails") or {}).get("duration", ""))
+        ),
     )
 
 

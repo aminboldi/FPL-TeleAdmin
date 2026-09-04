@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 
 import runtime_config
 import articles
+from translator import ContentIncompleteError
 
 logger = logging.getLogger(__name__)
 
@@ -307,7 +308,12 @@ def discover_candidates() -> list[Candidate]:
     return list(unique.values())
 
 
-async def _poll_once(import_article) -> None:
+# A feed that serves a truncated article usually fills in within a few hours,
+# so retry on the normal backoff before giving up on it for good.
+_MAX_INCOMPLETE_ATTEMPTS = 4
+
+
+async def _poll_once(import_article, on_abandoned=None) -> None:
     candidates = await asyncio.to_thread(discover_candidates)
     if not candidates:
         return
@@ -332,22 +338,42 @@ async def _poll_once(import_article) -> None:
             if not imported:
                 raise RuntimeError("article extraction returned no readable content")
         except Exception as exc:
-            runtime_config.finish_article_monitor_candidate(
-                candidate.url, success=False, error=str(exc)
+            # An incomplete source is expected to be retryable, so it is capped
+            # and reported rather than retried forever. Other failures keep the
+            # previous unlimited-retry behaviour.
+            incomplete = isinstance(exc, ContentIncompleteError)
+            abandoned = runtime_config.finish_article_monitor_candidate(
+                candidate.url,
+                success=False,
+                error=str(exc),
+                max_attempts=_MAX_INCOMPLETE_ATTEMPTS if incomplete else 0,
             )
-            logger.exception("Automatic article import failed for %s", candidate.url)
+            if incomplete:
+                logger.warning(
+                    "Article %s looks incomplete (%s); %s",
+                    candidate.url,
+                    exc,
+                    "giving up" if abandoned else "will retry",
+                )
+            else:
+                logger.exception("Automatic article import failed for %s", candidate.url)
+            if abandoned and on_abandoned:
+                try:
+                    await on_abandoned(candidate.url, exc)
+                except Exception:
+                    logger.exception("Could not report abandoned article %s", candidate.url)
         else:
             runtime_config.finish_article_monitor_candidate(candidate.url, success=True)
             logger.info("Automatically queued article %s", candidate.url)
 
 
-async def run_monitor(import_article) -> None:
+async def run_monitor(import_article, on_abandoned=None) -> None:
     """Poll sources indefinitely and hand new URLs to the normal importer."""
     logger.info("Article monitor started; polling every %d minutes", _POLL_SECONDS // 60)
     while True:
         try:
             if runtime_config.get_bool("ARTICLE_MONITOR_ENABLED"):
-                await _poll_once(import_article)
+                await _poll_once(import_article, on_abandoned)
         except Exception:
             logger.exception("Article monitor cycle failed")
         await asyncio.sleep(_POLL_SECONDS)

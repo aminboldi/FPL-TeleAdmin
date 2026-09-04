@@ -74,11 +74,6 @@ _FFFIX_PROMO_LABELS = (
     "track elite manager team changes",
     "stay ahead with expert fpl tips",
 )
-_FFFIX_END_MARKER = (
-    "unlock live elite team reveals, ai transfer recommendations and all our "
-    "opta-powered planning tools with premium plus"
-)
-_FFFIX_END_IMAGE_PREFIX = "s1-preseason-blog-1"
 _TELEGRAPH_TAGS = {
     "a", "b", "blockquote", "br", "code", "em", "figure", "figcaption",
     "h3", "h4", "hr", "i", "img", "li", "ol", "p", "pre", "s",
@@ -449,56 +444,13 @@ def _clean_fff_article_html(source_html: str) -> str:
             if following and following.name == "hr":
                 following.decompose()
 
-    def is_end_image(element) -> bool:
-        images = []
-        if getattr(element, "name", None) == "img":
-            images.append(element)
-        images.extend(element.find_all("img"))
-        for image in images:
-            src = str(
-                image.get("src")
-                or image.get("data-src")
-                or image.get("data-original")
-                or ""
-            ).strip()
-            filename = urlparse(src).path.rsplit("/", 1)[-1].lower()
-            if filename.startswith(_FFFIX_END_IMAGE_PREFIX):
-                return True
-        return False
-
-    # FFFix's seasonal promotion has appeared both with and without the
-    # marketing divider. The banner itself is a more reliable boundary than
-    # the surrounding copy, so cut from the first top-level child containing
-    # it and everything below it.
-    children = list(content.find_all(recursive=False))
-    end_index = next(
-        (index for index, child in enumerate(children) if is_end_image(child)),
-        None,
-    )
-    if end_index is not None:
-        for item in children[end_index:]:
-            item.extract()
-    else:
-        # Locate the offer itself, then remove the nearest preceding divider
-        # and everything after it. Checking the whole remainder from each
-        # divider is incorrect: the first article divider also has the offer
-        # somewhere later in its remainder and would truncate the article
-        # after its introduction.
-        offer_index = next(
-            (
-                index for index, child in enumerate(children)
-                if _FFFIX_END_MARKER in _fff_normalized_text(child)
-            ),
-            None,
-        )
-        if offer_index is not None:
-            cut_index = offer_index
-            for index in range(offer_index - 1, -1, -1):
-                if children[index].name == "hr":
-                    cut_index = index
-                    break
-            for item in children[cut_index:]:
-                item.extract()
+    # The end-of-article cut used to happen here, keyed on FFFix's promo
+    # banner filename or its offer wording. Both are brittle: when the site
+    # changed either one, the heuristic either stopped trimming or, worse, cut
+    # at the wrong divider and truncated the article after its introduction.
+    # Trailing promotional copy is now removed by the translator instead, which
+    # also reports the promo image placeholders it dropped. Keep this function
+    # to structural scoping only.
 
     # Keep the extractor focused on the article body even if the page adds
     # related cards or a site-wide offer inside the outer article wrapper.
@@ -527,22 +479,11 @@ def _clean_ffscout_article_html(source_html: str) -> str:
     if entry is None:
         return source_html
 
-    for paragraph in list(entry.find_all("p")):
-        if _fff_normalized_text(paragraph).startswith("read more:"):
-            paragraph.decompose()
-
-    # The final WordPress separator marks the end of the article. The figure
-    # and entry links after it are site promotion/navigation, not article
-    # content. Keep earlier separators because they can divide real sections.
-    separators = entry.find_all(
-        "hr", class_=lambda value: value and "wp-block-separator" in value
-    )
-    if separators:
-        final_separator = separators[-1]
-        for sibling in list(final_separator.find_next_siblings()):
-            sibling.decompose()
-        final_separator.decompose()
-
+    # The inline "READ MORE:" drop and the cut at the final WordPress
+    # separator were removed: the separator is not reliably the end of the
+    # article, so this silently truncated posts whose last section happened to
+    # be separated. The translator strips read-more links and trailing site
+    # promotion instead.
     return str(entry)
 
 
@@ -621,53 +562,11 @@ def _clean_allaboutfpl_article_html(source_html: str) -> str:
     if entry is None:
         return source_html
 
-    children = list(entry.find_all(recursive=False))
-
-    # The first Further reads heading starts the site's link-heavy footer.
-    for index, child in enumerate(children):
-        if _fff_normalized_text(child).startswith("further reads from allaboutfpl"):
-            for item in children[index:]:
-                item.extract()
-            break
-
-    # Remove individual article-to-article recommendations before translation.
-    for paragraph in list(entry.find_all("p")):
-        if _fff_normalized_text(paragraph).startswith("further read:"):
-            paragraph.decompose()
-
-    # Affiliate promotions are presented as complete blocks between two
-    # WordPress separators. Remove the separators with the block so no empty
-    # sales divider remains in the cleaned article.
-    while True:
-        children = list(entry.find_all(recursive=False))
-        removed = False
-        for start, child in enumerate(children):
-            if child.name != "hr" or "wp-block-separator" not in (child.get("class") or []):
-                continue
-            end = next(
-                (
-                    index for index in range(start + 1, len(children))
-                    if children[index].name == "hr"
-                    and "wp-block-separator" in (children[index].get("class") or [])
-                ),
-                None,
-            )
-            if end is None:
-                continue
-            block = children[start + 1:end]
-            block_text = " ".join(_fff_normalized_text(item) for item in block)
-            block_links = " ".join(
-                str(anchor.get("href") or "").lower()
-                for item in block for anchor in item.find_all("a")
-            )
-            if "fantasy football hub" in block_text or "fantasyfootballhub.co.uk" in block_links:
-                for item in children[start:end + 1]:
-                    item.extract()
-                removed = True
-                break
-        if not removed:
-            break
-
+    # The "Further reads from AllAboutFPL" cut, the "Further read:" paragraph
+    # drop, and the FFHUB affiliate-block matcher all lived here. They keyed on
+    # exact site wording and separator structure, so a wording change either
+    # left the promo in or truncated real content. The translator removes
+    # cross-links, affiliate blocks, and footer copy instead.
     return str(entry)
 
 
@@ -927,6 +826,12 @@ def _restore_images_by_source_position(
         source_position = source_positions.get(index)
         if source_position is None:
             continue
+        if not url:
+            # Blanked by the caller because the translator deleted this
+            # placeholder's promotional block. Count it as handled so this
+            # positioning pass still applies to the remaining images.
+            restored.add(index)
+            continue
         image = soup.new_tag("img", src=url)
         if not target_nodes:
             root.append(image)
@@ -956,8 +861,21 @@ def restore_images_in_place(
     image_urls: list[str],
     *,
     source_html: str | None = None,
+    removed_images: set[int] | None = None,
 ) -> str:
-    """Restore translated image markers at their original article positions."""
+    """Restore translated image markers at their original article positions.
+
+    ``removed_images`` holds placeholder numbers the translator deleted on
+    purpose because they belonged to a promotional block. They are not
+    "missing" images, so they must never be re-appended at the end of the
+    article — that would put the advert banner back after the content.
+    """
+    dropped = {int(index) for index in (removed_images or set())}
+    if dropped:
+        image_urls = [
+            "" if index in dropped else url
+            for index, url in enumerate(image_urls, start=1)
+        ]
     soup = BeautifulSoup(_remove_article_links(html_content), "html.parser")
     if source_html:
         restored = _restore_images_by_source_position(

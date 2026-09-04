@@ -27,6 +27,16 @@ _HEADER_RE = re.compile(
     r"^Price (Risers|Fallers)!.*?\((\d+)\).*$", re.MULTILINE | re.IGNORECASE
 )
 
+# Detection must stay tolerant of the source channel's formatting changes.
+# It has posted both "Price Fallers! 📉 (3) #FPL" with "🔴 J.Timber #ARS £6.1m"
+# rows and, later, "Price Fallers! 📉 #FPL" with "⬇ Madueke £6.3m" rows — no
+# count, no team code. Requiring the count made the newer posts fall through to
+# the LLM and get published as translated articles.
+_DETECT_HEADER_RE = re.compile(
+    r"^[^\w\n]*Price\s+(?:Risers|Fallers)\s*!", re.MULTILINE | re.IGNORECASE
+)
+_PRICE_ROW_RE = re.compile(r"£\s*\d+(?:\.\d+)?\s*m\b", re.IGNORECASE)
+
 
 def _esc(text: str) -> str:
     return text.translate(_HTML_ESCAPES)
@@ -47,9 +57,21 @@ class ParsedPriceChange:
 
 
 def is_price_change(text: str) -> bool:
+    """Detect a source-channel price-change post so it is never translated.
+
+    A leading header is accepted on its own, because these posts always open
+    with it. Elsewhere in a message the header must be backed by real price
+    rows, so an article that merely discusses risers and fallers in prose is
+    still translated normally.
+    """
     if not text:
         return False
-    return bool(_HEADER_RE.search(text))
+    match = _DETECT_HEADER_RE.search(text)
+    if not match:
+        return False
+    if not text[: match.start()].strip():
+        return True
+    return len(_PRICE_ROW_RE.findall(text)) >= 2
 
 
 def parse_price_change(text: str) -> ParsedPriceChange | None:

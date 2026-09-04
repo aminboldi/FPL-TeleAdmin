@@ -347,7 +347,7 @@ def format_farsi(alert: ParsedAlert) -> str | None:
             player_name = action.player_name.lower()
             if player_name == "none":
                 lines.append(f"\U0001f170\ufe0f {_esc('ندارد')}")
-            elif player_name == "tbd":
+            elif player_name in {"tbd", "tbc"}:
                 lines.append(f"\U0001f170\ufe0f {_esc('در دست بررسی')}")
             else:
                 player = _resolve_player(
@@ -430,40 +430,6 @@ def format_farsi(alert: ParsedAlert) -> str | None:
     lines.append("")
     lines.append("@EPL_Fantasy")
     return "\n".join(lines)
-
-
-def format_provisional_goal(
-    *,
-    home_team: str,
-    away_team: str,
-    home_code: str,
-    away_code: str,
-    home_score: int,
-    away_score: int,
-    scorer_name: str = "",
-    scorer_team_code: str = "",
-    own_goal: bool = False,
-) -> str:
-    """Format a fast API goal post before the source alert is confirmed.
-
-    The API can identify a scorer before it exposes a reliable assister.  The
-    assister therefore remains explicitly pending and the whole message can
-    later be replaced with the confirmed source version.
-    """
-    alert = ParsedAlert(
-        actions=[
-            Action("own_goal" if own_goal else "Goal", scorer_name, team_code=scorer_team_code or None),
-            Action("Assist", "tbd"),
-        ],
-        home_team=home_team,
-        away_team=away_team,
-        home_score=int(home_score),
-        away_score=int(away_score),
-        minute="?",
-        home_team_code=home_code,
-        away_team_code=away_code,
-    )
-    return format_farsi(alert) or ""
 
 
 # ── Line-up parsing ──

@@ -23,7 +23,7 @@ from telethon.tl.types import (
 )
 
 from config import load_config
-from translator import Translator, TranslationError
+from translator import Translator, TranslationError, ContentIncompleteError
 import alerts
 import price_changes
 import deadlines
@@ -49,8 +49,8 @@ logger = logging.getLogger("TeleAdmin")
 
 settings = load_config()
 runtime_config.init()
-# Apply additive SQLite migrations (including live-goal message tracking)
-# before any handlers or scheduler tasks access the database.
+# Ensure the SQLite schema exists before any handler or scheduler task
+# touches the database.
 db.init_db()
 
 translator = Translator(
@@ -109,6 +109,10 @@ _schedule_slot_lock = asyncio.Lock()
 # restart-safe source of truth because this cursor only lives in memory.
 _last_reserved_queue_slots: dict[str, datetime] = {}
 _youtube_failure_notified: set[str] = set()
+_youtube_incomplete_attempts: dict[str, int] = {}
+# Captions are often still being generated shortly after upload, so a partial
+# transcript is retried across polls before the video is skipped.
+_MAX_INCOMPLETE_TRANSCRIPT_ATTEMPTS = 4
 _automatic_alert_lock = asyncio.Lock()
 
 
@@ -660,7 +664,35 @@ async def _send_notification(event, caption: str, *, source: str | None = None, 
 
 
 async def _notify_youtube_monitor_failure(video, error: Exception):
-    """Alert admins once when every transcript provider failed for a video."""
+    """Alert admins once when a monitored video cannot be published."""
+    if isinstance(error, ContentIncompleteError):
+        # A partial transcript is usually a provider that returned only the
+        # opening minutes. Retry a few polls before giving up, so the video is
+        # not dropped over one bad fetch.
+        attempts = _youtube_incomplete_attempts.get(video.id, 0) + 1
+        _youtube_incomplete_attempts[video.id] = attempts
+        if attempts < _MAX_INCOMPLETE_TRANSCRIPT_ATTEMPTS:
+            logger.info(
+                "Transcript for %s looks incomplete (attempt %d/%d); will retry: %s",
+                video.id, attempts, _MAX_INCOMPLETE_TRANSCRIPT_ATTEMPTS, error,
+            )
+            return
+        if video.id in _youtube_failure_notified:
+            return
+        _youtube_failure_notified.add(video.id)
+        # Stop the poller from re-fetching this video indefinitely.
+        await asyncio.to_thread(
+            runtime_config.mark_youtube_video, video.id, video.channel_id, "skipped"
+        )
+        caption = (
+            "<b>⚠️ زیرنویس این ویدیو ناقص بود و منتشر نشد</b>\n\n"
+            f'<a href="{_escape_html(video.url)}">مشاهدهٔ ویدیو</a>\n\n'
+            f"{_escape_html(str(error))}"
+        )
+        await _send_notification(
+            None, caption, source="YouTube transcription", is_media=False
+        )
+        return
     if not isinstance(error, youtube_posts.TranscriptProvidersExhausted):
         return
     if video.id in _youtube_failure_notified:
@@ -674,6 +706,16 @@ async def _notify_youtube_monitor_failure(video, error: Exception):
     await _send_notification(
         None, caption, source="YouTube transcription", is_media=False
     )
+
+
+async def _notify_article_abandoned(url: str, error: Exception):
+    """Alert admins when a monitored article stayed incomplete after retries."""
+    caption = (
+        "<b>⚠️ این مقاله ناقص دریافت شد و منتشر نشد</b>\n\n"
+        f'<a href="{_escape_html(url)}">مشاهدهٔ مقاله</a>\n\n'
+        f"{_escape_html(str(error))}"
+    )
+    await _send_notification(None, caption, source="Article", is_media=False)
 
 
 async def _next_queue_slot(target_channel: str) -> datetime:
@@ -821,12 +863,11 @@ def _mark_alert_seen(key: str) -> None:
 
 
 async def _send_alert(farsi_text: str, event, *, dedup_key: str | None = None):
-    message = await _send_to_target(farsi_text, event=event)
+    await _send_to_target(farsi_text, event=event)
     if dedup_key:
         _mark_alert_seen(dedup_key)
     logger.info("Sent game alert to %s", _target_channel())
     await _send_notification(event, farsi_text)
-    return message
 
 
 async def _try_handle_automatic_content(text: str, event) -> bool:
@@ -839,28 +880,11 @@ async def _try_handle_automatic_content(text: str, event) -> bool:
                 alert_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 key = f"automatic_game_alert_{alert_day}_{alerts.dedup_key(parsed)}"
                 async with _automatic_alert_lock:
-                    # A rapid API watcher may already have posted this
-                    # scoreline with a provisional scorer/assister. Replace
-                    # that message when the source-confirmed alert arrives.
-                    confirmed_target_id = await scheduler.reconcile_confirmed_goal(
-                        client, _target_channel(), parsed, farsi
-                    )
-                    if confirmed_target_id:
-                        _save_mapping(event, confirmed_target_id)
-                        _mark_alert_seen(key)
-                        await _send_notification(event, farsi)
-                        logger.info("Replaced provisional goal alert with source confirmation")
-                        return True
                     if _alert_seen(key):
                         logger.info("Skipping duplicate game alert from a later source message")
                         return True
                     logger.info("Detected game-action alert, formatting directly")
-                    message = await _send_alert(farsi, event, dedup_key=key)
-                    mapped = message[0] if isinstance(message, (list, tuple)) else message
-                    if mapped is not None:
-                        scheduler.register_confirmed_goal(
-                            _target_channel(), parsed, farsi, mapped.id
-                        )
+                    await _send_alert(farsi, event, dedup_key=key)
                 return True
 
     if alerts.is_lineup(text):
@@ -1200,6 +1224,10 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     else:
         translation_html, inline_images = articles.prepare_article_html(raw_html)
     result = await translator.translate_article(translation_html)
+    if not result.get("complete", True):
+        raise ContentIncompleteError(
+            str(result.get("incomplete_reason") or "article source looks truncated")
+        )
     title = _article_title(
         _fix_unclosed_tags(_strip_quotes(result.get("title", ""))), article["title"]
     )
@@ -1248,7 +1276,10 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     )
     source_images = [image for image in source_images if image != feature_image]
     translated = articles.restore_images_in_place(
-        translated, source_images, source_html=translation_html
+        translated,
+        source_images,
+        source_html=translation_html,
+        removed_images=result.get("removed_images") or set(),
     )
     translated = articles.append_original_article_link(
         translated, article["url"], article.get("source_name", "")
@@ -1359,6 +1390,18 @@ async def _import_youtube_transcript(url: str) -> str:
     transcript = await asyncio.to_thread(
         youtube_posts.fetch_english_transcript, url, settings.x_rapidapi_key
     )
+    # Providers sometimes return only the opening minutes of a video. Check the
+    # captured transcript against the video's real duration before spending a
+    # translation on it, so a partial transcript is retried rather than posted.
+    assessment = await translator.assess_completeness(
+        transcript,
+        kind="YouTube video transcript",
+        duration_seconds=metadata.duration_seconds,
+    )
+    if not assessment.get("complete", True):
+        raise ContentIncompleteError(
+            assessment.get("reason") or "transcript looks incomplete"
+        )
     try:
         player_rows = await asyncio.to_thread(
             db.query,
@@ -1986,7 +2029,9 @@ async def main():
     tasks = [
         _start_health_server(),
         _enrich_article_catalog(),
-        article_monitor.run_monitor(_publish_article_from_url),
+        article_monitor.run_monitor(
+            _publish_article_from_url, _notify_article_abandoned
+        ),
         client.run_until_disconnected(),
         deadlines.run_deadline_loop(
             client=client,
@@ -1998,10 +2043,6 @@ async def main():
             target_channel=_target_channel(),
             league_code=runtime_config.get("EPL_LEAGUE_CODE"),
             price_predictions_enabled=runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"),
-        ),
-        scheduler.run_goal_watcher(
-            client=client,
-            target_channel=_target_channel(),
         ),
         youtube_monitor.run_monitor(
             settings.youtube_api_key,

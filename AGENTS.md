@@ -71,6 +71,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - English transcripts use a quota-aware RapidAPI chain with `X_RAPIDAPI_KEY`, in this order: `youtube-captions-transcript-subtitles-video-combiner`, `youtube-transcripts`, `youtube-transcript3`, `youtube-2-transcript`, and `youtube-transcripts-playlists-channels-search1`. Provider HTTP/auth/quota failures are persisted in `youtube_transcript_provider_health` and skipped until the next UTC calendar month; a valid no-captions response is treated as video-specific and allows the next provider. `transcriptapi` is not subscribed and is excluded.
 - The two caption providers are intentionally first because they retrieve YouTube subtitle tracks when available; their normalized SRT/segment output is preferred over generated speech recognition. The additional RapidAPI speech-recognition endpoints require an uploaded `audio_file`, so they are not usable as direct YouTube fallbacks without a separate audio-download/encoding pipeline.
 - If every transcript provider is exhausted for an automatically monitored upload, the admin bot sends a one-time private failure notification and leaves the video unseen so a later poll can retry it.
+- `VideoMetadata.duration_seconds` comes from the `contentDetails` part that was already being requested. It feeds the transcript completeness check, which runs **before** translation so a partial transcript costs one small call rather than a full translation.
 - Before translation, the transcript is passed through an AI correction pass using the full FPL player glossary (`first_name`, `second_name`, `web_name`, aliases, and club) to normalize likely ASR name errors to canonical English names. After translation and final transcript formatting, the visible text is deterministically mapped to `first_name_fa`/`second_name_fa` or `web_name_fa`; HTML tags and attributes (including URLs) are never changed. Keep both stages: correction improves recognition, while the final mapping guarantees Persian player names.
 - Every transcript uses the structured article translator. It reconstructs raw captions into paragraphs, inferred topic headings, and genuine lists; short inline posts convert that structure into Telegram-safe bold headings, spacing, and bullets, while long posts retain Telegraph HTML.
 
@@ -102,7 +103,21 @@ Returns `limit`, `usage`, `is_free_tier`, and `limit_remaining` fields.
 
 The LLM prompt lives in `teleadmin_project/prompt.txt` (not hardcoded). `{text}` placeholder is replaced at runtime. The model and fallback model are configured in `.env` (`OPEN_ROUTER_MODEL`) and `config.py` (`fallback_model`) respectively.
 
-For article translations, `article_prompt.txt` asks the LLM for structured JSON output (`title`, `summary`, `body`). `translator.translate_article()` parses the JSON with fallback to regular translation + auto-generated title/summary.
+For article translations, `article_prompt.txt` asks the LLM for structured JSON output (`title`, `summary`, `body`, `removed_images`, `complete`, `incomplete_reason`). `translator.translate_article()` parses the JSON with fallback to regular translation + auto-generated title/summary.
+
+### Never use `str.format()` on a prompt
+
+Prompts are filled by `translator._render()`, which does literal `{name}` replacement. `str.format()` must not be used: `article_prompt.txt` contains a literal JSON example, and `{ "title": ... }` is parsed as a replacement field, so `ARTICLE_PROMPT.format()` raised `KeyError` on **every** call. The structured article path therefore always failed and silently fell back to plain translation — which had a 4096-token ceiling and truncated long articles. Any new prompt containing braces breaks the same way under `.format()`.
+
+### Output-token ceilings and truncation
+
+Persian is token-heavy relative to English, so translated output is much longer than the English source suggests. The ceilings in `translator.py` (`_MAX_TOKENS_*`) are deliberately generous; the previous 4096/8192 values silently cut long articles and transcripts mid-sentence.
+
+`translator._response_text()` inspects `finish_reason` on every completion and raises `TruncatedResponseError` when it is `"length"`. This is the API's own report that output was cut off, so it is exact — prefer it over any heuristic. The summary call is the one deliberate exception: a clipped summary is cosmetic, so it tolerates the ceiling rather than failing the publish.
+
+### Tone
+
+All translation prompts ask for casual, conversational Persian — how an Iranian FPL fan talks to other fans — rather than formal written Persian. Tone never overrides the FPL terminology dictionary, player/club names, numbers, or prices. `transcript_format_prompt.txt` is explicitly told to preserve the casual register, because that pass runs after translation and would otherwise re-formalize the text.
 
 ## Git push
 
@@ -157,27 +172,39 @@ Formatting: `alerts.format_farsi()` looks up player names/prices in the DB and o
 
 Alerts are posted immediately (not scheduled for review) since they're time-sensitive live events.
 
-### Live goal alerts
+Goal alerts are source-driven only. An API-polling live-goal watcher was tried
+and removed: it could not reliably detect the scoring minute, so it failed to
+match the source alert for deduplication and posted every goal twice, while not
+being meaningfully faster than the source channel. Do not reintroduce it
+without solving the minute/dedup problem first.
 
-The scheduler runs a separate live-goal watcher every 10 seconds while fixtures
-are in their match window. It compares scorelines and player IDs from the
-official FPL fixture feed (`fixtures/?event={gw}`), posts a goal as soon as the
-score changes, and leaves the assister pending. LiveFPL is not used for goal
-detection. The target message ID is stored in `goal_alerts`; later official
-scorer updates and source-confirmed scorer/assist/own-goal alerts edit that
-same message. Player resolution for every match event is constrained to the
-two clubs in the fixture, preventing same-name players at unrelated clubs
-from being selected. HTTP/API failures retain the last state and retry on the
-next pass. If a VAR correction removes a previously reported goal, the
-watcher edits that post to strike all content above `@EPL_Fantasy` and records
-the cancellation; if the goal is restored, the provisional post can be
-unstruck and refreshed.
+Player resolution for every match event is constrained to the two clubs in the
+fixture (`alerts._resolve_player()` takes `strict_team_code`/
+`allowed_team_codes`), preventing same-name players at unrelated clubs from
+being selected.
 
 ## Price-change alerts
 
 Source-channel price-change posts are ignored. The scheduler curates the report directly from the official FPL bootstrap payload, including confirmed changes and next-update projections.
 
+`price_changes.is_price_change()` gates that exclusion and must stay tolerant of the source channel's formatting. It has posted both `Price Fallers! 📉 (3) #FPL` with `🔴 J.Timber #ARS £6.1m` rows and, later, `Price Fallers! 📉 #FPL` with `⬇ Madueke £6.3m` rows — no count, no team code. The old regex required the count, so the newer posts fell through to the LLM and were published as translated articles. Detection now accepts a leading header on its own, and elsewhere in a message requires at least two `£x.xm` rows so prose about risers and fallers is still translated normally. `parse_price_change()` is unused; only detection matters.
+
 The official report lists every confirmed rise, and only confirmed/predicted falls for players above 1% ownership. Each riser/faller list is sorted by ownership descending, and rows are wrapped in `<blockquote>`.
+
+### Confirmed changes are detected, not scheduled
+
+Confirmed changes are found by **diffing official prices against a saved baseline**, not by posting at a fixed clock time. FPL applies price changes at roughly 01:30 UTC and the exact moment drifts, so a fixed-time post either fires before the change lands or misses it. Do not reintroduce a clock-triggered confirmed-price post.
+
+- `livefpl.fetch_price_payload()` fetches the bootstrap **once**; the diff, the report, and the new baseline all come from that single payload. Re-fetching between those steps loses any change that lands in between.
+- The baseline lives in `last_updated` under `price_prediction_snapshot` and advances **only after Telegram accepts the post**, so a failed send retries on the next pass and a change is never reported twice.
+- `livefpl.load_price_snapshot()` returns `None` (never seeded) versus `{}` (seeded but empty) deliberately. With no baseline the scheduler seeds it silently and posts nothing — `cost_change_event` counts the whole gameweek, not the last day, so it is not a valid stand-in for "today's changes".
+- Because it is a diff, changes that happen while the bot is down are reported on the next successful pass.
+- The bootstrap is ~1.7MB, so the check runs on its own `_PRICE_POLL_INTERVAL` (5 min) rather than every 30s scheduler tick.
+- `PRICE_PREDICTIONS_ENABLED` gates **only** the 23:30 prediction watchlist. Confirmed changes are always reported.
+
+### Scheduler jobs are individually isolated
+
+Every job in `run_scheduler`'s loop has its own `try`/`except`. They previously shared one block, so a failure in the lineup check silently suppressed every price report for the life of the process. Keep them isolated when adding jobs.
 
 ## Lineups
 
@@ -196,11 +223,10 @@ The FPL league code is stored in `LEAGUE_CODE` env var (default `433b70`). The f
 
 ## LiveFPL API integration (`livefpl.py`)
 
-The bot fetches post-match points/EO data from `livefpl.us` and price/live-goal data from the official FPL API — **no Playwright needed**. The endpoints are:
+The bot fetches post-match points/EO data from `livefpl.us` and price data from the official FPL API — **no Playwright needed**. The endpoints are:
 
 - `https://livefpl.us/api/games.json` — per-game player points, EO%, stats, events. Each player entry: `[web_name, eo%, ?, points, [[stat_name, value, points], ...], element_id, name, pos_code]`. The `minutes` stat in `p[4]` determines who started.
 - `https://fantasy.premierleague.com/api/bootstrap-static/` — official player prices, confirmed gameweek changes, and `price_change_percent` / `price_change_projections` predictions.
-- `https://fantasy.premierleague.com/api/fixtures/?event={gw}` — official live scores and fixture `stats` (including goal and own-goal player IDs) used by the goal watcher.
 
 Key functions:
 - `build_game_text(fixture)` — per-game player points with blockquote formatting, color circles, and starter/sub split
@@ -260,15 +286,14 @@ Runs alongside the bot in `asyncio.gather()`. Automated posts:
 | Post | Trigger | Source |
 |---|---|---|
 | Price predictions | 23:30 Iran time nightly | official FPL bootstrap via `livefpl.build_price_changes_text()` |
-| Actual price changes | 00:00 GMT daily (with a short API-settling delay) | official FPL bootstrap compared with the last report snapshot |
-| Live goal alerts | Every 10s during live-match windows | official FPL fixture score/scorer data, edited with source confirmation |
+| Actual price changes | Whenever official prices differ from the saved baseline (checked every 5 min) | official FPL bootstrap diffed against `price_prediction_snapshot` |
 | EO leaderboard | 75 minutes after each deadline | `livefpl.build_eo_text()` |
 | Game points | When game status becomes "Done" in API (polled every 30s) | `livefpl.build_game_text()` |
 | Deadline-passed | At deadline time | `deadlines.py` (unchanged) |
 
 Deduplication uses the `last_updated` DB table (same as deadline posts).
 
-Price predictions can be paused by setting `PRICE_PREDICTIONS_ENABLED=false` in `.env`. The scheduler loop still runs, but `_check_price_post()` is skipped.
+Price predictions can be paused by setting `PRICE_PREDICTIONS_ENABLED=false` in `.env`. The scheduler loop still runs and confirmed price changes are still reported; only the 23:30 prediction watchlist is skipped.
 
 ## Translated post queue
 
@@ -314,8 +339,10 @@ When a source message contains a URL, `_maybe_post_article()` runs **after** the
 
 - `articles.is_pl_article_url()` selects the site-specific Premier League extractor for `premierleague.com/en/news/...`, short `preml.ge/...`, and `t.co/...` links.
 - `articles.fetch_article()` uses BeautifulSoup for Premier League pages and Trafilatura reader mode for other article-like pages. General pages need at least 500 readable characters and are skipped if inaccessible or likely paywalled.
-- Source-specific cleanup removes known promotional blocks and article footers before translation. PL cards/widgets, FFFix Premium blocks, FFScout `READ MORE`/trailing content, and AllAboutFPL `Further Read`/FFHUB/footer blocks are excluded.
+- Source-specific cleanup is now **structural only**: it selects the article container, extracts the feature image, and drops related-article cards and tag buttons. It must not try to find the end of the article.
+- Promotional removal is the translator's job (`article_prompt.txt`). The old scripted end-of-article detection — FFFix's promo-banner filename and offer wording, FFScout's final `wp-block-separator` and `READ MORE:` paragraphs, AllAboutFPL's `Further reads`/FFHUB blocks — was removed. Each keyed on exact site wording or separator structure, so when a site changed either one the heuristic silently truncated real content. Do not reintroduce it.
 - A feature image is selected from the source social/header image, or the first article image, and sent with the Telegram post. It is removed from Telegraph so users do not see it twice. Remaining inline images are replaced with positional `[[TELEADMIN_IMAGE_N]]` markers and restored at those positions afterward.
+- **Deleted promo images must be reported.** `restore_images_in_place()` re-appends any marker the model dropped, so a promotional banner inside a block the translator deleted would reappear at the end of the article. The prompt therefore requires every deliberately-deleted placeholder to be listed in `removed_images`, and that set is passed to `restore_images_in_place(..., removed_images=...)`. Keep those two in sync when changing either side.
 - Source hyperlinks are removed while retaining visible text. The original article URL is appended only at the end of the Telegraph article, never in the Telegram caption.
 
 ### 2. Long-text / merged-chunk articles (>940 chars)
@@ -339,6 +366,22 @@ Long-form content (>940 source chars) and merged text chunks are published as Te
 - YouTube article pages use the fetched YouTube thumbnail URL. URL-imported articles use the selected source/header image URL. No local image copy is required for catalog cards; images are loaded from their public HTTPS URLs. Articles without a recoverable image render as text-only cards.
 - `_enrich_article_catalog()` backfills older imported pages: it generates an AI summary from the full Telegraph content, recovers the original source link when present, derives YouTube thumbnails, and attempts to refetch source-article images. Recovery is impossible when an old page contains neither an image nor an original source link.
 - `article_monitor.py` polls Premier League and Fantasy Football Fix listing pages plus the Fantasy Football Scout and AllAboutFPL RSS feeds every 15 minutes. It seeds the current backlog on first startup, then sends only newly discovered URLs through `_publish_article_from_url()` and the normal half-hour review queue. Seen URLs and retry state live in `runtime_config.db`; `/set ARTICLE_MONITOR_ENABLED false` pauses polling.
+
+## Incomplete-content gate
+
+Partial content is never published. Two independent checks exist:
+
+- **Our output was cut off** — `TruncatedResponseError`, from `finish_reason == "length"`. Exact, not a guess.
+- **The source itself was partial** — `ContentIncompleteError`, from `translator.assess_completeness()` or the `complete` field of the article JSON. Used for a feed that served a truncated article, or a transcript provider that returned only the opening minutes.
+
+`assess_completeness()` is given the character count and, for videos, the duration plus the pre-computed expected range (roughly 750–1100 chars of speech per minute for these talk-heavy channels) — models are unreliable at doing that arithmetic themselves. A clear sign-off outweighs the length heuristic, since it proves the ending was captured. The check fails **open**: an unavailable or unparseable assessment returns `complete: True`, so this gate can never become a new reason for content to vanish silently.
+
+Retry then give up, reporting once:
+
+- Articles: `runtime_config.finish_article_monitor_candidate(..., max_attempts=4)` returns `True` when the attempt budget is spent and moves the URL to status `abandoned`, which `claim_article_monitor_candidate()` never re-claims. `bot._notify_article_abandoned()` then sends one private admin message.
+- YouTube: `bot._notify_youtube_monitor_failure()` counts attempts in memory, retries across polls, then marks the video `skipped` and notifies admins once.
+
+Only the automated feeds are gated (`_publish_article_from_url` and the YouTube transcript path). Source-channel Telegram posts and admin submissions are not — a forwarded post is complete by definition, and gating it would block legitimate content.
 
 ## Public article catalog
 

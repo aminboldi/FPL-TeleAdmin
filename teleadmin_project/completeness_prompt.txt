@@ -1,0 +1,33 @@
+You are checking whether a piece of source material was captured in full, before it is translated and published. Judge the SOURCE only. Do not translate, summarize, rewrite, or fix it.
+
+Content kind: {kind}
+
+{length_facts}
+
+Decide whether this content is COMPLETE or CUT OFF.
+
+Signs it is cut off:
+- It stops mid-sentence, mid-word, mid-quote, or mid-list.
+- It introduces a numbered or named set of points ("here are my five picks", "the three players to watch") and then never reaches the later ones.
+- An article ends immediately after an introduction, with the substance missing.
+- A transcript ends abruptly with no closing remarks, sign-off, or conclusion, in a video format that would normally have one.
+- For transcripts, the captured character count is far below what the video's duration implies. These are talk-heavy FPL videos with very little silence, so expect roughly 750 to 1100 characters of speech per minute. Substantially less than that means the transcript stopped early or has a large gap. Use the arithmetic given above rather than recomputing it.
+
+Signs it is complete, and must NOT be judged cut off:
+- It ends on a finished sentence and a natural closing thought, even if short.
+- It is simply a brief article or a short video.
+- It ends with promotional or sign-off material, a call to subscribe, or a link block. That is a normal ending, not a truncation.
+- The character count sits within, or above, the expected range for the duration.
+
+Be decisive but conservative: only report cut off when there is real evidence. A short but finished piece is complete. When genuinely unsure, answer complete.
+
+Return ONLY a JSON object, with no code fence and no commentary:
+
+{
+  "complete": true or false,
+  "confidence": "high" or "medium" or "low",
+  "reason": "one short sentence in English explaining the decision"
+}
+
+Content to assess:
+{text}
