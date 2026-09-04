@@ -508,6 +508,33 @@ def update_player_farsi_names(
     return len(normalized)
 
 
+def add_player_alias(player_id: int, alias: str, *, limit: int = 12) -> bool:
+    """Append a newly observed spelling to a player's alias list.
+
+    Returns whether anything was stored. The list is capped so a bad run of
+    model output cannot grow the column without bound, and the aliases stay in
+    the same comma-separated form the /players editor reads and writes, so an
+    operator can review or delete whatever was learned.
+    """
+    alias = " ".join(str(alias or "").split())
+    if not alias:
+        return False
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT alias FROM players WHERE id=?", (int(player_id),)
+        ).fetchone()
+        if row is None:
+            return False
+        existing = [part.strip() for part in str(row[0] or "").split(",") if part.strip()]
+        if len(existing) >= limit or alias_matches(row[0], alias):
+            return False
+        conn.execute(
+            "UPDATE players SET alias=? WHERE id=?",
+            (", ".join([*existing, alias]), int(player_id)),
+        )
+    return True
+
+
 def get_db_path() -> Path:
     return DB_PATH
 

@@ -6,7 +6,7 @@ from html import escape
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, Comment, NavigableString
 from telegraph import Telegraph
 import trafilatura
 
@@ -79,10 +79,13 @@ _TELEGRAPH_TAGS = {
     "h3", "h4", "hr", "i", "img", "li", "ol", "p", "pre", "s",
     "strong", "u", "ul",
 }
-_ARTICLE_CATALOGUE_URL = "https://epl-fantasy.ir"
+ARTICLE_CATALOGUE_URL = "https://epl-fantasy.ir"
 _ARTICLE_CATALOGUE_FOOTER = (
-    f'<p><a href="{_ARTICLE_CATALOGUE_URL}">آرشیو مقالات کانال</a></p>'
+    f'<p><a href="{ARTICLE_CATALOGUE_URL}">آرشیو مقالات کانال</a></p>'
 )
+_TELEGRAPH_PAGE_HOSTS = {
+    "telegra.ph", "www.telegra.ph", "graph.org", "www.graph.org",
+}
 _SLUG_WORDS = {
     "آخرین": "akharin", "فانتزی": "fantasy", "درفت": "draft",
     "رتبه": "rank", "فصل": "season", "هفته": "week", "مقاله": "article",
@@ -299,6 +302,7 @@ def _fetch_pl_article(url: str) -> dict | None:
     for widget in soup.select(", ".join(_PL_PROMOTIONAL_SELECTORS)):
         widget.decompose()
 
+    rerouted_links = reroute_internal_links(content_el, final_url)
     parts = []
     for child in content_el.children:
         if not hasattr(child, "name"):
@@ -307,7 +311,11 @@ def _fetch_pl_article(url: str) -> dict | None:
         if tag == "p":
             text = child.get_text(strip=True)
             if text and not text.startswith("Share"):
-                parts.append({"type": "p", "text": text})
+                parts.append({
+                    "type": "p",
+                    "text": text,
+                    "html": _paragraph_html_with_links(child, rerouted_links),
+                })
         elif tag in ("figure", "picture"):
             img = child.find("img")
             if img:
@@ -338,6 +346,38 @@ def _fetch_pl_article(url: str) -> dict | None:
     }
 
 
+def _inline_paragraph_html(node, rerouted_links: set[str]) -> str:
+    if isinstance(node, Comment):
+        return ""
+    if isinstance(node, NavigableString):
+        return escape(str(node), quote=False)
+    if node.name in {"script", "style"}:
+        return ""
+    if node.name == "br":
+        return "<br>"
+    inner = "".join(
+        _inline_paragraph_html(child, rerouted_links) for child in node.children
+    )
+    href = str(node.get("href") or "").strip() if node.name == "a" else ""
+    if href and href in rerouted_links and node.get_text(strip=True):
+        return f'<a href="{escape(href, quote=True)}">{inner}</a>'
+    return inner
+
+
+def _paragraph_html_with_links(paragraph, rerouted_links: set[str]) -> str:
+    """Return paragraph HTML that keeps only its rerouted internal links.
+
+    Empty when the paragraph has none, so an ordinary Premier League paragraph
+    keeps taking the plain-text path it always has.
+    """
+    if not rerouted_links or not any(
+        str(anchor.get("href") or "").strip() in rerouted_links
+        for anchor in paragraph.find_all("a", href=True)
+    ):
+        return ""
+    return _inline_paragraph_html(paragraph, rerouted_links).strip()
+
+
 def _metadata_content(soup: BeautifulSoup, *names: str) -> str:
     for name in names:
         tag = soup.find("meta", attrs={"property": name}) or soup.find(
@@ -348,12 +388,64 @@ def _metadata_content(soup: BeautifulSoup, *names: str) -> str:
     return ""
 
 
+def is_telegraph_url(url: str) -> bool:
+    return (urlparse(str(url or "").strip()).hostname or "").lower() in _TELEGRAPH_PAGE_HOSTS
+
+
+def reroute_internal_links(soup, base_url: str) -> set[str]:
+    """Point a source article's own cross-links at our translation of them.
+
+    These sites link mostly to their own earlier articles, and a large share of
+    those already have a published Persian page in the Telegraph catalog. The
+    hyperlink is therefore worth keeping as long as its destination is replaced
+    by our own article — the reader stays in Persian and inside the channel's
+    catalogue. Anchors whose destination has not been translated are left
+    untouched here and dropped by the caller, exactly as before.
+
+    Returns the Telegraph URLs that anchors now point at, so a caller can tell
+    a rerouted link apart from a Telegraph URL that was in the source page.
+    """
+    # A list of pairs, not a dict: BeautifulSoup hashes a tag by its markup, so
+    # an article that links to the same page twice with the same text would
+    # keep only one of the two anchors.
+    destinations: list[tuple] = []
+    for anchor in soup.find_all("a", href=True):
+        href = urljoin(base_url, str(anchor.get("href") or "").strip())
+        if href.startswith(("http://", "https://")) and anchor.get_text(strip=True):
+            destinations.append((anchor, href))
+    if not destinations:
+        return set()
+
+    try:
+        import article_catalog
+
+        translated = article_catalog.resolve_source_links(
+            {href for _, href in destinations}
+        )
+    except Exception:
+        # A catalog problem must never stop an article from being published;
+        # without the mapping every link is simply dropped as it used to be.
+        logger.exception("Could not resolve internal article links")
+        return set()
+
+    rerouted = set()
+    for anchor, href in destinations:
+        target = translated.get(href, "")
+        if target:
+            anchor.attrs = {"href": target}
+            rerouted.add(target)
+    if rerouted:
+        logger.info("Rerouted %d internal link(s) to published Telegraph articles", len(rerouted))
+    return rerouted
+
+
 def _telegraph_safe_article_html(extracted_html: str, base_url: str) -> tuple[str, list[str]]:
     """Keep reader-mode structure while restricting it to Telegraph-safe HTML."""
     soup = BeautifulSoup(extracted_html, "html.parser")
     for tag in soup.find_all(["script", "style", "noscript", "svg"]):
         tag.decompose()
 
+    rerouted_links = reroute_internal_links(soup, base_url)
     images: list[str] = []
     for tag in soup.find_all(True):
         if tag.name in {"h1", "h2"}:
@@ -363,10 +455,15 @@ def _telegraph_safe_article_html(extracted_html: str, base_url: str) -> tuple[st
             continue
 
         if tag.name == "a":
-            # Source article links are commonly promotional/SEO links. Keep
-            # their visible text, but do not carry the hyperlinks into the
-            # translated Telegraph article.
-            tag.unwrap()
+            # Source article links are otherwise promotional or SEO links, and
+            # a link out of the channel is of no use to a Persian reader. Keep
+            # the visible text and drop everything except the cross-links that
+            # were rerouted to our own published translation.
+            href = str(tag.get("href") or "").strip()
+            if href in rerouted_links:
+                tag.attrs = {"href": href}
+            else:
+                tag.unwrap()
             continue
 
         if tag.name == "img":
@@ -612,7 +709,10 @@ def fetch_general_article(url: str) -> dict | None:
             output_format="html",
             include_comments=False,
             include_formatting=True,
-            include_links=False,
+            # Links are kept here only so ``_telegraph_safe_article_html`` can
+            # see them; it drops every one that is not rerouted to one of our
+            # own published articles.
+            include_links=True,
             include_images=True,
             favor_precision=True,
             deduplicate=True,
@@ -659,14 +759,82 @@ def fetch_general_article(url: str) -> dict | None:
     }
 
 
+def _article_image_candidates(article: dict) -> list[str]:
+    candidates = list(article.get("images") or [])
+    candidates.extend(
+        part.get("src", "")
+        for part in article.get("parts") or []
+        if part.get("type") == "img"
+    )
+    candidates.extend(
+        article.get(field, "") for field in ("feature_image", "header_image")
+    )
+    return list(dict.fromkeys(url for url in candidates if url))
+
+
+def _drop_recurring_images(article: dict) -> dict:
+    """Remove the banners this source puts on every article.
+
+    Identified by how widely an image is reused rather than by its filename or
+    its surrounding wording — see ``article_images``. A promo banner that
+    survives to translation is the one thing the model cannot deal with: it
+    can delete the promotional *text* around it, but the picture stays.
+    """
+    candidates = _article_image_candidates(article)
+    if not candidates:
+        return article
+
+    try:
+        import article_catalog
+        import article_images
+
+        recurring = article_images.recurring_images(
+            article_catalog.source_key(article.get("url", "")), candidates
+        )
+    except Exception:
+        # Never let image bookkeeping cost us the article.
+        logger.exception("Could not check article images for recurring banners")
+        return article
+    if not recurring:
+        return article
+
+    surviving = [url for url in candidates if url not in recurring]
+    logger.info(
+        "Dropping %d recurring image(s) from %s; %d image(s) left",
+        len(recurring),
+        article.get("url", ""),
+        len(surviving),
+    )
+    article["images"] = [
+        url for url in article.get("images") or [] if url not in recurring
+    ]
+    if article.get("parts"):
+        article["parts"] = [
+            part for part in article["parts"]
+            if not (part.get("type") == "img" and part.get("src") in recurring)
+        ]
+    if article.get("html"):
+        article["html"] = remove_images_from_html(
+            article["html"], sorted(recurring), article.get("url", "")
+        )
+    for field in ("feature_image", "header_image"):
+        if article.get(field) in recurring:
+            # Only swap when there is something to swap to. Publishing needs a
+            # feature image, and a banner is better than no article.
+            article[field] = surviving[0] if surviving else article[field]
+    return article
+
+
 def fetch_article(url: str) -> dict | None:
     """Use the site-specific extractor when available, reader mode otherwise."""
     if is_excluded_premier_league_article(url):
         logger.info("Skipping excluded Premier League article %s", url)
         return None
     if is_pl_article_url(url):
-        return _fetch_pl_article(url)
-    return fetch_general_article(url)
+        article = _fetch_pl_article(url)
+    else:
+        article = fetch_general_article(url)
+    return _drop_recurring_images(article) if article else article
 
 
 def build_article_html(title: str, date: str, summary: str, parts: list[dict], original_url: str, header_image: str = "") -> str:
@@ -679,7 +847,7 @@ def build_article_html(title: str, date: str, summary: str, parts: list[dict], o
         result.append(f"<p><b>{summary}</b></p>")
     for part in parts:
         if part["type"] == "p":
-            result.append(f"<p>{part['text']}</p>")
+            result.append(f"<p>{part.get('html') or part['text']}</p>")
         elif part["type"] == "img":
             src = part["src"]
             result.append(f'<img src="{src}">')
@@ -741,8 +909,15 @@ def prepare_article_html(html_content: str) -> tuple[str, list[str]]:
     after translation, avoiding the old append-all-images fallback.
     """
     soup = BeautifulSoup(html_content, "html.parser")
+    # Links that survived extraction were rerouted to our own Telegraph
+    # articles, so they are carried through translation. Anything else is a
+    # source hyperlink that must not reach the published page.
     for anchor in soup.find_all("a"):
-        anchor.unwrap()
+        href = str(anchor.get("href") or "").strip()
+        if is_telegraph_url(href) and anchor.get_text(strip=True):
+            anchor.attrs = {"href": href}
+        else:
+            anchor.unwrap()
 
     image_urls = []
     for image in soup.find_all("img"):
@@ -758,11 +933,77 @@ def prepare_article_html(html_content: str) -> tuple[str, list[str]]:
     return "".join(str(child) for child in root.contents).strip(), image_urls
 
 
-def _remove_article_links(html_content: str) -> str:
-    """Remove hyperlinks while retaining their visible article text."""
-    soup = BeautifulSoup(html_content, "html.parser")
+def reroute_html_links(html_content: str) -> tuple[str, set[str]]:
+    """Apply internal-link rerouting to an already-assembled HTML fragment.
+
+    Used by the Telegram paths, whose hyperlinks come from message entities
+    rather than a scraped page. Text with no hyperlink at all is returned
+    unchanged so those paths keep the exact markup they build today.
+    """
+    content = str(html_content or "")
+    soup = BeautifulSoup(content, "html.parser")
+    if not soup.find("a"):
+        return content, set()
+
+    rerouted = reroute_internal_links(soup, "")
     for anchor in soup.find_all("a"):
-        anchor.unwrap()
+        href = str(anchor.get("href") or "").strip()
+        if href in rerouted:
+            anchor.attrs = {"href": href}
+        else:
+            anchor.unwrap()
+    root = soup.body or soup
+    return "".join(str(child) for child in root.contents).strip(), rerouted
+
+
+def strip_image_markers(html_content: str) -> str:
+    """Remove leftover image placeholders from text that keeps no images.
+
+    The inline-post path publishes the translation as a caption, so a marker
+    the model kept for an image that was dropped would be shown to readers.
+    """
+    soup = BeautifulSoup(
+        _IMAGE_MARKER_RE.sub("", str(html_content or "")), "html.parser"
+    )
+    for wrapper in list(soup.find_all(["p", "figure"])):
+        if not wrapper.get_text(strip=True) and not wrapper.find("img"):
+            wrapper.decompose()
+    root = soup.body or soup
+    return "".join(str(child) for child in root.contents).strip()
+
+
+def article_link_targets(html_content: str) -> set[str]:
+    """Return the rerouted Telegraph destinations present in article HTML.
+
+    Collected before translation so the model's output can be checked against
+    the links it was actually given.
+    """
+    soup = BeautifulSoup(str(html_content or ""), "html.parser")
+    return {
+        str(anchor.get("href") or "").strip()
+        for anchor in soup.find_all("a", href=True)
+        if is_telegraph_url(str(anchor.get("href") or ""))
+    }
+
+
+def sanitize_article_links(
+    html_content: str, allowed_links: set[str] | None = None,
+) -> str:
+    """Keep only approved hyperlinks, retaining every anchor's visible text.
+
+    ``allowed_links`` are the rerouted internal links the model was given. A
+    link the model invented, moved to a different destination, or copied out of
+    the source text is not in that set and is removed, so a mangled URL can
+    only ever cost us the link — never publish a wrong one.
+    """
+    allowed = {str(url).strip() for url in (allowed_links or set())}
+    soup = BeautifulSoup(str(html_content or ""), "html.parser")
+    for anchor in soup.find_all("a"):
+        href = str(anchor.get("href") or "").strip()
+        if href in allowed and anchor.get_text(strip=True):
+            anchor.attrs = {"href": href}
+        else:
+            anchor.unwrap()
     root = soup.body or soup
     return "".join(str(child) for child in root.contents).strip()
 
@@ -862,6 +1103,7 @@ def restore_images_in_place(
     *,
     source_html: str | None = None,
     removed_images: set[int] | None = None,
+    allowed_links: set[str] | None = None,
 ) -> str:
     """Restore translated image markers at their original article positions.
 
@@ -869,6 +1111,9 @@ def restore_images_in_place(
     purpose because they belonged to a promotional block. They are not
     "missing" images, so they must never be re-appended at the end of the
     article — that would put the advert banner back after the content.
+
+    ``allowed_links`` are the rerouted internal links given to the translator;
+    every other hyperlink in its output is removed.
     """
     dropped = {int(index) for index in (removed_images or set())}
     if dropped:
@@ -876,7 +1121,9 @@ def restore_images_in_place(
             "" if index in dropped else url
             for index, url in enumerate(image_urls, start=1)
         ]
-    soup = BeautifulSoup(_remove_article_links(html_content), "html.parser")
+    soup = BeautifulSoup(
+        sanitize_article_links(html_content, allowed_links), "html.parser"
+    )
     if source_html:
         restored = _restore_images_by_source_position(
             soup, image_urls, source_html
@@ -1101,6 +1348,22 @@ def normalize_telegraph_structure(html_content: str) -> str:
             continue
         flush(child)
     flush()
+
+    # Telegraph's own editor produces neither of the next two shapes, and a
+    # page that deviates from the structure Telegram's Instant View template
+    # expects is rendered as an ordinary web page instead: it loads slowly, in
+    # Telegraph's own light theme, ignoring the reader's font. Both were
+    # visible on published pages — a root-level <br> on every article built
+    # from Telegram text, and an unwrapped <img> on every article with inline
+    # images — so normalize them here, at the one boundary every page crosses.
+    for line_break in list(root.find_all("br", recursive=False)):
+        # The text on either side of this break is already in its own
+        # paragraph, so the break itself carries nothing.
+        line_break.decompose()
+
+    for image in list(root.find_all("img")):
+        if image.find_parent("figure") is None:
+            image.wrap(soup.new_tag("figure"))
 
     # Models sometimes put all translated prose inside one <p> while keeping
     # the source's newlines. HTML rendering collapses those newlines, so make

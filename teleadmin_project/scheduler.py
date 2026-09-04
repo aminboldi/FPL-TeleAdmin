@@ -8,6 +8,7 @@ import livefpl
 import runtime_config
 import alerts
 import official_lineups
+import player_names
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,9 @@ async def run_scheduler(client, target_channel: str, league_code: str, price_pre
             if now_monotonic >= next_db_refresh:
                 try:
                     result = await asyncio.to_thread(db.refresh_from_fpl_api)
+                    # A refresh can add players, and translations resolve
+                    # Persian names through a cached index of them.
+                    await asyncio.to_thread(player_names.reload)
                     logger.info(
                         "FPL database refreshed: %d players, %d fixtures, %d new players",
                         result["player_count"],

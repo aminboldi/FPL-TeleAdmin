@@ -21,6 +21,34 @@ _TRANSCRIPT_URL = f"https://{_RAPID_HOST}/api/transcript-with-url"
 _YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 _THUMBNAIL_PREFERENCE = ("maxres", "standard", "high", "medium", "default")
 _HASHTAG_RE = re.compile(r"(?<!\w)#[\w-]+", re.UNICODE)
+# A slash is deliberately not a separator: it holds seasons together ("2025/26").
+_TITLE_SEPARATOR_RE = re.compile(r"\s*[|｜•·]\s*|\s+[–—]\s+")
+_EMOJI_RE = re.compile(
+    "[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f000-\U0001f2ff️⬀-⯿]"
+)
+# A title segment that is only one of these says nothing about the video. Each
+# has to match a whole segment, so none of them can cut into real wording.
+_TITLE_NOISE_SEGMENTS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        # Season tags, alone or behind the game's name: "FPL 2025/26",
+        # "Fantasy Premier League 25/26", "فانتزی 2025/26", "Season 9".
+        r"(?:fpl|fantasy\s+premier\s+league|فانتزی(?:\s+پریمیر\s*لیگ)?|فصل)?"
+        r"\s*(?:20)?\d{2}\s*[/\-–]\s*(?:20)?\d{2}",
+        r"season\s*\d+",
+        # The game's name used as a tag rather than as part of a sentence.
+        r"fpl",
+        r"fantasy\s+premier\s+league",
+        r"فانتزی",
+        r"فانتزی\s+پریمیر\s*لیگ",
+        # Rank boasts: "3x Top 10k", "Top 1k Finisher", "1M OR", "#1 in the World".
+        r"\d+\s*x\s*top\s*\d+\s*k?",
+        r"top\s*\d+\s*k?(?:\s+finisher)?",
+        r"\d+(?:\.\d+)?\s*[mk]\s*(?:or|overall)",
+        r"#?\s*1\s*(?:in\s+the\s+world|overall|ranked)",
+        r"تاپ\s*\d+\s*(?:هزار|k)?",
+    )
+)
 _AD_TITLE_RE = re.compile(r"(?<!\w)#ad(?!\w)|(?<!\w)ad(?!\w)", re.IGNORECASE)
 _SHORTS_HASHTAG_RE = re.compile(r"(?<!\w)#shorts(?!\w)", re.IGNORECASE)
 _ISO_DURATION_RE = re.compile(
@@ -90,13 +118,49 @@ def is_ad_title(title: str) -> bool:
     return bool(_AD_TITLE_RE.search(str(title or "")))
 
 
+def _is_noise_segment(segment: str) -> bool:
+    """Whether a separator-delimited title segment is a tag, not a title.
+
+    Only a segment that is *entirely* one of these is dropped. "FPL" inside a
+    sentence, or a gameweek the video is actually about, is left alone: the
+    same words carry meaning in the middle of a title and none at the end of
+    one, and only the position tells them apart.
+    """
+    text = segment.strip().strip("[](){}<>«»\"'").strip()
+    if not text:
+        return True
+    return any(pattern.fullmatch(text) for pattern in _TITLE_NOISE_SEGMENTS)
+
+
 def clean_video_title(title: str) -> str:
-    """Remove hashtags from a title while keeping the remaining wording."""
-    cleaned = _HASHTAG_RE.sub("", str(title or ""))
+    """Strip hashtags and leftover search tags from a translated video title.
+
+    The model is asked to remove search and self-promotion fragments while it
+    translates (``translator.VIDEO_TITLE_INSTRUCTIONS``); this is the
+    deterministic net underneath it, for the mechanical leftovers that survive
+    translation unchanged because they are digits and Latin abbreviations.
+    """
+    cleaned = _EMOJI_RE.sub("", str(title or ""))
+
+    # Segments are judged before hashtags are stripped, because a rank boast is
+    # often written as one ("#1 in the World"), and again afterwards, because
+    # removing a hashtag can leave a segment with nothing in it.
+    segments = [
+        segment for segment in _TITLE_SEPARATOR_RE.split(cleaned)
+        if not _is_noise_segment(segment)
+    ]
+    segments = [_HASHTAG_RE.sub("", segment).strip() for segment in segments]
+    segments = [
+        segment for segment in segments
+        if segment and not _is_noise_segment(segment)
+    ]
+    # Never return nothing: a title made only of tags keeps its own words.
+    cleaned = " | ".join(segments) or _HASHTAG_RE.sub("", cleaned)
+
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
-    cleaned = cleaned.strip(" -|–—")
-    return cleaned
+    cleaned = re.sub(r"\(\s*\)|\[\s*\]", "", cleaned)
+    return cleaned.strip(" -|–—:،")
 
 
 class _ProviderFailure(Exception):

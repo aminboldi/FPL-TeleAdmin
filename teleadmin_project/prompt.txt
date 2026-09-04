@@ -56,7 +56,7 @@ H: میزبان
 A: مهمان
 Draft: درفت
 DCL: کالورت لوین
-VVD: فندایک
+VVD: فن دایک
 RDZ: دیزربی
 MLS: لوئیس اسکلی
 
@@ -65,6 +65,7 @@ BOU: بورنموث | ARS: آرسنال | AVL: استون ویلا | BRE: برن
 
 Don't translate "m" in prices, for example "£10.0m" doesn't translate to "£10.0م" 10 میلیون پوند
 
+{player_names}
 
 Text to translate:
 {text}

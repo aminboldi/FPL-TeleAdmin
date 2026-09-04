@@ -16,6 +16,7 @@ from telegraph.utils import ALLOWED_TAGS, html_to_nodes
 import articles
 import article_catalog
 import database
+import player_names
 
 logger = logging.getLogger(__name__)
 
@@ -772,6 +773,9 @@ async def handle_http(reader, writer) -> None:
                     )
                 ]
                 changed = await asyncio.to_thread(database.update_player_farsi_names, updates)
+                # Translations resolve Persian names through a cached index, so
+                # an edit made here has to take effect on the next post.
+                await asyncio.to_thread(player_names.reload)
             except Exception as exc:
                 logger.exception("Failed to save player names")
                 await _send_response(writer, 400, _message_page(f"ذخیره نام‌ها ناموفق بود: {exc}"))

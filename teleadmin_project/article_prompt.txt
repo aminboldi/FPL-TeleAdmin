@@ -32,10 +32,10 @@ Judging completeness:
 - When in doubt, set "complete" to true.
 
 Constraints for the body:
-- Return valid Telegraph HTML only; never use Markdown. Telegraph supports: <p>, <br>, <h3>, <h4>, <b>, <strong>, <i>, <em>, <blockquote>, <ul>, <ol>, <li>, <hr>, <code>, <pre>, <img>, and <figure>.
-- The input may contain HTML formatting tags. Preserve every existing tag and every existing attribute EXACTLY, except that hyperlinks must be removed as described below. You may add only the supported Telegraph tags above around plain text to make the article readable.
+- Return valid Telegraph HTML only; never use Markdown. Telegraph supports: <p>, <br>, <h3>, <h4>, <b>, <strong>, <i>, <em>, <blockquote>, <ul>, <ol>, <li>, <hr>, <code>, <pre>, <img>, <a>, and <figure>.
+- The input may contain HTML formatting tags. Preserve every existing tag and every existing attribute EXACTLY. You may add only the supported Telegraph tags above around plain text to make the article readable.
 - Image placeholders in the form [[TELEADMIN_IMAGE_1]], [[TELEADMIN_IMAGE_2]], etc. represent inline images. Preserve every placeholder exactly, do not translate, duplicate, or reorder them, and keep each one at the same point in the article where it appears in the input. Leave them as plain text placeholders; do not wrap them in <img>, put them in an HTML attribute, or replace them with a URL. The only placeholders you may remove are those inside a promotional block you deleted, and each one you remove must be listed in "removed_images".
-- Do not create, preserve, or move hyperlinks. If any <a> tag is present, keep its visible text but remove the link itself.
+- Any <a> tag in the input has already been checked and points to our own Persian article. Keep each one exactly where it is, copy its href character for character, and translate only the visible link text. Never change, shorten, or invent a href, never add a link to text that has none, and never move a link to a different phrase. A link inside a promotional block you delete is deleted with it.
 - Format the body as a real article, never as one continuous block: use <p>...</p> for short, coherent paragraphs (normally 1–3 related sentences) and insert paragraph breaks generously whenever the topic, speaker, or point changes.
 - Plain-text source may contain meaningful single and blank line breaks. Treat blank lines as paragraph boundaries and preserve meaningful single breaks with <br>; never collapse the entire source into one uninterrupted paragraph.
 - Use <h3> or <h4> only for genuine section changes that improve scanning. Use <ul>/<ol> with <li> for real enumerations, steps, comparisons, or grouped recommendations; do not turn ordinary prose into a list.
@@ -50,6 +50,8 @@ Team Abbreviations:
 BOU: بورنموث | ARS: آرسنال | AVL: استون ویلا | BRE: برنتفورد | BHA: برایتون | BUR: برنلی | CHE: چلسی | CRY: کریستال پالاس | EVE: اورتون | FUL: فولام | LEE: لیدز | LIV: لیورپول | MCI: منچستر سیتی | MUN: منچستر یونایتد | NEW: نیوکاسل | NFO: ناتینگهام فارست | SUN: ساندرلند | TOT: تاتنهام | WHU: وست هم | WOL: ولوز
 
 Don't translate "m" in prices (e.g., "£10.0m" stays "£10.0m").
+
+{player_names}
 
 Text to translate:
 {text}

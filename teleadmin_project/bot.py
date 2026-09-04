@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,7 +24,7 @@ from telethon.tl.types import (
 )
 
 from config import load_config
-from translator import Translator, TranslationError, ContentIncompleteError
+from translator import Translator, TranslationError, ContentIncompleteError, VIDEO_TITLE_INSTRUCTIONS
 import alerts
 import price_changes
 import deadlines
@@ -38,6 +39,7 @@ import x_posts
 import youtube_posts
 import youtube_monitor
 import livefpl
+import player_names
 from admin_dashboard import AdminDashboard
 
 logging.basicConfig(
@@ -80,16 +82,34 @@ _ARTICLE_SOURCE_THRESHOLD = 940
 # Media captions are limited to 1,024 rendered characters. Keep the short
 # article heuristic conservative because Persian translation can expand and
 # the caption also contains the article header, source link, and signature.
-_SHORT_ARTICLE_SOURCE_LIMIT = 700
-_SHORT_ARTICLE_CAPTION_LIMIT = 950
+# Not everything needs a Telegraph page. A translation that fits in a caption,
+# with no inline image to place, is published as an ordinary post carrying its
+# feature image. There is no separate length limit on the body: the caption
+# either holds the whole thing or the article goes to Telegraph, so nothing is
+# ever trimmed to make it fit.
 _CHUNK_TIMEOUT = 3  # seconds to wait for text chunks from same chat
-_FORWARDED_BATCH_TIMEOUT = 3  # seconds of quiet before merging forwarded posts
+# A quiet window is the only thing holding a forwarded burst together, so it has
+# to outlast the slowest post in it. Three seconds was short enough that a post
+# arriving behind the others — in practice one carrying a photo — missed the
+# batch and was published on its own. Once the batch contains media it waits
+# longer still, because that is when arrival is most uneven.
+_FORWARDED_BATCH_TIMEOUT = 6
+_FORWARDED_BATCH_MEDIA_TIMEOUT = 12
 _YOUTUBE_DESCRIPTION_PREVIEW_LIMIT = 500
 _CATALOG_VISIBILITY_LOOKBACK = timedelta(days=3)
-# Photo captions are limited to 1,024 rendered characters.  This leaves room
-# for the YouTube header, title, original-video link, and AI signature.
-_YOUTUBE_INLINE_TRANSCRIPT_LIMIT = 800
+_CATALOG_ENRICHMENT_BATCH = 25
+# One start's worth of backlog. Each page costs a Telegraph fetch, and pages
+# that recover nothing are stamped so the next start continues past them.
+_CATALOG_ENRICHMENT_LIMIT = 500
+_CATALOG_ENRICHMENT_DELAY = 0.5
+# Telegram's own limit on the caption of a media post, in UTF-16 code units.
+# This, not the body limit above, is what usually decides: a caption also
+# carries the title, the source link, and the AI signature.
+_MEDIA_CAPTION_LIMIT = 1024
 _AUTOMATIC_ONLY_SOURCE_REFS = ("@FPLFootball",)
+# A match plus stoppage, a delayed start, and the wait before the API marks it
+# finished. A fixture unfinished for longer than this was postponed.
+_FIXTURE_IN_PROGRESS_HOURS = 4
 
 _album_buffer: dict[int, list] = {}
 _album_tasks: dict[int, asyncio.Task] = {}
@@ -100,6 +120,7 @@ _chunk_tasks: dict[int, asyncio.Task] = {}
 _forward_batch_buffer: dict[int, list] = {}
 _forward_batch_tasks: dict[int, asyncio.Task] = {}
 _forward_batch_waiters: dict[int, list[asyncio.Future]] = {}
+_forward_batch_deadlines: dict[int, float] = {}
 _pending_dashboard_content: str | None = None
 _admin_bot_client: TelegramClient | None = None
 _schedule_slot_lock = asyncio.Lock()
@@ -263,6 +284,17 @@ def _rendered_text_length(text: str) -> int:
     return len(html_lib.unescape(_strip_html_tags(text)))
 
 
+def _caption_length(text: str) -> int:
+    """Measure a caption the way Telegram does, in UTF-16 code units.
+
+    An emoji costs two, and every caption here ends with the AI signature, so
+    counting characters would under-report and let a caption through that
+    Telegram then rejects.
+    """
+    rendered = html_lib.unescape(_strip_html_tags(text))
+    return len(rendered.encode("utf-16-le")) // 2
+
+
 def _strip_article_images(text: str) -> str:
     return re.sub(r"<img\b[^>]*>", "", text, flags=re.IGNORECASE)
 
@@ -340,11 +372,12 @@ def _format_short_article_post(
     return "\n\n".join(part for part in parts if part)
 
 
+# The thumbnail already shows whose video it is, so the posts open with the
+# title rather than with a "new video from <channel>" line that repeated it.
 def _format_youtube_telegraph_post(
-    title: str, summary: str, telegraph_url: str, original_url: str, channel_title: str,
+    title: str, summary: str, telegraph_url: str, original_url: str,
 ) -> str:
     return (
-        f"<b>▶️ ویدئوی جدید کانال {_escape_html(channel_title)}</b>\n\n"
         f"<b>{_escape_html(title)}</b>\n\n"
         f"- - - - - - - - -\n\n"
         f"{summary}\n\n"
@@ -355,10 +388,9 @@ def _format_youtube_telegraph_post(
 
 
 def _format_youtube_inline_post(
-    title: str, transcript: str, original_url: str, channel_title: str,
+    title: str, transcript: str, original_url: str,
 ) -> str:
     return (
-        f"<b>▶️ ویدئوی جدید کانال {_escape_html(channel_title)}</b>\n\n"
         f"<b>{title}</b>\n\n"
         f"{transcript}\n\n"
         f'<a href="{_escape_html(original_url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a>\n\n'
@@ -424,6 +456,18 @@ def _prepare_plain_article_layout(html: str) -> str:
     if not html or re.search(r"<(?:blockquote|a)\b", html, flags=re.IGNORECASE):
         return html
     return html.replace("\r\n", "\n").replace("\n", "<br>")
+
+
+def _prepare_article_source(html: str) -> tuple[str, set[str]]:
+    """Ready a Telegram post for the article translator.
+
+    Rerouting runs first: a post's hyperlinks either become links to our own
+    published translation or disappear, and only once they are gone can the
+    plain-text layout pass see the post for what it is and make its line breaks
+    explicit.
+    """
+    rerouted, allowed_links = articles.reroute_html_links(html)
+    return _prepare_plain_article_layout(rerouted), allowed_links
 
 _PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
 _ENGLISH_DIGITS = "01234567890123456789"
@@ -1066,12 +1110,14 @@ async def handle_new_message(event, *, automatic_only: bool = False):
     if html:
         try:
             if len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
-                result = await translator.translate_article(
-                    _prepare_plain_article_layout(html)
-                )
+                source_html, allowed_links = _prepare_article_source(html)
+                result = await translator.translate_article(source_html)
                 title = _article_title(result.get("title", ""))
                 summary = result.get("summary", "")
-                body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+                body = articles.sanitize_article_links(
+                    _fix_unclosed_tags(_strip_quotes(result.get("body", ""))),
+                    allowed_links,
+                )
                 telegraph_url = articles.publish_to_telegraph(
                     title,
                     body,
@@ -1136,12 +1182,14 @@ async def _finish_chunks(chat_id: int):
     translated = None
     if html:
         try:
-            result = await translator.translate_article(
-                _prepare_plain_article_layout(html)
-            )
+            source_html, allowed_links = _prepare_article_source(html)
+            result = await translator.translate_article(source_html)
             title = _article_title(result.get("title", ""))
             summary = result.get("summary", "")
-            body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+            body = articles.sanitize_article_links(
+                _fix_unclosed_tags(_strip_quotes(result.get("body", ""))),
+                allowed_links,
+            )
             telegraph_url = articles.publish_to_telegraph(
                 title,
                 body,
@@ -1212,17 +1260,15 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     else:
         raw_html = articles.build_general_article_html(article)
 
-    short_html = _strip_article_images(raw_html)
-    source_length = _rendered_text_length(short_html)
-    is_short_article = source_length <= _SHORT_ARTICLE_SOURCE_LIMIT
     raw_html = articles.remove_images_from_html(
         raw_html, [feature_image], article.get("url", url)
     )
 
-    if is_short_article:
-        translation_html, inline_images = short_html, []
-    else:
-        translation_html, inline_images = articles.prepare_article_html(raw_html)
+    translation_html, inline_images = articles.prepare_article_html(raw_html)
+    # The source's own cross-links have already been rerouted to our published
+    # translations of those articles. Keep the list so any other hyperlink the
+    # model returns can be dropped.
+    allowed_links = articles.article_link_targets(translation_html)
     result = await translator.translate_article(translation_html)
     if not result.get("complete", True):
         raise ContentIncompleteError(
@@ -1236,14 +1282,38 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
     if not translated.strip():
         raise RuntimeError("Article translation was empty.")
 
-    if is_short_article:
+    # Prefer the image positions represented in the extracted article HTML.
+    # The article-level image list is only a fallback for pages whose reader
+    # mode omitted all inline images (for example, lazy-loaded images).
+    source_images = inline_images or article.get(
+        "images", [article.get("header_image", "")]
+    )
+    source_images = [image for image in source_images if image != feature_image]
+    kept_images = [
+        image
+        for index, image in enumerate(source_images, start=1)
+        if index not in (result.get("removed_images") or set())
+    ]
+
+    # Telegraph is for what genuinely needs a page. A translation that fits in
+    # a caption and carries no inline image reads better as an ordinary post
+    # with its feature image, so the decision is made here, on the finished
+    # Persian text, rather than guessed from the length of the English source.
+    if not kept_images:
+        # The Telegraph path sanitizes links while restoring images; a caption
+        # never goes through that, so it is cleaned here.
+        inline_body = articles.strip_image_markers(
+            articles.sanitize_article_links(translated, allowed_links)
+        )
         caption = _format_short_article_post(
             title,
-            translated,
+            inline_body,
             article["url"],
             source_name=article.get("source_name", ""),
         )
-        if _rendered_text_length(caption) <= _SHORT_ARTICLE_CAPTION_LIMIT:
+        body_length = _rendered_text_length(inline_body)
+        caption_length = _caption_length(caption)
+        if caption_length <= _MEDIA_CAPTION_LIMIT:
             feature_path = await asyncio.to_thread(
                 _download_remote_media, feature_image, "photo"
             )
@@ -1258,28 +1328,24 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
             finally:
                 Path(feature_path).unlink(missing_ok=True)
             logger.info(
-                "Published short article as a featured-image post (%d source chars, %d caption chars)",
-                source_length,
-                _rendered_text_length(caption),
+                "Published %s as a featured-image post (%d body chars, %d caption units)",
+                url,
+                body_length,
+                caption_length,
             )
             return True
         logger.info(
-            "Short article expanded beyond the media-caption limit (%d chars); using Telegraph",
-            _rendered_text_length(caption),
+            "Article translation needs Telegraph: %d body chars, %d caption units",
+            body_length,
+            caption_length,
         )
 
-    # Prefer the image positions represented in the extracted article HTML.
-    # The article-level image list is only a fallback for pages whose reader
-    # mode omitted all inline images (for example, lazy-loaded images).
-    source_images = inline_images or article.get(
-        "images", [article.get("header_image", "")]
-    )
-    source_images = [image for image in source_images if image != feature_image]
     translated = articles.restore_images_in_place(
         translated,
         source_images,
         source_html=translation_html,
         removed_images=result.get("removed_images") or set(),
+        allowed_links=allowed_links,
     )
     translated = articles.append_original_article_link(
         translated, article["url"], article.get("source_name", "")
@@ -1402,100 +1468,74 @@ async def _import_youtube_transcript(url: str) -> str:
         raise ContentIncompleteError(
             assessment.get("reason") or "transcript looks incomplete"
         )
-    try:
-        player_rows = await asyncio.to_thread(
-            db.query,
-            """
-            SELECT p.first_name, p.second_name, p.web_name,
-                   p.first_name_fa, p.second_name_fa, p.web_name_fa,
-                   p.alias,
-                   t.short_name AS team
-            FROM players AS p
-            JOIN teams AS t ON t.id = p.team_id
-            ORDER BY p.id
-            """,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Could not load player glossary for transcript correction: %s", exc
-        )
-        player_rows = []
-    player_glossary = []
-    for player in player_rows:
-        first_name = str(player.get("first_name") or "").strip()
-        second_name = str(player.get("second_name") or "").strip()
-        canonical = " ".join(part for part in (first_name, second_name) if part)
-        first_name_fa = str(player.get("first_name_fa") or "").strip()
-        second_name_fa = str(player.get("second_name_fa") or "").strip()
-        canonical_fa = " ".join(
-            part for part in (first_name_fa, second_name_fa) if part
-        )
-        if canonical:
-            player_glossary.append(
-                {
-                    "canonical": canonical,
-                    "display": str(player.get("web_name") or "").strip(),
-                    "canonical_fa": canonical_fa,
-                    "display_fa": str(player.get("web_name_fa") or "").strip(),
-                    "aliases": str(player.get("alias") or "").strip(),
-                    "team": str(player.get("team") or "").strip(),
-                }
-            )
+    # Speech recognition mangles player names before anything is translated, so
+    # this pass is given the whole roster; every other path resolves the names
+    # it actually needs from the same index.
+    player_glossary = await asyncio.to_thread(player_names.glossary)
     transcript = await translator.correct_transcript(transcript, player_glossary)
     _refresh_translator_model()
+    # YouTube titles carry search tags and self-promotion that mean nothing in
+    # the channel. The model is asked to drop them while translating; the
+    # scripted pass afterwards is a net for the mechanical leftovers.
     translated_title = youtube_posts.clean_video_title(
         _fix_unclosed_tags(
             _strip_quotes(
                 await translator.translate(
                     _escape_html(metadata.title),
-                    player_glossary=player_glossary,
+                    instructions=VIDEO_TITLE_INSTRUCTIONS,
                 )
             )
         )
     )
-    if len(transcript) <= _YOUTUBE_INLINE_TRANSCRIPT_LIMIT:
-        article = await translator.translate_article(
-            _escape_html(transcript),
-            transcript=True,
-            player_glossary=player_glossary,
-        )
-        translated_transcript = _telegraph_to_telegram_html(
-            _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
-        )
-        if not translated_transcript.strip():
-            raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
-        inline_caption = _format_youtube_inline_post(
-            translated_title,
-            translated_transcript,
-            url,
-            metadata.channel_title,
-        )
-        # Providers can expand text substantially.  Keep the post usable by
-        # falling back to the long-form pipeline instead of exceeding Telegram's
-        # photo-caption limit.
-        if len(_strip_html_tags(inline_caption)) <= 1000:
-            thumbnail = await asyncio.to_thread(
-                _download_remote_media, metadata.thumbnail_url, "photo"
-            )
-            try:
-                await _send_to_target(
-                    inline_caption, file_path=thumbnail,
-                    queue=True,
-                )
-                await _send_notification(
-                    None, inline_caption, source="YouTube", is_media=True,
-                )
-            finally:
-                Path(thumbnail).unlink(missing_ok=True)
-            return (
-                f"✅ متن فارسی کوتاه برای بررسی، {QUEUED_POST_CONFIRMATION}"
-            )
-
     article = await translator.translate_article(
-        _escape_html(transcript),
-        transcript=True,
-        player_glossary=player_glossary,
+        _escape_html(transcript), transcript=True,
     )
+    # A transcript contains no hyperlinks, so any link in the translation was
+    # invented by the model.
+    article_body = articles.sanitize_article_links(
+        _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
+    )
+    if not article_body.strip():
+        raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
+
+    # Short videos read better as an ordinary post with the thumbnail than as a
+    # Telegraph page. The English transcript's length predicts neither the
+    # Persian length nor the caption's, so the finished text decides.
+    inline_caption = _format_youtube_inline_post(
+        translated_title,
+        _telegraph_to_telegram_html(article_body),
+        url,
+    )
+    transcript_length = _rendered_text_length(article_body)
+    caption_length = _caption_length(inline_caption)
+    if caption_length <= _MEDIA_CAPTION_LIMIT:
+        thumbnail = await asyncio.to_thread(
+            _download_remote_media, metadata.thumbnail_url, "photo"
+        )
+        try:
+            await _send_to_target(
+                inline_caption, file_path=thumbnail, queue=True,
+            )
+            await _send_notification(
+                None, inline_caption, source="YouTube", is_media=True,
+            )
+        finally:
+            Path(thumbnail).unlink(missing_ok=True)
+        logger.info(
+            "Published %s as an inline post (%d body chars, %d caption units)",
+            url,
+            transcript_length,
+            caption_length,
+        )
+        return (
+            f"✅ متن فارسی کوتاه برای بررسی، {QUEUED_POST_CONFIRMATION}"
+        )
+    logger.info(
+        "Transcript needs Telegraph: %d body chars, %d caption units",
+        transcript_length,
+        caption_length,
+    )
+
     article_title = _article_title(
         translated_title or _fix_unclosed_tags(_strip_quotes(article.get("title", "")))
     )
@@ -1508,9 +1548,6 @@ async def _import_youtube_transcript(url: str) -> str:
     article_summary = _fix_unclosed_tags(_strip_quotes(article.get("summary", "")))
     if not article_summary:
         article_summary = _youtube_description_preview(translated_description)
-    article_body = _fix_unclosed_tags(_strip_quotes(article.get("body", "")))
-    if not article_body.strip():
-        raise RuntimeError("ترجمهٔ زیرنویس خالی بود.")
     article_body += (
         f'\n\n<p><a href="{_escape_html(url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a></p>'
     )
@@ -1529,7 +1566,6 @@ async def _import_youtube_transcript(url: str) -> str:
         article_summary,
         telegraph_url,
         url,
-        metadata.channel_title,
     )
     thumbnail = await asyncio.to_thread(
         _download_remote_media, metadata.thumbnail_url, "photo"
@@ -1571,67 +1607,178 @@ def _forwarded_post_html(event) -> tuple[str, list[str]]:
     return html, links
 
 
+@dataclass
+class _ForwardedPost:
+    """One post of a forwarded burst, which may be an album of several messages."""
+
+    html: str
+    links: list[str]
+    photo_event: object | None
+
+
+def _is_photo_message(event) -> bool:
+    """Whether this message carries an image that could open the article.
+
+    A forwarded video or file is still a member of the batch and its caption is
+    still used, but it is not something to publish as a feature image.
+    """
+    message = event.message
+    if message.photo:
+        return True
+    mime = str(getattr(getattr(message, "document", None), "mime_type", "") or "")
+    return mime.startswith("image/")
+
+
+def _forwarded_batch_posts(events: list) -> list[_ForwardedPost]:
+    """Turn the raw burst into posts, collapsing each album into one.
+
+    Telegram delivers an album as one message per item, with the caption on
+    whichever item happens to carry it, so counting them individually would
+    treat one post as several and lose the caption's place in the sequence.
+    """
+    posts: list[_ForwardedPost] = []
+    by_album: dict[int, _ForwardedPost] = {}
+    for event in events:
+        html, links = _forwarded_post_html(event)
+        photo_event = event if _is_photo_message(event) else None
+        album = getattr(event.message, "grouped_id", None)
+        post = by_album.get(album) if album is not None else None
+        if post is None:
+            post = _ForwardedPost(html=html, links=list(links), photo_event=photo_event)
+            posts.append(post)
+            if album is not None:
+                by_album[album] = post
+            continue
+        if html and not post.html:
+            post.html = html
+        post.links.extend(link for link in links if link not in post.links)
+        if post.photo_event is None:
+            post.photo_event = photo_event
+    return posts
+
+
+async def _download_forwarded_photo(event) -> str | None:
+    """Download one forwarded image to a temporary file, or return None."""
+    if event is None:
+        return None
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=_media_suffix(event))
+    temp.close()
+    try:
+        await event.message.download_media(file=temp.name)
+    except Exception:
+        logger.exception("Could not download the forwarded article's feature image")
+        Path(temp.name).unlink(missing_ok=True)
+        return None
+    if not os.path.getsize(temp.name):
+        Path(temp.name).unlink(missing_ok=True)
+        return None
+    return temp.name
+
+
 async def _translate_forwarded_article(events: list) -> str:
     """Merge a burst of forwarded posts into one Telegraph article."""
     first_event = events[0]
-    parts = []
+    posts = _forwarded_batch_posts(events)
+    parts = [post.html for post in posts if post.html]
     all_links: list[str] = []
-    for event in events:
-        html, links = _forwarded_post_html(event)
-        if html:
-            parts.append(html)
-        for link in links:
-            if link not in all_links:
-                all_links.append(link)
+    for post in posts:
+        all_links.extend(link for link in post.links if link not in all_links)
+    # The first image opens the article; the rest are dropped, but every post's
+    # text is part of the chain whether or not it came with a picture.
+    feature_event = next(
+        (post.photo_event for post in posts if post.photo_event is not None), None
+    )
+    logger.info(
+        "Merging %d forwarded post(s) into one article: %d with text, %d with an image",
+        len(posts),
+        len(parts),
+        sum(1 for post in posts if post.photo_event is not None),
+    )
     merged_html = "\n\n".join(parts).strip()
     if not merged_html:
         raise ValueError("پست‌های فورواردشده متن قابل استفاده‌ای ندارند.")
 
-    result = await translator.translate_article(merged_html)
+    merged_html, allowed_links = articles.reroute_html_links(merged_html)
+    result = await translator.translate_article(merged_html, merged_posts=len(parts) > 1)
     title = _article_title(_fix_unclosed_tags(_strip_quotes(result.get("title", ""))))
     summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
-    body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
-    telegraph_url = articles.publish_to_telegraph(
-        title,
-        body,
-        summary=summary,
-        source_tag="Telegram",
+    body = articles.sanitize_article_links(
+        _fix_unclosed_tags(_strip_quotes(result.get("body", ""))), allowed_links
     )
-    if telegraph_url:
-        caption = _format_telegraph_post(title, summary, telegraph_url)
-        await _send_to_target(caption, event=first_event, queue=True)
-    else:
-        link_url = await _display_link_url(all_links)
-        caption = _build_caption(body, link_url=link_url, html=True)
-        await _forward_message(caption, first_event)
-    await _send_notification(first_event, caption)
-    return f"✅ {len(events)} پست فورواردشده به یک مقالهٔ واحد تبدیل شد؛ {QUEUED_POST_CONFIRMATION}"
+    feature_path = await _download_forwarded_photo(feature_event)
+    attachment = feature_path
+    try:
+        telegraph_url = articles.publish_to_telegraph(
+            title,
+            body,
+            summary=summary,
+            source_tag="Telegram",
+        )
+        if telegraph_url:
+            caption = _format_telegraph_post(title, summary, telegraph_url)
+            if attachment and _rendered_text_length(caption) > _MEDIA_CAPTION_LIMIT:
+                # Telegram refuses an over-long caption on a media post, and the
+                # article is worth more than the picture that opens it.
+                logger.info(
+                    "Merged-article caption is %d characters; posting it without the feature image",
+                    _rendered_text_length(caption),
+                )
+                attachment = None
+            await _send_to_target(
+                caption, file_path=attachment, event=first_event, queue=True
+            )
+        else:
+            attachment = None
+            link_url = await _display_link_url(all_links)
+            caption = _build_caption(body, link_url=link_url, html=True)
+            await _forward_message(caption, first_event)
+    finally:
+        if feature_path:
+            Path(feature_path).unlink(missing_ok=True)
+    await _send_notification(first_event, caption, is_media=bool(attachment))
+    return (
+        f"✅ {len(posts)} پست فورواردشده به یک مقالهٔ واحد تبدیل شد"
+        + ("، با تصویر شاخص" if attachment else "")
+        + f"؛ {QUEUED_POST_CONFIRMATION}"
+    )
 
 
 async def _finish_forwarded_batch(chat_id: int) -> None:
-    await asyncio.sleep(_FORWARDED_BATCH_TIMEOUT)
-    events = _forward_batch_buffer.pop(chat_id, [])
-    _forward_batch_tasks.pop(chat_id, None)
-    waiters = _forward_batch_waiters.pop(chat_id, [])
-    if not events:
-        for waiter in waiters:
-            if not waiter.done():
-                waiter.set_result("")
-        return
+    loop = asyncio.get_running_loop()
+    # Wait out the quiet window rather than restarting a task per message: a
+    # later post extends the deadline, and once the wait ends the batch is
+    # closed and handed on. Cancelling the task instead, as this used to, could
+    # abort a publish that had already started and leave the admin's dashboard
+    # call waiting for a reply that never came.
+    while True:
+        remaining = _forward_batch_deadlines.get(chat_id, 0.0) - loop.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(remaining)
 
+    events = _forward_batch_buffer.pop(chat_id, [])
+    waiters = _forward_batch_waiters.pop(chat_id, [])
+    _forward_batch_deadlines.pop(chat_id, None)
+    # Released before publishing, so a post arriving during the publish opens a
+    # new batch instead of joining one that has already been taken.
+    _forward_batch_tasks.pop(chat_id, None)
+
+    result = ""
     try:
         if len(events) == 1:
             result = await _translate_dashboard_single_submission(events[0])
-        else:
+        elif events:
             result = await _translate_forwarded_article(events)
     except Exception as exc:
+        logger.exception("Forwarded batch of %d post(s) failed", len(events))
         result = f"❌ {exc}"
-    for index, waiter in enumerate(waiters):
-        if waiter.done():
-            continue
-        # One confirmation is enough for the whole burst; the other callback
-        # invocations suppress their duplicate dashboard replies.
-        waiter.set_result(result if index == 0 else "")
+    finally:
+        for index, waiter in enumerate(waiters):
+            if waiter.done():
+                continue
+            # One confirmation is enough for the whole burst; the other callback
+            # invocations suppress their duplicate dashboard replies.
+            waiter.set_result(result if index == 0 else "")
 
 
 async def _queue_forwarded_submission(event) -> str:
@@ -1640,10 +1787,19 @@ async def _queue_forwarded_submission(event) -> str:
     waiter = loop.create_future()
     _forward_batch_buffer.setdefault(chat_id, []).append(event)
     _forward_batch_waiters.setdefault(chat_id, []).append(waiter)
-    previous = _forward_batch_tasks.get(chat_id)
-    if previous:
-        previous.cancel()
-    _forward_batch_tasks[chat_id] = asyncio.create_task(_finish_forwarded_batch(chat_id))
+    window = (
+        _FORWARDED_BATCH_MEDIA_TIMEOUT
+        if any(
+            _has_uploadable_media(queued)
+            for queued in _forward_batch_buffer[chat_id]
+        )
+        else _FORWARDED_BATCH_TIMEOUT
+    )
+    _forward_batch_deadlines[chat_id] = loop.time() + window
+    if chat_id not in _forward_batch_tasks:
+        _forward_batch_tasks[chat_id] = asyncio.create_task(
+            _finish_forwarded_batch(chat_id)
+        )
     return await waiter
 
 
@@ -1669,12 +1825,13 @@ async def _translate_dashboard_single_submission(event) -> str:
     html = html.strip()
 
     if html and len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
-        result = await translator.translate_article(
-            _prepare_plain_article_layout(html)
-        )
+        source_html, allowed_links = _prepare_article_source(html)
+        result = await translator.translate_article(source_html)
         title = _article_title(_fix_unclosed_tags(_strip_quotes(result.get("title", ""))))
         summary = _fix_unclosed_tags(_strip_quotes(result.get("summary", "")))
-        body = _fix_unclosed_tags(_strip_quotes(result.get("body", "")))
+        body = articles.sanitize_article_links(
+            _fix_unclosed_tags(_strip_quotes(result.get("body", ""))), allowed_links
+        )
         telegraph_url = articles.publish_to_telegraph(
             title, body, summary=summary, source_tag="Telegram",
         )
@@ -1813,62 +1970,94 @@ async def _recent_telegraph_pages() -> list[dict]:
 
 
 async def _enrich_article_catalog() -> None:
-    """Backfill images and AI summaries for imported Telegraph pages."""
+    """Backfill source links, images, and AI summaries for indexed pages.
+
+    This runs once per start and works through the whole backlog in batches
+    rather than only the first page of it. An indexed article that never
+    recovers its source URL can never be linked to by a later translation, so
+    a catalog built up before internal-link rerouting existed would otherwise
+    stay unusable for it indefinitely.
+    """
     import article_catalog
 
     if not os.getenv("TELEGRAPH_ACCESS_TOKEN"):
         return
+    attempted: set[str] = set()
     try:
         await asyncio.to_thread(article_catalog.sync_from_telegraph)
-        pages = await asyncio.to_thread(
-            article_catalog.pages_needing_enrichment, 50
-        )
-        for page in pages:
-            try:
-                remote = await asyncio.to_thread(
-                    articles.get_telegraph_page, page["url"]
-                )
-                content = str(remote.get("content") or "")
-                source_url = page.get("source_url") or article_catalog.first_source_url(content)
-                image_url = (
-                    page.get("image_url")
-                    or article_catalog.first_image_url(content)
-                )
-                if not image_url and source_url:
-                    image_url = _youtube_thumbnail_url(source_url)
-                    if not image_url:
-                        source_article = await asyncio.to_thread(
-                            articles.fetch_article, source_url
-                        )
-                        if source_article:
-                            image_url = (
-                                source_article.get("feature_image")
-                                or source_article.get("header_image", "")
-                                or next(
-                                    iter(source_article.get("images", [])), ""
-                                )
-                            )
-                summary = page.get("summary", "")
-                generated_summary = ""
-                if page.get("summary_source") != "ai" or not summary:
-                    generated_summary = await translator.summarize_article(content)
-                    summary = generated_summary or summary
-                await asyncio.to_thread(
-                    article_catalog.update_metadata,
-                    page["url"],
-                    summary=summary,
-                    image_url=image_url,
-                    source_url=source_url,
-                    summary_source="ai" if generated_summary else page.get(
-                        "summary_source", "telegraph"
-                    ),
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to enrich Telegraph catalog page %s", page.get("url")
-                )
+        while len(attempted) < _CATALOG_ENRICHMENT_LIMIT:
+            batch = await asyncio.to_thread(
+                article_catalog.pages_needing_enrichment,
+                _CATALOG_ENRICHMENT_BATCH,
+            )
+            pages = [page for page in batch if page["path"] not in attempted]
+            if not pages:
+                # Every page still needing work has already had its turn.
+                break
+            for page in pages:
+                attempted.add(page["path"])
+                await _enrich_catalog_page(page)
+                # A whole-backlog sweep asks Telegraph, and sometimes a source
+                # site, for one page after another. Nothing waits on this, so
+                # pace it rather than risk a rate limit.
+                await asyncio.sleep(_CATALOG_ENRICHMENT_DELAY)
+        if attempted:
+            logger.info("Enriched %d Telegraph catalog page(s)", len(attempted))
     except Exception:
         logger.exception("Telegraph catalog enrichment failed")
+
+
+async def _enrich_catalog_page(page: dict) -> None:
+    """Recover one indexed page's source link, image, and AI summary."""
+    import article_catalog
+
+    try:
+        remote = await asyncio.to_thread(
+            articles.get_telegraph_page, page["url"]
+        )
+        content = str(remote.get("content") or "")
+        source_url = page.get("source_url") or article_catalog.first_source_url(content)
+        image_url = (
+            page.get("image_url")
+            or article_catalog.first_image_url(content)
+        )
+        if not image_url and source_url:
+            image_url = _youtube_thumbnail_url(source_url)
+            if not image_url:
+                source_article = await asyncio.to_thread(
+                    articles.fetch_article, source_url
+                )
+                if source_article:
+                    image_url = (
+                        source_article.get("feature_image")
+                        or source_article.get("header_image", "")
+                        or next(iter(source_article.get("images", [])), "")
+                    )
+        summary = page.get("summary", "")
+        generated_summary = ""
+        if page.get("summary_source") != "ai" or not summary:
+            generated_summary = await translator.summarize_article(content)
+            summary = generated_summary or summary
+        await asyncio.to_thread(
+            article_catalog.update_metadata,
+            page["url"],
+            summary=summary,
+            image_url=image_url,
+            source_url=source_url,
+            summary_source="ai" if generated_summary else page.get(
+                "summary_source", "telegraph"
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to enrich Telegraph catalog page %s", page.get("url")
+        )
+    finally:
+        # Pages are taken never-attempted first, then oldest attempt first, so
+        # every page must be stamped whether or not anything was recovered.
+        await asyncio.to_thread(
+            article_catalog.mark_enrichment_attempt, page.get("url", "")
+        )
 
 
 async def _article_catalog_url() -> str:
@@ -1887,13 +2076,58 @@ async def _import_article(url: str) -> str:
     )
 
 
-def _fixtures_text() -> str:
-    gameweek = db.query_one(
-        "SELECT id, name FROM gameweeks WHERE is_current=1 OR is_next=1 "
-        "ORDER BY CASE WHEN is_current=1 THEN 0 ELSE 1 END, id LIMIT 1"
+def _gameweek_has_football_left(gameweek_id: int) -> bool:
+    """Whether this gameweek still has a match to come or in progress.
+
+    A fixture that has been unfinished for longer than a match can last was
+    postponed rather than played, and must not hold a gameweek open until the
+    rescheduled date.
+    """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=_FIXTURE_IN_PROGRESS_HOURS)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return bool(
+        db.query_scalar(
+            "SELECT count(*) FROM fixtures "
+            "WHERE gameweek_id=? AND finished=0 AND kickoff_time > ?",
+            (gameweek_id, cutoff),
+        )
     )
-    if not gameweek:
+
+
+def _fixtures_gameweek() -> dict:
+    """Return the gameweek whose fixtures are worth posting.
+
+    The FPL API keeps a gameweek ``is_current`` until the *next* one's
+    deadline, so between the final whistle and that deadline this command was
+    still advertising matches that had already been played. Once the current
+    gameweek has no football left in it, the next one is what people want.
+    """
+    current = db.query_one(
+        "SELECT id, name FROM gameweeks WHERE is_current=1 ORDER BY id LIMIT 1"
+    )
+    if current:
+        if _gameweek_has_football_left(current["id"]):
+            return current
+        upcoming = db.query_one(
+            "SELECT g.id, g.name FROM gameweeks g "
+            "JOIN fixtures f ON f.gameweek_id = g.id "
+            "WHERE g.id > ? GROUP BY g.id ORDER BY g.id LIMIT 1",
+            (current["id"],),
+        )
+        # Nothing follows the final gameweek of a season.
+        return upcoming or current
+
+    upcoming = db.query_one(
+        "SELECT id, name FROM gameweeks WHERE is_next=1 ORDER BY id LIMIT 1"
+    )
+    if not upcoming:
         raise RuntimeError("گیم‌ویک فعلی یا بعدی پیدا نشد.")
+    return upcoming
+
+
+def _fixtures_text() -> str:
+    gameweek = _fixtures_gameweek()
     fixtures = db.query(
         """SELECT f.kickoff_time, ht.short_name_fa AS home_fa, ht.short_name AS home_en,
                   at.short_name_fa AS away_fa, at.short_name AS away_en
@@ -2025,6 +2259,10 @@ async def main():
         logger.info("Admin dashboard enabled for %d user(s)", len(settings.admin_user_ids))
     else:
         logger.warning("Admin dashboard disabled: set TELEGRAM_BOT_TOKEN and ADMIN_USER_IDS")
+
+    # Build the player-name index before the first message arrives, so no
+    # translation pays for it.
+    await asyncio.to_thread(player_names.reload)
 
     tasks = [
         _start_health_server(),

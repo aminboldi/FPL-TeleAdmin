@@ -7,6 +7,8 @@ import html as html_lib
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
+import player_names
+
 logger = logging.getLogger(__name__)
 
 _prompt_path = Path(__file__).parent / "prompt.txt"
@@ -35,6 +37,26 @@ _MAX_TOKENS_FORMAT = 32768
 _MAX_TOKENS_CORRECTION = 32768
 _MAX_TOKENS_SUMMARY = 800
 _MAX_TOKENS_ASSESS = 600
+VIDEO_TITLE_INSTRUCTIONS = """
+
+Additional instructions for this input:
+- The input is a YouTube video title from an FPL channel. Return the Persian title that belongs above the video in a Telegram post, not a literal translation of every word in it.
+- Remove the parts that exist for YouTube search or for the creator's promotion rather than to say what the video is about: season tags ("FPL 2025/26", "2026/27", "Season 9"); a bare "FPL" or "Fantasy Premier League" used as a tag rather than as part of the sentence; channel, creator, and co-host names; rank claims ("3x Top 10k", "Top 1k Finisher", "1M OR", "#1 in the World"); sponsor, discount, and giveaway mentions; "subscribe", "must watch", "you NEED to see this" urging; hashtags; emoji; and bracketed tags that carry no information.
+- Keep everything that says what the video is about: the gameweek, player and club names, chip names, transfers, deadlines, prices, and the question the video answers.
+- Do not add a topic the title does not contain, do not make it longer, and do not turn a statement into a question. A title that is already clean is simply translated.
+- Return one line of plain text: no quotation marks, no surrounding brackets, no trailing full stop, and no explanation.
+"""
+
+_MERGED_POSTS_INSTRUCTIONS = """
+
+Additional instructions for this input:
+- The input is several separate Telegram posts, published one after another and merged here in their original order. It is not one continuous article, and the first post is not an introduction to the others.
+- The title must describe the whole set. Titling the article after the opening post is wrong. When the posts share a subject, title it after that subject; when they are separate items, use a title that covers them together.
+- The summary must synthesize every post, not the first one.
+- Keep every post's content and its order. Do not drop a post, and do not merge two posts into one statement.
+- Give each post its own paragraph, and add an <h3> heading only where a post clearly begins a new topic.
+"""
+
 _TRANSCRIPT_FORMATTING_INSTRUCTIONS = """
 
 Additional instructions for this raw YouTube transcript:
@@ -82,44 +104,6 @@ def _translate_team_abbreviations(text: str) -> str:
         parts[index] = _TEAM_ABBREVIATION_RE.sub(
             lambda match: _TEAM_ABBREVIATIONS[match.group(0)], parts[index]
         )
-    return "".join(parts)
-
-
-def _translate_player_names(
-    text: str, player_glossary: list[dict[str, str]] | None,
-) -> str:
-    """Replace known English player names in visible text with Persian names."""
-    if not text or not player_glossary:
-        return text
-
-    replacements: dict[str, str] = {}
-    for player in player_glossary:
-        for source_key, target_key in (
-            ("canonical", "canonical_fa"),
-            ("display", "display_fa"),
-        ):
-            source = str(player.get(source_key) or "").strip()
-            target = str(player.get(target_key) or "").strip()
-            if source and target and source.casefold() != target.casefold():
-                replacements[source] = target
-    if not replacements:
-        return text
-
-    # Prefer full names before surnames and replace only visible text, never
-    # HTML tags or attributes such as image and hyperlink URLs.
-    patterns = [
-        (
-            re.compile(rf"(?<![\w]){re.escape(source)}(?![\w])", re.IGNORECASE),
-            target,
-        )
-        for source, target in sorted(
-            replacements.items(), key=lambda item: len(item[0]), reverse=True
-        )
-    ]
-    parts = re.split(r"(<[^>]*>)", text)
-    for index in range(0, len(parts), 2):
-        for pattern, target in patterns:
-            parts[index] = pattern.sub(target, parts[index])
     return "".join(parts)
 
 
@@ -203,32 +187,39 @@ class Translator:
         )
         self.google_model = google_model
 
-    async def translate(
-        self, text: str, *, player_glossary: list[dict[str, str]] | None = None,
-    ) -> str:
+    async def translate(self, text: str, *, instructions: str = "") -> str:
+        """Translate one piece of text, optionally under extra instructions.
+
+        ``instructions`` are appended to the shared translation prompt so a
+        caller with a specific job — a video title that needs its search tags
+        removed — gets the same terminology dictionary and player glossary
+        without a second model call or a duplicated prompt file.
+        """
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
             translated = await self._call_model(
-                self.google_client, self.google_model, text
+                self.google_client, self.google_model, text, instructions
             )
-            return _translate_player_names(
-                _translate_team_abbreviations(_normalize_digits(translated)),
-                player_glossary,
-            )
+            return self._finish_text(translated, text)
         except Exception:
             try:
                 translated = await self._call_model(
-                    self.openrouter_client, self.fallback_model, text
+                    self.openrouter_client, self.fallback_model, text, instructions
                 )
-                return _translate_player_names(
-                    _translate_team_abbreviations(_normalize_digits(translated)),
-                    player_glossary,
-                )
+                return self._finish_text(translated, text)
             except Exception:
                 raise TranslationError(
                     "Translation failed with both primary and fallback models"
                 )
+
+    @staticmethod
+    def _finish_text(translated: str, source_text: str) -> str:
+        """Normalize a model response into the channel's own spellings."""
+        return player_names.enforce(
+            _translate_team_abbreviations(_normalize_digits(translated)),
+            source_text=source_text,
+        )
 
     async def correct_transcript(
         self, text: str, player_glossary: list[dict[str, str]]
@@ -289,69 +280,72 @@ class Translator:
         return "\n".join(lines)
 
     async def translate_article(
-        self,
-        text: str,
-        *,
-        transcript: bool = False,
-        player_glossary: list[dict[str, str]] | None = None,
+        self, text: str, *, transcript: bool = False, merged_posts: bool = False,
     ) -> dict[str, str]:
-        def finish(article: dict[str, str]) -> dict[str, str]:
-            return {
-                key: _translate_player_names(value, player_glossary)
-                if isinstance(value, str) else value
-                for key, value in article.items()
-            }
-
-        formatting_instructions = _TRANSCRIPT_FORMATTING_INSTRUCTIONS if transcript else ""
-        try:
-            if not self.google_client:
-                raise TranslationError("Google AI Studio is not configured")
-            article = self._normalize_article(
-                await self._call_article_model(
-                    self.google_client, self.google_model, text, formatting_instructions
-                )
-            )
-            if transcript:
-                article["body"] = await self._format_transcript_body(article.get("body", ""))
-            article["summary"] = (
-                await self.summarize_article(article.get("body", ""))
-                or article.get("summary", "")
-            )
-            return finish(article)
-        except Exception:
+        formatting_instructions = ""
+        if transcript:
+            formatting_instructions = _TRANSCRIPT_FORMATTING_INSTRUCTIONS
+        elif merged_posts:
+            formatting_instructions = _MERGED_POSTS_INSTRUCTIONS
+        for client, model in (
+            (self.google_client, self.google_model),
+            (self.openrouter_client, self.fallback_model),
+        ):
+            if client is None:
+                continue
             try:
                 article = self._normalize_article(
                     await self._call_article_model(
-                        self.openrouter_client, self.fallback_model, text, formatting_instructions
+                        client, model, text, formatting_instructions
                     )
                 )
-                if transcript:
-                    article["body"] = await self._format_transcript_body(article.get("body", ""))
-                article["summary"] = (
-                    await self.summarize_article(article.get("body", ""))
-                    or article.get("summary", "")
-                )
-                return finish(article)
             except Exception:
-                pass
+                continue
+            return await self._finish_article(article, text, transcript=transcript)
+
         # Fallback: translate normally. Summary generation is deliberately
         # handled separately, so a translation/API failure can never turn the
         # first 300 characters of the article into a fake summary.
-        body = await self.translate(text)
-        body = body.strip()
-        if transcript:
-            body = await self._format_transcript_body(body)
+        body = (await self.translate(text)).strip()
         lines = body.split("\n")
-        title = lines[0].strip()[:100] if lines else ""
-        summary = await self.summarize_article(body)
-        return finish({
-            "title": title,
-            "summary": summary,
-            "body": body,
-            "removed_images": set(),
-            "complete": True,
-            "incomplete_reason": "",
-        })
+        return await self._finish_article(
+            {
+                "title": lines[0].strip()[:100] if lines else "",
+                "summary": "",
+                "body": body,
+                "removed_images": set(),
+                "complete": True,
+                "incomplete_reason": "",
+            },
+            text,
+            transcript=transcript,
+        )
+
+    async def _finish_article(
+        self, article: dict, source_text: str, *, transcript: bool,
+    ) -> dict:
+        """Format, summarize, and apply the channel's player spellings.
+
+        The body is corrected before it is summarized: the summary is written
+        from the translated body, so correcting the body first is what stops a
+        wrong player spelling from being copied into the Telegram post.
+        """
+        if transcript:
+            article["body"] = await self._format_transcript_body(
+                article.get("body", "")
+            )
+        article["body"] = player_names.enforce(
+            article.get("body", ""), source_text=source_text
+        )
+        article["summary"] = (
+            await self.summarize_article(article["body"])
+            or article.get("summary", "")
+        )
+        for field in ("title", "summary"):
+            article[field] = player_names.enforce(
+                article.get(field, ""), source_text=source_text
+            )
+        return article
 
     # Talk-heavy FPL videos. Used only to give the model the arithmetic, since
     # models are unreliable at computing a ratio themselves.
@@ -483,6 +477,9 @@ class Translator:
         raw = re.sub(r"<[^>]+>", "", raw)
         raw = html_lib.unescape(re.sub(r"\s+", " ", raw)).strip(" \"'")
         raw = _translate_team_abbreviations(_normalize_digits(raw))
+        # The summary is written from an already-corrected body, but it is also
+        # generated on its own for catalog cards, so it is normalized here too.
+        raw = player_names.enforce(raw)
         if len(raw) <= 400:
             return raw
 
@@ -617,11 +614,20 @@ class Translator:
             for chunk in chunks
         )
 
-    async def _call_model(self, client: AsyncOpenAI, model: str, text: str) -> str:
+    async def _call_model(
+        self, client: AsyncOpenAI, model: str, text: str, instructions: str = "",
+    ) -> str:
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "user", "content": _render(TRANSLATION_PROMPT, text=text)}
+                {
+                    "role": "user",
+                    "content": _render(
+                        TRANSLATION_PROMPT,
+                        player_names=player_names.prompt_glossary(text),
+                        text=text,
+                    ) + instructions,
+                }
             ],
             temperature=0.3,
             max_tokens=_MAX_TOKENS_TRANSLATE,
@@ -652,7 +658,11 @@ class Translator:
             messages=[
                 {
                     "role": "user",
-                    "content": _render(ARTICLE_PROMPT, text=text) + formatting_instructions,
+                    "content": _render(
+                        ARTICLE_PROMPT,
+                        player_names=player_names.prompt_glossary(text),
+                        text=text,
+                    ) + formatting_instructions,
                 }
             ],
             temperature=0.3,

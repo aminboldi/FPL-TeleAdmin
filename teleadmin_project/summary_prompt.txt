@@ -10,6 +10,9 @@ Requirements:
 - Write 2 or 3 concise sentences, no more than 400 characters.
 - Synthesize the whole article; do not copy the opening paragraph or any other
   contiguous passage.
+- Some articles merge several separate posts, or cover several distinct items
+  one after another. Cover the whole span in that case: a summary that reflects
+  only the first item is wrong, even when that item is the longest.
 - Prioritize the article's main FPL suggestions, recommendations, decisions,
   and actionable takeaways. Include important player/team names when relevant.
 - If there are several suggestions, combine the most important ones rather than
