@@ -229,13 +229,15 @@ Both producers now render through `format_price_report()`, and new report kinds 
 
 ### The prediction window is hours wide, not minutes
 
-`_price_prediction_key()` returns the key for tonight's watchlist, or `None` outside its window. The window opens at 23:30 Iran time and closes at 03:00, because FPL applies the change at about 05:00 and the watchlist is worth posting right up to it. It used to close at midnight, leaving thirty minutes in which a restart, a deploy, or a slow tick lost the night's post — silently, because the next day's key is a different one and nothing logged the miss.
+`_price_prediction_key()` returns the key for tonight's watchlist, or `None` outside its window. It is expressed **in UTC**, because FPL applies the change at midnight GMT: the window is 20:00–23:30 UTC, opening at the same moment it always did (23:30 Iran) and closing half an hour before the change, by which point a watchlist has nothing left to say. Reasoning about it in Iran time made it look as though it straddled midnight; in UTC it is one uninterrupted evening, and the key is simply the next UTC date.
 
-The key names the date of the **change**, not of the moment, so it is the same either side of midnight and the post cannot repeat. Confirmed changes and the watchlist are also wrapped in separate `try` blocks inside `_check_price_post()`: a failure fetching or posting one must not cost the other.
+It used to be the half hour from 23:30 to midnight Iran time, so a restart or a slow tick inside it lost the night's post — silently, because the next day's key is a different one and every reason to skip was a bare `return`. `_log_prediction_window()` now writes one line per night saying the window opened and whether the setting is off, the post already went, or it is about to be sent. That line is what distinguishes a disabled setting from an unreachable API from a scheduler that was not running.
+
+Confirmed changes and the watchlist are also wrapped in separate `try` blocks inside `_check_price_post()`: a failure fetching or posting one must not cost the other.
 
 ### Confirmed changes are detected, not scheduled
 
-Confirmed changes are found by **diffing official prices against a saved baseline**, not by posting at a fixed clock time. FPL applies price changes at roughly 01:30 UTC and the exact moment drifts, so a fixed-time post either fires before the change lands or misses it. Do not reintroduce a clock-triggered confirmed-price post.
+Confirmed changes are found by **diffing official prices against a saved baseline**, not by posting at a fixed clock time. FPL applies price changes at midnight GMT, the exact moment drifts, and the hour has moved between seasons (it was ~01:30 UTC the previous season), so a fixed-time post either fires before the change lands or misses it. Do not reintroduce a clock-triggered confirmed-price post.
 
 - `livefpl.fetch_price_payload()` fetches the bootstrap **once**; the diff, the report, and the new baseline all come from that single payload. Re-fetching between those steps loses any change that lands in between.
 - The baseline lives in `last_updated` under `price_prediction_snapshot` and advances **only after Telegram accepts the post**, so a failed send retries on the next pass and a change is never reported twice.
@@ -328,7 +330,7 @@ Runs alongside the bot in `asyncio.gather()`. Automated posts:
 
 | Post | Trigger | Source |
 |---|---|---|
-| Price predictions | 23:30 Iran time nightly | official FPL bootstrap via `livefpl.build_price_changes_text()` |
+| Price predictions | Nightly, 20:00–23:30 UTC (23:30–03:00 Iran) | official FPL bootstrap via `livefpl.build_price_changes_text()` |
 | Actual price changes | Whenever official prices differ from the saved baseline (checked every 5 min) | official FPL bootstrap diffed against `price_prediction_snapshot` |
 | EO leaderboard | 75 minutes after each deadline | `livefpl.build_eo_text()` |
 | Game points | When game status becomes "Done" in API (polled every 30s) | `livefpl.build_game_text()` |
@@ -336,7 +338,7 @@ Runs alongside the bot in `asyncio.gather()`. Automated posts:
 
 Deduplication uses the `last_updated` DB table (same as deadline posts).
 
-Price predictions can be paused by setting `PRICE_PREDICTIONS_ENABLED=false` in `.env`. The scheduler loop still runs and confirmed price changes are still reported; only the 23:30 prediction watchlist is skipped.
+Price predictions can be paused by setting `PRICE_PREDICTIONS_ENABLED=false` in `.env` or through `/set`. The scheduler loop still runs and confirmed price changes are still reported; only the nightly watchlist is skipped. **Check this setting first when the watchlist stops appearing** — it is stored in `runtime_config.db`, so an old `/set` outlives a redeploy, and until now skipping produced no log line at all.
 
 ## Translated post queue
 
