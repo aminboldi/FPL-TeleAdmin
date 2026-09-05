@@ -17,6 +17,11 @@ _IRAN_OFFSET = timedelta(hours=3, minutes=30)
 _PRICE_POSTED_KEY = "price_prediction_posted"
 _EO_POSTED_KEY = "eo_posted"
 _PRICE_CHANGES_RESUME_DATE = date(2026, 8, 21)
+# Iran-time minutes past midnight. FPL applies the change at about 05:00 Iran
+# time, so the watchlist stays postable until 03:00 rather than expiring at
+# midnight thirty minutes after it became due.
+_PRICE_PREDICTION_OPENS = 23 * 60 + 30
+_PRICE_PREDICTION_CLOSES = 3 * 60
 # The bootstrap payload is ~1.7MB, so poll for price movement on its own
 # cadence rather than on every 30s scheduler tick.
 _PRICE_POLL_INTERVAL = 5 * 60
@@ -254,15 +259,18 @@ async def _check_price_post(client, target_channel, now_iran, price_predictions_
     if now_iran.date() < _PRICE_CHANGES_RESUME_DATE:
         return
 
-    await _check_actual_price_changes(client, target_channel)
+    # Isolated from each other for the same reason the scheduler isolates its
+    # jobs: a failure fetching or posting confirmed changes must not also cost
+    # the night's watchlist.
+    try:
+        await _check_actual_price_changes(client, target_channel)
+    except Exception:
+        logger.exception("Confirmed price-change check failed")
 
     if not price_predictions_enabled:
         return
-    # The watchlist for the coming update is published at 23:30 Iran time.
-    if now_iran.hour < 23 or (now_iran.hour == 23 and now_iran.minute < 30):
-        return
-    prediction_key = f"{_PRICE_POSTED_KEY}_{now_iran.date().isoformat()}"
-    if _already_posted(prediction_key):
+    prediction_key = _price_prediction_key(now_iran)
+    if prediction_key is None or _already_posted(prediction_key):
         return
     text = await asyncio.to_thread(
         livefpl.build_price_changes_text,
@@ -270,10 +278,33 @@ async def _check_price_post(client, target_channel, now_iran, price_predictions_
         include_potential=True,
     )
     if not text:
+        logger.warning("Price prediction watchlist produced no text; will retry")
         return
     await client.send_message(target_channel, text, parse_mode="html")
     _mark_posted(prediction_key)
-    logger.info("Posted price prediction watchlist")
+    logger.info("Posted price prediction watchlist for %s", prediction_key)
+
+
+def _price_prediction_key(now_iran) -> str | None:
+    """Return the key for tonight's watchlist, or None outside its window.
+
+    The window opens at 23:30 and stays open until 03:00, because the change
+    itself lands around 05:00 and the watchlist is worth posting right up to
+    it. It used to close at midnight, which left half an hour in which a
+    restart, a deploy, or a slow tick lost the night's post entirely — and
+    silently, because the next day's key is a different one.
+
+    The key names the date of the *change*, not of the moment, so it stays the
+    same on either side of midnight and the post cannot repeat.
+    """
+    minutes = now_iran.hour * 60 + now_iran.minute
+    if minutes >= _PRICE_PREDICTION_OPENS:
+        change_date = now_iran.date() + timedelta(days=1)
+    elif minutes < _PRICE_PREDICTION_CLOSES:
+        change_date = now_iran.date()
+    else:
+        return None
+    return f"{_PRICE_POSTED_KEY}_{change_date.isoformat()}"
 
 
 async def _check_actual_price_changes(client, target_channel) -> bool:

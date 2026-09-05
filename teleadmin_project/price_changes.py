@@ -149,49 +149,95 @@ def _price_display(player: dict | None, source_price: str) -> str:
     return f"<b>{source_price}{pos_letter}</b>"
 
 
+@dataclass(frozen=True)
+class PriceMove:
+    """One player's line in a price report, already resolved to Persian.
+
+    Whoever produces the report — a relayed source post or the official FPL
+    data — resolves the player themselves and hands over the finished pieces,
+    so the layout below stays the one description of how a price post looks.
+    """
+
+    name: str
+    flag: str = ""
+    price: str = ""
+    position: str = ""
+    team: str = ""
+    note: str = ""
+
+
+def prediction_header() -> str:
+    return "پیش‌بینی تغییرات قیمت امشب 💷 🧐"
+
+
+def _move_line(move: PriceMove, arrow: str) -> str:
+    flag = f"{move.flag} " if move.flag else " "
+    price = f"<b>{_esc(move.price)}{_esc(move.position)}</b>" if move.price else ""
+    note = f" (<b>{_esc(move.note)}</b>)" if move.note else ""
+    team = f" ({_esc(move.team)})" if move.team else ""
+    return f"<blockquote>{arrow} {_esc(move.name)}{flag}{price}{note}{team}</blockquote>"
+
+
+def format_price_report(
+    risers: list[PriceMove],
+    fallers: list[PriceMove],
+    *,
+    header: str | None = None,
+    empty_note: str = "",
+    footer: bool = True,
+) -> str:
+    """Render the channel's price-report layout.
+
+    This is the one place that layout lives. It was written to relay the
+    source channel's price posts; the official FPL report renders through it
+    too, so a reader sees the same post no matter which produced it. Keep new
+    report kinds going through here rather than growing a second layout.
+    """
+    lines = [header if header is not None else _day_header(), ""]
+    for arrow, heading, moves in (
+        ("⬆️", "🔼 افزایش:", risers),
+        ("⬇️", "🔽 کاهش:", fallers),
+    ):
+        if not moves:
+            continue
+        lines.extend([heading, ""])
+        lines.extend(_move_line(move, arrow) for move in moves)
+        lines.append("")
+    if not risers and not fallers:
+        if not empty_note:
+            return ""
+        lines.extend([empty_note, ""])
+    if footer:
+        lines.append("@EPL_Fantasy")
+    return "\n".join(lines).rstrip("\n")
+
+
+def _source_move(change: PriceChange) -> PriceMove:
+    """Turn one parsed source-channel line into a report line."""
+    player = _resolve_player(change.player_name, change.team_code)
+    if not player:
+        return PriceMove(
+            name=change.player_name,
+            price=f"£{change.new_price_raw}m",
+            team=change.team_code,
+        )
+    team = db.query_one(
+        "SELECT short_name_fa FROM teams WHERE short_name=?", (change.team_code,)
+    )
+    return PriceMove(
+        name=player["web_name_fa"] or player["web_name"],
+        flag=player.get("flag") or "",
+        price=change.new_price_raw,
+        position=_POS_LETTER.get(player["pos_name"], "?"),
+        team=team["short_name_fa"] if team else change.team_code,
+    )
+
+
 def format_price_changes_farsi(risers: list[PriceChange], fallers: list[PriceChange]) -> str:
-    lines = [_day_header(), ""]
-
-    if risers:
-        lines.append("🔼 افزایش:")
-        lines.append("")
-        for pc in risers:
-            player = _resolve_player(pc.player_name, pc.team_code)
-            if player:
-                name = player["web_name_fa"] or player["web_name"]
-                price = _price_display(player, pc.new_price_raw)
-                flag = (player.get("flag") or "") + " "
-                team = db.query_one(
-                    "SELECT short_name_fa FROM teams WHERE short_name=?",
-                    (pc.team_code,),
-                )
-                team_str = team["short_name_fa"] if team else pc.team_code
-                lines.append(f"<blockquote>⬆️ {name}{flag}{price} ({team_str})</blockquote>")
-            else:
-                lines.append(f"<blockquote>⬆️ {pc.player_name} £{pc.new_price_raw}m ({pc.team_code})</blockquote>")
-        lines.append("")
-
-    if fallers:
-        lines.append("🔽 کاهش:")
-        lines.append("")
-        for pc in fallers:
-            player = _resolve_player(pc.player_name, pc.team_code)
-            if player:
-                name = player["web_name_fa"] or player["web_name"]
-                price = _price_display(player, pc.new_price_raw)
-                flag = (player.get("flag") or "") + " "
-                team = db.query_one(
-                    "SELECT short_name_fa FROM teams WHERE short_name=?",
-                    (pc.team_code,),
-                )
-                team_str = team["short_name_fa"] if team else pc.team_code
-                lines.append(f"<blockquote>⬇️ {name}{flag}{price} ({team_str})</blockquote>")
-            else:
-                lines.append(f"<blockquote>⬇️ {pc.player_name} £{pc.new_price_raw}m ({pc.team_code})</blockquote>")
-        lines.append("")
-
-    lines.append("@EPL_Fantasy")
-    return "\n".join(lines)
+    return format_price_report(
+        [_source_move(change) for change in risers],
+        [_source_move(change) for change in fallers],
+    )
 
 
 # ── Buffering: accumulate risers + fallers, post once both are received ──

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import requests
 
 import database as db
+import price_changes
 
 logger = logging.getLogger(__name__)
 
@@ -554,25 +555,22 @@ def _price_player_position(player: dict, db_player: dict | None) -> str:
     return _ELEMENT_TYPE_POSITION.get(int(player.get("element_type") or 0), "?")
 
 
-def _price_line(
+def _price_move(
     player: dict,
     db_player: dict | None,
     teams: dict[int, dict],
     *,
-    direction: str,
-    change: float | None = None,
-    progress: float | None = None,
-) -> str:
-    name = _esc(_price_player_name(player, db_player))
-    price = int(player.get("now_cost") or 0) / 10
-    position = _price_player_position(player, db_player)
-    team = _esc(_price_player_team(player, db_player, teams))
-    price_part = f"<b>{price:.1f}{position}</b>"
-    if change is not None:
-        change_part = f"<b>{change:+.1f}M</b>"
-        return f"<blockquote>{direction} {name} {price_part} ({change_part}) ({team})</blockquote>"
-    progress_part = f"<b>{round(progress or 0):.0f}%</b>"
-    return f"<blockquote>{direction} {name} {price_part} ({progress_part}) ({team})</blockquote>"
+    note: str = "",
+) -> price_changes.PriceMove:
+    """Resolve one official player record into a line of the channel's report."""
+    return price_changes.PriceMove(
+        name=_price_player_name(player, db_player),
+        flag=(db_player.get("flag") or "") if db_player else "",
+        price=f"{int(player.get('now_cost') or 0) / 10:.1f}",
+        position=_price_player_position(player, db_player),
+        team=_price_player_team(player, db_player, teams),
+        note=note,
+    )
 
 
 def _price_ownership(player: dict) -> float:
@@ -660,61 +658,45 @@ def build_price_changes_text(
     potential_risers.sort(key=lambda item: _price_ownership(item[1]), reverse=True)
     potential_fallers.sort(key=lambda item: _price_ownership(item[1]), reverse=True)
 
-    lines = ["تغییرات قیمت 💷", ""]
-    if include_actual and (actual_risers or actual_fallers):
-        lines.extend(["✅ تغییرات واقعی:", ""])
-        if actual_risers:
-            lines.extend(["🔼 افزایش:", ""])
-            for delta, player in actual_risers:
-                db_player = db_players.get(int(player["id"]))
-                lines.append(
-                    _price_line(
-                        player, db_player, teams, direction="⬆️", change=delta / 10
-                    )
-                )
-            lines.append("")
-        if actual_fallers:
-            lines.extend(["🔽 کاهش:", ""])
-            for delta, player in actual_fallers:
-                db_player = db_players.get(int(player["id"]))
-                lines.append(
-                    _price_line(
-                        player, db_player, teams, direction="⬇️", change=delta / 10
-                    )
-                )
-            lines.append("")
-    elif include_actual and not have_baseline:
-        lines.extend(["✅ تغییرات واقعی: هنوز مبنایی برای مقایسه ثبت نشده است.", ""])
-    elif include_actual:
-        lines.extend(["✅ تغییرات واقعی: موردی از آخرین گزارش ثبت نشده است.", ""])
+    def moves(entries, note=None):
+        return [
+            _price_move(
+                player,
+                db_players.get(int(player["id"])),
+                teams,
+                note=note(value) if note else "",
+            )
+            for value, player in entries
+        ]
 
+    # Both reports render through the channel's own price layout, the one
+    # written for relaying the source channel's posts. A confirmed change is
+    # exactly what that layout describes, so it carries no extra labelling;
+    # the prediction adds each player's progress towards the change.
+    reports = []
+    if include_actual:
+        reports.append(
+            price_changes.format_price_report(
+                moves(actual_risers),
+                moves(actual_fallers),
+                empty_note=(
+                    "هنوز مبنایی برای مقایسه ثبت نشده است."
+                    if not have_baseline
+                    else "موردی از آخرین گزارش ثبت نشده است."
+                ),
+                footer=not include_potential,
+            )
+        )
     if include_potential:
-        lines.extend(["🔮 پیش‌بینی تغییرات احتمالی امشب:", ""])
-        if potential_risers:
-            lines.extend(["🔼 افزایش احتمالی:", ""])
-            for progress, player in potential_risers:
-                db_player = db_players.get(int(player["id"]))
-                lines.append(
-                    _price_line(
-                        player, db_player, teams, direction="⬆️", progress=progress
-                    )
-                )
-            lines.append("")
-        if potential_fallers:
-            lines.extend(["🔽 کاهش احتمالی:", ""])
-            for progress, player in potential_fallers:
-                db_player = db_players.get(int(player["id"]))
-                lines.append(
-                    _price_line(
-                        player, db_player, teams, direction="⬇️", progress=progress
-                    )
-                )
-            lines.append("")
-        if not potential_risers and not potential_fallers:
-            lines.extend(["موردی به آستانه پیش‌بینی نرسیده است.", ""])
-
-    lines.append("@EPL_Fantasy")
-    return "\n".join(lines)
+        reports.append(
+            price_changes.format_price_report(
+                moves(potential_risers, note=lambda value: f"{round(value):.0f}%"),
+                moves(potential_fallers, note=lambda value: f"{round(value):.0f}%"),
+                header=price_changes.prediction_header(),
+                empty_note="موردی به آستانه پیش‌بینی نرسیده است.",
+            )
+        )
+    return "\n\n".join(report for report in reports if report)
 
 
 def get_finished_fixtures(gameweek_id: int | None = None) -> list[dict]:

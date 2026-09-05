@@ -219,7 +219,19 @@ Source-channel price-change posts are ignored. The scheduler curates the report 
 
 `price_changes.is_price_change()` gates that exclusion and must stay tolerant of the source channel's formatting. It has posted both `Price Fallers! 📉 (3) #FPL` with `🔴 J.Timber #ARS £6.1m` rows and, later, `Price Fallers! 📉 #FPL` with `⬇ Madueke £6.3m` rows — no count, no team code. The old regex required the count, so the newer posts fell through to the LLM and were published as translated articles. Detection now accepts a leading header on its own, and elsewhere in a message requires at least two `£x.xm` rows so prose about risers and fallers is still translated normally. `parse_price_change()` is unused; only detection matters.
 
-The official report lists every confirmed rise, and only confirmed/predicted falls for players above 1% ownership. Each riser/faller list is sorted by ownership descending, and rows are wrapped in `<blockquote>`.
+The official report lists every confirmed rise, and only confirmed/predicted falls for players above 1% ownership. Each riser/faller list is sorted by ownership descending.
+
+### One layout, in `price_changes.format_price_report()`
+
+The channel's price post has a fixed look: `تغییرات قیمت 💷 صبح <روز> 🧐`, then `🔼 افزایش:` and `🔽 کاهش:`, then one `<blockquote>` per player as `<arrow> <name><flag> <b><price><position></b> (<team>)`, then `@EPL_Fantasy`. It was written to relay the source channel's posts, and when the official report replaced that relay it grew a *second* layout — a `تغییرات قیمت 💷` header with no weekday, a `✅ تغییرات واقعی:` section label, no flag, and the change amount in parentheses. Readers noticed.
+
+Both producers now render through `format_price_report()`, and new report kinds must too rather than growing a third layout. Each producer resolves its own players and hands over `PriceMove` records, so the formatter never touches the database: `price_changes._source_move()` resolves a parsed source line by name, `livefpl._price_move()` resolves an official element through `_load_db_players()`. `PriceMove.note` is the only variation — the prediction post puts each player's progress percentage there, and the confirmed post leaves it empty because a confirmed change needs no annotation.
+
+### The prediction window is hours wide, not minutes
+
+`_price_prediction_key()` returns the key for tonight's watchlist, or `None` outside its window. The window opens at 23:30 Iran time and closes at 03:00, because FPL applies the change at about 05:00 and the watchlist is worth posting right up to it. It used to close at midnight, leaving thirty minutes in which a restart, a deploy, or a slow tick lost the night's post — silently, because the next day's key is a different one and nothing logged the miss.
+
+The key names the date of the **change**, not of the moment, so it is the same either side of midnight and the post cannot repeat. Confirmed changes and the watchlist are also wrapped in separate `try` blocks inside `_check_price_post()`: a failure fetching or posting one must not cost the other.
 
 ### Confirmed changes are detected, not scheduled
 
@@ -230,7 +242,8 @@ Confirmed changes are found by **diffing official prices against a saved baselin
 - `livefpl.load_price_snapshot()` returns `None` (never seeded) versus `{}` (seeded but empty) deliberately. With no baseline the scheduler seeds it silently and posts nothing — `cost_change_event` counts the whole gameweek, not the last day, so it is not a valid stand-in for "today's changes".
 - Because it is a diff, changes that happen while the bot is down are reported on the next successful pass.
 - The bootstrap is ~1.7MB, so the check runs on its own `_PRICE_POLL_INTERVAL` (5 min) rather than every 30s scheduler tick.
-- `PRICE_PREDICTIONS_ENABLED` gates **only** the 23:30 prediction watchlist. Confirmed changes are always reported.
+- `PRICE_PREDICTIONS_ENABLED` gates **only** the nightly prediction watchlist. Confirmed changes are always reported.
+- The projections come from the official bootstrap itself: each element carries `price_change_projections` (a list keyed by `offset`, where `offset: 0` is tonight) and a flat `price_change_percent` fallback. `_PRICE_PREDICTION_THRESHOLD` is 90, and the values run past ±100 for a player expected to cross.
 
 ### Scheduler jobs are individually isolated
 
