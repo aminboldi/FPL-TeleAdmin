@@ -2143,8 +2143,12 @@ def _fixtures_text() -> str:
     current_day = None
     for fixture in fixtures:
         kickoff = datetime.strptime(fixture["kickoff_time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) + iran_offset
-        day = kickoff.strftime("%Y/%m/%d")
+        # The post goes out weekly, so the weekday tells a reader which match
+        # is which far quicker than a calendar date does.
+        day = price_changes.persian_weekday(kickoff)
         if day != current_day:
+            if current_day is not None:
+                lines.append("")
             current_day = day
             lines.extend([f"<b>{day}</b>", ""])
         home = fixture["home_fa"] or fixture["home_en"]

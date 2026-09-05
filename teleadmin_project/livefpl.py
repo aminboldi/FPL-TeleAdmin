@@ -298,7 +298,9 @@ def _eo_player_line(player: dict | None, name: str, eo: float) -> str:
     if is_bold:
         line = f"<b>{line}</b>"
 
-    return line
+    # Every per-player line the channel posts is quoted, price reports and
+    # this one alike, so a reader sees one list style everywhere.
+    return f"<blockquote>{line}</blockquote>"
 
 
 def build_eo_text(gameweek_id: int | None = None) -> str | None:
@@ -561,14 +563,19 @@ def _price_move(
     teams: dict[int, dict],
     *,
     note: str = "",
+    brief: bool = False,
 ) -> price_changes.PriceMove:
-    """Resolve one official player record into a line of the channel's report."""
+    """Resolve one official player record into a line of the channel's report.
+
+    ``brief`` drops the flag and the club, which a confirmed change is worth
+    spelling out but a watchlist of maybes is not.
+    """
     return price_changes.PriceMove(
         name=_price_player_name(player, db_player),
-        flag=(db_player.get("flag") or "") if db_player else "",
+        flag="" if brief else ((db_player.get("flag") or "") if db_player else ""),
         price=f"{int(player.get('now_cost') or 0) / 10:.1f}",
         position=_price_player_position(player, db_player),
-        team=_price_player_team(player, db_player, teams),
+        team="" if brief else _price_player_team(player, db_player, teams),
         note=note,
     )
 
@@ -658,21 +665,23 @@ def build_price_changes_text(
     potential_risers.sort(key=lambda item: _price_ownership(item[1]), reverse=True)
     potential_fallers.sort(key=lambda item: _price_ownership(item[1]), reverse=True)
 
-    def moves(entries, note=None):
+    def moves(entries, note=None, brief=False):
         return [
             _price_move(
                 player,
                 db_players.get(int(player["id"])),
                 teams,
                 note=note(value) if note else "",
+                brief=brief,
             )
             for value, player in entries
         ]
 
     # Both reports render through the channel's own price layout, the one
     # written for relaying the source channel's posts. A confirmed change is
-    # exactly what that layout describes, so it carries no extra labelling;
-    # the prediction adds each player's progress towards the change.
+    # exactly what that layout describes, so it carries no extra labelling.
+    # The watchlist is a list of maybes rather than a record, so it is kept
+    # short: the player, the price, and how close the change is.
     reports = []
     if include_actual:
         reports.append(
@@ -688,10 +697,11 @@ def build_price_changes_text(
             )
         )
     if include_potential:
+        percent = lambda value: f"{round(value):.0f}%"  # noqa: E731
         reports.append(
             price_changes.format_price_report(
-                moves(potential_risers, note=lambda value: f"{round(value):.0f}%"),
-                moves(potential_fallers, note=lambda value: f"{round(value):.0f}%"),
+                moves(potential_risers, note=percent, brief=True),
+                moves(potential_fallers, note=percent, brief=True),
                 header=price_changes.prediction_header(),
                 empty_note="موردی به آستانه پیش‌بینی نرسیده است.",
             )

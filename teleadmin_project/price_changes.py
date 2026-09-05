@@ -100,10 +100,13 @@ def parse_price_change(text: str) -> ParsedPriceChange | None:
     return ParsedPriceChange(change_type=change_type, count=count, players=players)
 
 
+def persian_weekday(moment: datetime) -> str:
+    """Return the Persian name of a moment's weekday."""
+    return _FA_DAYS[moment.weekday()]
+
+
 def _day_header() -> str:
-    now = datetime.now(tz=timezone.utc)
-    day_name = _FA_DAYS[now.weekday()]
-    return f"تغییرات قیمت 💷 صبح {day_name} 🧐"
+    return f"تغییرات قیمت 💷 صبح {persian_weekday(datetime.now(tz=timezone.utc))} 🧐"
 
 
 def _resolve_player(name: str, team_code: str) -> dict | None:
