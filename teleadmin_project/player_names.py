@@ -79,7 +79,8 @@ _EQUIVALENT_LETTERS = {
 _PROMPT_HEADER = (
     "Player names — these Persian spellings are the channel's own and are "
     "authoritative. Use each one exactly as written, everywhere that player is "
-    "named, and never transliterate the English name yourself:"
+    "named, and never transliterate the English name yourself. Use the short "
+    "form given here even where the English writes the player's full name:"
 )
 
 
@@ -187,23 +188,26 @@ def _load_players() -> list[Player]:
 def _spellings(player: Player) -> list[tuple[str, str]]:
     """Return this player's (spelling, replacement) pairs, longest first.
 
-    The replacement for a full English name is the full Persian name, so a
-    translation keeps the same level of detail the source used.
+    Every spelling resolves to the **display** name, whatever level of detail
+    the source used. English sources write a player out in full on first
+    mention and by surname after it; the channel calls him one thing. So
+    "Christos Tzolis" and "Tzolis" both become زولیس, and so does the full
+    Persian name if the model writes one.
     """
     persian = player.persian
     if not persian:
         return []
     pairs = [
-        (player.canonical, player.canonical_fa or persian),
+        (player.canonical, persian),
         (player.display, persian),
         (player.canonical.split(" ")[-1], persian),
     ]
     for alias in player.aliases:
         pairs.append((alias, persian))
-    # Persian spellings are listed so they can be *detected*; the replacement
-    # is a no-op for the canonical ones and the correction for a variant.
+    # The Persian spellings are here to be shortened to the display name, and
+    # to let the display name itself be detected.
     pairs.extend([
-        (player.canonical_fa, player.canonical_fa or persian),
+        (player.canonical_fa, persian),
         (persian, persian),
     ])
     unique: dict[str, str] = {}
@@ -245,12 +249,12 @@ def _build_index(players: list[Player]) -> _Index:
     owners: dict[str, Player] = {}
     fragments: dict[str, str] = {}
     conflicting: set[str] = set()
-    claimed_persian: set[str] = set()
+    claimed_persian: dict[str, set[int]] = {}
 
     for player in players:
         for spelling in (player.canonical_fa, player.persian):
             if spelling:
-                claimed_persian.add(lookup_key(spelling))
+                claimed_persian.setdefault(lookup_key(spelling), set()).add(player.id)
 
     for player in players:
         for spelling, replacement in _spellings(player):
@@ -258,12 +262,14 @@ def _build_index(players: list[Player]) -> _Index:
             if not key or key in conflicting:
                 continue
             persian_spelling = _is_persian(spelling)
-            # A recorded Persian variant must never rewrite a name another
-            # player already owns; that would swap one player for another.
+            # A Persian spelling may be shortened to its own player's display
+            # name, but must never be rewritten to a different player's: that
+            # would swap one player for another. The check is therefore about
+            # who owns the name, not merely whether anyone does.
             if (
                 persian_spelling
                 and lookup_key(replacement) != key
-                and key in claimed_persian
+                and claimed_persian.get(key, set()) - {player.id}
             ):
                 continue
             if key in replacements and replacements[key][0] != replacement:
@@ -412,7 +418,7 @@ def prompt_glossary(text: str, limit: int = _PROMPT_GLOSSARY_LIMIT) -> str:
     """
     lines = []
     for player in mentioned(text)[:limit]:
-        persian = player.canonical_fa or player.persian
+        persian = player.persian
         if not persian:
             continue
         english = player.canonical
