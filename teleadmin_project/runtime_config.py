@@ -1,8 +1,11 @@
 """Persistent, non-secret operational settings and their audit trail."""
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 DB_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", Path(__file__).parent / "runtime_config.db"))
@@ -16,6 +19,53 @@ DEFAULTS = {
     "IRAN_LEAGUE_ID": os.getenv("IRAN_LEAGUE_ID", ""),
     "ARTICLE_MONITOR_ENABLED": os.getenv("ARTICLE_MONITOR_ENABLED", "true"),
 }
+
+
+# Which environment variables back each setting. A setting is seeded from its
+# environment value the first time the database is created, and thereafter the
+# stored value wins so the dashboard can change it. That left no way to correct
+# a stored value from the environment: editing .env and redeploying did
+# nothing, silently, because the row already existed. An explicitly-set
+# variable now updates the row at startup instead.
+_ENV_NAMES = {
+    "OPEN_ROUTER_MODEL": ("OPEN_ROUTER_MODEL",),
+    "TARGET_CHANNEL_ID": ("TARGET_CHANNEL_ID",),
+    "PRICE_PREDICTIONS_ENABLED": ("PRICE_PREDICTIONS_ENABLED",),
+    "EPL_LEAGUE_CODE": ("EPL_LEAGUE_CODE", "LEAGUE_CODE"),
+    "EPL_LEAGUE_ID": ("EPL_LEAGUE_ID",),
+    "IRAN_LEAGUE_ID": ("IRAN_LEAGUE_ID",),
+    "ARTICLE_MONITOR_ENABLED": ("ARTICLE_MONITOR_ENABLED",),
+}
+_env_applied = False
+
+
+def _env_value(key: str) -> str | None:
+    """The value the environment sets for a setting, or None if it sets none."""
+    for name in _ENV_NAMES.get(key, ()):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _apply_env_overrides(conn: sqlite3.Connection, now: str) -> None:
+    for key in DEFAULTS:
+        value = _env_value(key)
+        if value is None:
+            continue
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        if row is None or row[0] == value:
+            continue
+        conn.execute(
+            "UPDATE settings SET value=?, updated_at=? WHERE key=?",
+            (value, now, key),
+        )
+        logger.warning(
+            "%s taken from the environment: %r replaces the stored %r",
+            key, value, row[0],
+        )
 
 
 def _connect() -> sqlite3.Connection:
@@ -100,6 +150,10 @@ def init() -> None:
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (key, value, now),
             )
+        global _env_applied
+        if not _env_applied:
+            _apply_env_overrides(conn, now)
+            _env_applied = True
 
 
 def get(key: str) -> str:

@@ -236,7 +236,7 @@ class AdminDashboard:
             )
         elif data == "menu:settings":
             await event.edit(
-                self._channels_text() + "\n\nبرای سایر تنظیمات: <code>/set KEY VALUE</code>",
+                self._channels_text(),
                 buttons=[[Button.inline("تغییر مقصد", b"targethelp")], *self._back_button()], parse_mode="html",
             )
         elif data == "openrouter":
@@ -337,11 +337,29 @@ class AdminDashboard:
             await event.edit("لغو شد.")
 
     def _channels_text(self) -> str:
+        """Show every editable setting and its effective value.
+
+        Only the target channel used to be shown, so a setting silently sitting
+        at the wrong value -- a paused price watchlist, say -- could not be
+        checked from here at all.
+        """
         values = runtime_config.values()
-        return (
-            "<b>📡 کانال مقصد</b>\n\n"
-            f"مقصد: <code>{values['TARGET_CHANNEL_ID'] or '—'}</code>"
-        )
+        lines = [
+            "<b>📡 کانال مقصد</b>",
+            "",
+            f"مقصد: <code>{values.get('TARGET_CHANNEL_ID') or '—'}</code>",
+            "",
+            "<b>⚙️ تنظیمات</b>",
+            "",
+        ]
+        for key in runtime_config.DEFAULTS:
+            if key == "TARGET_CHANNEL_ID":
+                continue
+            lines.append(
+                f"<code>{key}</code> = <code>{values.get(key) or '—'}</code>"
+            )
+        lines.extend(["", "برای تغییر: <code>/set KEY VALUE</code>"])
+        return "\n".join(lines)
 
     async def _propose(self, event, key: str, value: str) -> None:
         token = secrets.token_urlsafe(8)
