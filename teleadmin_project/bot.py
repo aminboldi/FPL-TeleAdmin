@@ -762,6 +762,26 @@ async def _notify_article_abandoned(url: str, error: Exception):
     await _send_notification(None, caption, source="Article", is_media=False)
 
 
+def _log_effective_settings() -> None:
+    """Log which databases this instance uses and what they say.
+
+    Two deployments pointed at one persistent volume share these files, and
+    therefore share every setting, post marker, and price baseline in them.
+    That is how a watchlist can be disabled for a deployment whose own
+    environment enables it: whichever instance created the settings row first
+    decided the value for both. Printing the paths and the effective values at
+    boot turns that from a multi-day hunt into one look at the deploy log.
+    """
+    logger.info("Runtime settings database: %s", runtime_config.DB_PATH)
+    logger.info("FPL database: %s", db.DB_PATH)
+    for key, value in sorted(runtime_config.values().items()):
+        environment = runtime_config._env_value(key)
+        note = ""
+        if environment is not None and environment != value:
+            note = f"  (environment says {environment!r})"
+        logger.info("  %s = %r%s", key, value, note)
+
+
 async def _notify_admin(caption: str) -> None:
     """Send a scheduler-level warning to the private admin chat."""
     await _send_notification(None, caption, source="Scheduler", is_media=False)
@@ -2268,6 +2288,8 @@ async def main():
         logger.info("Admin dashboard enabled for %d user(s)", len(settings.admin_user_ids))
     else:
         logger.warning("Admin dashboard disabled: set TELEGRAM_BOT_TOKEN and ADMIN_USER_IDS")
+
+    _log_effective_settings()
 
     # A short-lived feature guessed a player's Persian spelling from nearby
     # words and recorded ordinary words as names, which then rewrote those

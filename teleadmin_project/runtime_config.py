@@ -26,7 +26,8 @@ DEFAULTS = {
 # stored value wins so the dashboard can change it. That left no way to correct
 # a stored value from the environment: editing .env and redeploying did
 # nothing, silently, because the row already existed. An explicitly-set
-# variable now updates the row at startup instead.
+# variable now updates the row at startup instead -- unless an operator has
+# chosen that value through the dashboard, which outranks any environment.
 _ENV_NAMES = {
     "OPEN_ROUTER_MODEL": ("OPEN_ROUTER_MODEL",),
     "TARGET_CHANNEL_ID": ("TARGET_CHANNEL_ID",),
@@ -49,6 +50,14 @@ def _env_value(key: str) -> str | None:
 
 
 def _apply_env_overrides(conn: sqlite3.Connection, now: str) -> None:
+    """Correct stored settings from explicitly-set environment variables.
+
+    A value an operator chose through the dashboard is left alone. Two
+    deployments can share one persistent volume, and then they share this
+    database: without that rule, redeploying either one would silently impose
+    its own environment on the other. An explicit ``/set`` is the stronger
+    statement of intent, and it is the way to pin a setting against that.
+    """
     for key in DEFAULTS:
         value = _env_value(key)
         if value is None:
@@ -57,6 +66,16 @@ def _apply_env_overrides(conn: sqlite3.Connection, now: str) -> None:
             "SELECT value FROM settings WHERE key=?", (key,)
         ).fetchone()
         if row is None or row[0] == value:
+            continue
+        chosen = conn.execute(
+            "SELECT 1 FROM audit_log WHERE key=? LIMIT 1", (key,)
+        ).fetchone()
+        if chosen:
+            logger.warning(
+                "%s is %r in the environment but %r was set from the dashboard; "
+                "keeping %r. Use /set to change it.",
+                key, value, row[0], row[0],
+            )
             continue
         conn.execute(
             "UPDATE settings SET value=?, updated_at=? WHERE key=?",
