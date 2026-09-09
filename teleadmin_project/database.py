@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import requests
 import shutil
 import sqlite3
@@ -508,31 +509,45 @@ def update_player_farsi_names(
     return len(normalized)
 
 
-def add_player_alias(player_id: int, alias: str, *, limit: int = 12) -> bool:
-    """Append a newly observed spelling to a player's alias list.
+_PERSIAN_ALIAS_RE = re.compile(r"[\u0600-\u06ff]")
 
-    Returns whether anything was stored. The list is capped so a bad run of
-    model output cannot grow the column without bound, and the aliases stay in
-    the same comma-separated form the /players editor reads and writes, so an
-    operator can review or delete whatever was learned.
+
+def purge_guessed_aliases() -> list[tuple[str, str]]:
+    """Delete Persian-script aliases, which were written by a guesser.
+
+    A short-lived feature tried to learn a player's Persian spelling from the
+    translated text by taking any Persian word within one edit of the name. A
+    three-letter name is one edit from the most common words in the language,
+    so it recorded ordinary words as player names -- and, worse, those records
+    then rewrote the same words in every later translation.
+
+    Aliases are English community abbreviations (``DCL``, ``VVD``); no Persian
+    one existed before that feature, which makes the script an exact
+    discriminator. Returns the (player, alias) pairs removed so the caller can
+    report them.
     """
-    alias = " ".join(str(alias or "").split())
-    if not alias:
-        return False
+    removed: list[tuple[str, str]] = []
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT alias FROM players WHERE id=?", (int(player_id),)
-        ).fetchone()
-        if row is None:
-            return False
-        existing = [part.strip() for part in str(row[0] or "").split(",") if part.strip()]
-        if len(existing) >= limit or alias_matches(row[0], alias):
-            return False
-        conn.execute(
-            "UPDATE players SET alias=? WHERE id=?",
-            (", ".join([*existing, alias]), int(player_id)),
-        )
-    return True
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, web_name, alias FROM players "
+            "WHERE alias IS NOT NULL AND alias <> ''"
+        ).fetchall()
+        for row in rows:
+            kept, dropped = [], []
+            for part in str(row["alias"]).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                (dropped if _PERSIAN_ALIAS_RE.search(part) else kept).append(part)
+            if not dropped:
+                continue
+            removed.extend((str(row["web_name"]), alias) for alias in dropped)
+            conn.execute(
+                "UPDATE players SET alias = ? WHERE id = ?",
+                (", ".join(kept) or None, row["id"]),
+            )
+    return removed
 
 
 def get_db_path() -> Path:

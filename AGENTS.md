@@ -128,18 +128,16 @@ The database holds the Persian spelling the channel uses for each player. A mode
 
 **Do not fix an individual player in a prompt.** A new name or a corrected transliteration is a database edit — `/players`, or the `alias` column — and takes effect on the next post. The `DCL`/`VVD`/`RDZ`/`MLS` lines still in `prompt.txt` predate this module; `RDZ` is a manager and has no player row, and the others can be retired once their alias is confirmed in the production database.
 
-Three passes, in increasing order of cost:
+Two passes, both exact:
 
-1. **Prompt.** `prompt_glossary(source_text)` lists only the players that source actually names, with their Persian spelling, and is injected into `prompt.txt` and `article_prompt.txt` through the `{player_names}` placeholder. This is what stops the wrong transliteration from being generated at all, and it costs a few lines rather than a glossary of 570 players. It returns `""` when the text names nobody, so the prompt never carries an empty heading.
-2. **Rewrite.** `enforce()` rewrites the result: an English name becomes its Persian spelling, and a recorded variant becomes the canonical one. It only ever touches visible text — HTML tags, attributes, and URLs are split out first.
-3. **Learn.** When the source named a player but the translation contains no spelling of that name we know, a Persian word within a small edit distance is taken as a new variant, corrected, and written to that player's `alias` column, so pass 2 catches it from then on.
+1. **Prompt.** `prompt_glossary(source_text)` lists only the players that source actually names, with their Persian spelling, injected into `prompt.txt` and `article_prompt.txt` through the `{player_names}` placeholder. This is what stops the wrong transliteration from being generated at all, and it costs a few lines rather than a glossary of 570 players. It returns `""` when the text names nobody, so the prompt never carries an empty heading.
+2. **Rewrite.** `enforce()` replaces every *known* spelling: an English name, or one recorded in the player's `alias` column. It only ever touches visible text — HTML tags, attributes, and URLs are split out first.
 
-Guards that make pass 3 safe — weaken any one of these and it starts renaming ordinary words:
+### Never guess a spelling from nearby words
 
-- Only players **detected in the source text** are considered, and only when no known spelling of the name is already present.
-- `_variant_distance()` charges 1 for an inserted or dropped letter and for a swap **within** a confusable group (`زذضظ`, `چجشژ`, …) — the ones a transliterator actually confuses — and 2 for any other substitution, so an unrelated word cannot fit a budget of 1.
-- Exactly one candidate word must match. Two equally close words means ambiguity, and nothing is changed.
-- A word that is already some player's name is never re-pointed, and one misspelling cannot be claimed by two players in the same text.
+A third pass briefly tried to *learn* spellings: when a player was known to be in the source but no known spelling appeared, it took a Persian word within one edit of the name as a misspelling of it, corrected it, and recorded it as an alias. **It cannot be made to work and must not be reintroduced.** A three-letter Persian name is one edit from the most common words in the language, so it recorded — and then permanently rewrote — `روی`→`رولی`, `حال`→`هال`, `این`→`آینا`, `اما`→`آماد`. Every guard it had (only players named in the source, only one candidate word, never a word another player owns, cheap edits only within confusable letter groups) was satisfied by all four. The failure is not in the tuning: a short name has no unique neighbourhood in a real language.
+
+`database.purge_guessed_aliases()` removes what it wrote and runs at startup. Aliases are English community abbreviations (`DCL`, `VVD`) and no Persian one existed before that feature, so the script is an exact discriminator. No code path writes an alias any more — a new spelling is recorded by a person, through `/players`.
 
 Other invariants:
 
@@ -167,7 +165,7 @@ In production, when `RUNTIME_CONFIG_PATH` points to the persistent Coolify volum
 - Team Farsi names live in `teams.name_fa` / `teams.short_name_fa`
 - Player Farsi names in `players.first_name_fa`, `second_name_fa`, `web_name_fa` (populated by `translate_names.py`)
 - **Every** translated output uses those player Farsi columns as the authoritative English-name → Persian-name mapping, not just YouTube transcripts (see *Player name consistency*). Missing values mean a player name cannot be deterministically translated, so keep these columns populated when refreshing the player database.
-- Player community aliases in `players.alias` (populated by `generate_aliases.py`, by `/players`, and by learned Persian spellings). Comma-separated, and now holds two kinds of entry: English community abbreviations (`DCL`) and Persian misspellings the translator produced (`تزولیس`). Both are matched case- and script-insensitively, and feed the same replacement map.
+- Player community aliases in `players.alias`, comma-separated, populated by `generate_aliases.py` and by `/players` — **only by a person**, never by the bot (see *Never guess a spelling from nearby words*). A Persian entry here is a spelling somebody recorded on purpose; `purge_guessed_aliases()` cleared the ones a short-lived guesser wrote.
 - Country flags stored in `players.flag` — resolved from `regions.json` at DB import time via `database._region_to_flag()`
 
 ### DB rebuild procedure
@@ -231,9 +229,9 @@ Both producers now render through `format_price_report()`, and new report kinds 
 
 ### The prediction window is hours wide, not minutes
 
-`_price_prediction_key()` returns the key for tonight's watchlist, or `None` outside its window. It is expressed **in UTC**, because FPL applies the change at midnight GMT: the window is 20:00–23:30 UTC, opening at the same moment it always did (23:30 Iran) and closing half an hour before the change, by which point a watchlist has nothing left to say. Reasoning about it in Iran time made it look as though it straddled midnight; in UTC it is one uninterrupted evening, and the key is simply the next UTC date.
+`_price_prediction_key()` returns the key for tonight's watchlist, or `None` outside its window. It is expressed **in UTC**, because FPL applies the change at midnight GMT: the window is 20:00–23:55 UTC, opening at the same moment it always did (23:30 Iran) and staying open almost to the change itself — a watchlist is only stale once the prices have actually moved, and a narrow window is what lost it in the first place. Reasoning about it in Iran time made it look as though it straddled midnight; in UTC it is one uninterrupted evening, and the key is simply the next UTC date.
 
-It used to be the half hour from 23:30 to midnight Iran time, so a restart or a slow tick inside it lost the night's post — silently, because the next day's key is a different one and every reason to skip was a bare `return`. `_log_prediction_window()` now writes one line per night saying the window opened and whether the setting is off, the post already went, or it is about to be sent. That line is what distinguishes a disabled setting from an unreachable API from a scheduler that was not running.
+It used to be the half hour from 23:30 to midnight Iran time, so a restart or a slow tick inside it lost the night's post — silently, because the next day's key is a different one and every reason to skip was a bare `return`. `_report_prediction_skip()` now sends the reason to the **private admin chat**, once per night, whenever the watchlist is skipped or fails: the setting being off, the report failing to build, or the API returning nothing. The operator reads Telegram, not the server log, and each blind diagnosis was costing a whole day. `run_scheduler()` also logs at startup whether predictions are enabled and what the window is, so a disabled flag is visible without waiting for evening.
 
 Confirmed changes and the watchlist are also wrapped in separate `try` blocks inside `_check_price_post()`: a failure fetching or posting one must not cost the other.
 

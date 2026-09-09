@@ -6,19 +6,23 @@ for each one. A translation model does not: it transliterates from the English
 spelling each time it meets a name, so the same player arrives as زولیس in one
 post and تزولیس in the next, and is sometimes left in English entirely.
 
-Three passes make the stored spelling win, in increasing order of cost:
+Two passes make the stored spelling win:
 
 1. ``prompt_glossary`` lists the players actually named in the source text,
    with their Persian spelling, inside the translation prompt. This is what
    prevents the wrong transliteration from being produced at all, and it costs
    a handful of lines rather than a glossary of every player.
 2. ``enforce`` rewrites the result deterministically: an English name becomes
-   its Persian spelling, and any recorded variant becomes the canonical one.
-3. When a player is known to be in the source but the translation contains
-   neither their Persian name nor a recorded variant, a near-identical Persian
-   word is taken as a new variant of that name, corrected, and stored in the
-   player's ``alias`` column — so pass 2 catches it from then on and the
-   operator can see and edit it in the /players editor.
+   its Persian spelling, and a spelling recorded in the player's ``alias``
+   column becomes the canonical one.
+
+Both match exactly. There was briefly a third pass that guessed: when a player
+was known to be in the source but no known spelling of the name appeared, it
+took a Persian word within one edit of the name as a misspelling of it. That
+cannot work, and no amount of tightening fixes it -- a three-letter name is one
+edit away from the most common words in the language, so it rewrote روی to
+رولی, حال to هال, این to آینا, and اما to آماد. A spelling is only corrected
+here if somebody recorded it; there is no inference.
 
 Nothing here is specific to a player. Adding a name or fixing a transliteration
 is a database edit, never a code or prompt change.
@@ -39,16 +43,12 @@ logger = logging.getLogger(__name__)
 # a name calls ``reload``, so this interval is only a safety net for a database
 # edited from outside the bot.
 _CACHE_SECONDS = 3600
-# A ceiling on what one player can accumulate, so a broken model response can
-# never grow the alias column without bound.
-_MAX_LEARNED_VARIANTS = 12
 _MIN_NAME_CHARS = 3
 _PROMPT_GLOSSARY_LIMIT = 40
 
 # Escapes rather than literals throughout: several of these characters are
 # invisible or combining, and a literal one cannot be reviewed in a diff.
 _PERSIAN_RANGE = "\u0600-\u06ff"
-_PERSIAN_WORD_RE = re.compile(rf"[{_PERSIAN_RANGE}]{{{_MIN_NAME_CHARS},}}")
 _HTML_SPLIT_RE = re.compile(r"(<[^>]*>)")
 _DIACRITICS_RE = re.compile(r"[\u064b-\u0652\u0670\u0640]")
 # Persian writes compounds with a zero-width non-joiner: invisible, but it
@@ -74,13 +74,6 @@ _FOLD_MAP = str.maketrans(
 # The reverse view, used to build patterns that match unfolded text.
 _EQUIVALENT_LETTERS = {
     "ی": "یيىئ", "ک": "کك", "ه": "هةۀ", "ا": "اآأإٱ", "و": "وؤ",
-}
-# Letters a transliterator swaps for one another when reading a Latin spelling:
-# Tzolis' ز against a ذ, Cherki's ش against a چ. A substitution outside these
-# groups is not a spelling variant of the same name, it is a different word.
-_CONFUSABLE_GROUPS = ("تط", "سصث", "زذضظ", "چجشژ", "حهخ", "قغکگ", "بپ")
-_CONFUSABLE = {
-    letter: group for group in _CONFUSABLE_GROUPS for letter in group
 }
 
 _PROMPT_HEADER = (
@@ -116,11 +109,9 @@ class _Index:
     replacements: dict[str, tuple[str, bool]]
     # spelling key -> the player it names, for spellings that name only one
     owners: dict[str, Player]
-    # every Persian spelling already claimed by some player
-    claimed_persian: frozenset[str]
 
 
-_EMPTY_INDEX = _Index((), None, {}, {}, frozenset())
+_EMPTY_INDEX = _Index((), None, {}, {})
 _index: _Index | None = None
 _index_loaded_at = 0.0
 _lock = threading.Lock()
@@ -310,7 +301,6 @@ def _build_index(players: list[Player]) -> _Index:
         pattern=pattern,
         replacements=replacements,
         owners=owners,
-        claimed_persian=frozenset(claimed_persian),
     )
 
 
@@ -457,147 +447,16 @@ def _replace_known(text: str) -> str:
     return _map_visible(text, lambda segment: current.pattern.sub(substitute, segment))
 
 
-def _variant_distance(left: str, right: str, budget: int) -> int:
-    """Edit distance in which only a plausible mis-transliteration is cheap.
+def enforce(text: str) -> str:
+    """Replace every known spelling of a player's name with the stored one.
 
-    Inserting or dropping a letter costs 1, as does swapping one letter for a
-    letter transliteration confuses it with. Any other substitution costs 2, so
-    an unrelated word cannot slip under a budget of 1.
-    """
-    if abs(len(left) - len(right)) > budget:
-        return budget + 1
-    previous = list(range(len(right) + 1))
-    for row, left_char in enumerate(left, start=1):
-        current = [row]
-        left_group = _CONFUSABLE.get(left_char)
-        for column, right_char in enumerate(right, start=1):
-            if left_char == right_char:
-                cost = 0
-            elif left_group and left_group == _CONFUSABLE.get(right_char):
-                cost = 1
-            else:
-                cost = 2
-            current.append(min(
-                previous[column] + 1,
-                current[column - 1] + 1,
-                previous[column - 1] + cost,
-            ))
-        if min(current) > budget:
-            return budget + 1
-        previous = current
-    return previous[-1]
-
-
-def _contains_word(folded_text: str, spelling: str) -> bool:
-    """Whether an already-folded text contains this spelling as a whole word."""
-    folded = fold(spelling).strip()
-    if not folded:
-        return False
-    return re.search(rf"(?<!\w){re.escape(folded)}(?!\w)", folded_text) is not None
-
-
-def _learn_variants(text: str, players: list[Player]) -> str:
-    """Correct and record spellings the model invented for known players.
-
-    Only players the source text actually named are considered, and only when
-    the translation contains no spelling of that name we already know. That
-    makes the question narrow enough to answer by similarity alone: given that
-    this article is about Tzolis and no known spelling of زولیس is present,
-    a lone Persian word one letter away from it is that name.
-    """
-    current = index()
-    body = visible_text(text)
-    if not body:
-        return text
-
-    words = _PERSIAN_WORD_RE.findall(body)
-    if not words:
-        return text
-    folded_words = {word: fold(word) for word in set(words)}
-    folded_body = fold(body)
-    claimed: set[str] = set()
-
-    for player in players:
-        persian = player.persian
-        if not persian:
-            continue
-        target = fold(persian)
-        # Whole-word, and over the text rather than over single words: a stored
-        # name can be two words ("بن دیویس"), while a plain substring test
-        # would find زولیس inside the very misspelling being looked for.
-        if any(
-            _contains_word(folded_body, spelling)
-            for spelling in (persian, player.canonical_fa, *player.aliases)
-        ):
-            continue
-
-        budget = 1 if len(target) <= 6 else 2
-        candidates = {
-            word
-            for word, folded_word in folded_words.items()
-            if word not in claimed
-            and lookup_key(word) not in current.claimed_persian
-            and lookup_key(word) not in current.replacements
-            and _variant_distance(folded_word, target, budget) <= budget
-        }
-        if len(candidates) != 1:
-            # Nothing close, or two equally close words: leave the text alone
-            # rather than guess which one is the name.
-            continue
-
-        variant = candidates.pop()
-        # One misspelling cannot be two players at once.
-        claimed.add(variant)
-        text = _map_visible(
-            text,
-            lambda segment, variant=variant, persian=persian: re.sub(
-                rf"(?<!\w){re.escape(variant)}(?!\w)", persian, segment
-            ),
-        )
-        _record_variant(player, variant)
-    return text
-
-
-def _record_variant(player: Player, variant: str) -> None:
-    """Store a newly seen spelling so it is corrected without guessing again."""
-    import database as db
-
-    # Store the folded spelling: it is the same name written with the standard
-    # Persian letters, so the stored list stays comparable and readable.
-    variant = fold(variant)
-    try:
-        added = db.add_player_alias(player.id, variant, limit=_MAX_LEARNED_VARIANTS)
-    except Exception:
-        logger.exception(
-            "Could not record the spelling %r for player %s", variant, player.canonical
-        )
-        return
-    if added:
-        logger.info(
-            "Learned Persian spelling %r for %s; corrected to %r",
-            variant,
-            player.canonical,
-            player.persian,
-        )
-        invalidate()
-
-
-def enforce(text: str, *, source_text: str = "", learn: bool = True) -> str:
-    """Make the stored Persian spelling of every known player win.
-
-    ``source_text`` is the English original. It is what makes the third pass
-    safe, so a caller that has it should pass it; without one only spellings
-    already known are corrected.
+    Exact matching only: an English name, or a spelling recorded in the
+    player's ``alias`` column. A spelling nobody recorded is left alone.
     """
     if not str(text or "").strip():
         return text
     try:
-        result = _replace_known(text)
-        if learn and source_text:
-            players = mentioned(source_text)
-            if players:
-                result = _learn_variants(result, players)
-        return result
+        return _replace_known(text)
     except Exception:
         # Never let name handling cost us a translation.
         logger.exception("Player name enforcement failed")

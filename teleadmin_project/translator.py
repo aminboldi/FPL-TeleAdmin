@@ -201,24 +201,23 @@ class Translator:
             translated = await self._call_model(
                 self.google_client, self.google_model, text, instructions
             )
-            return self._finish_text(translated, text)
+            return self._finish_text(translated)
         except Exception:
             try:
                 translated = await self._call_model(
                     self.openrouter_client, self.fallback_model, text, instructions
                 )
-                return self._finish_text(translated, text)
+                return self._finish_text(translated)
             except Exception:
                 raise TranslationError(
                     "Translation failed with both primary and fallback models"
                 )
 
     @staticmethod
-    def _finish_text(translated: str, source_text: str) -> str:
+    def _finish_text(translated: str) -> str:
         """Normalize a model response into the channel's own spellings."""
         return player_names.enforce(
-            _translate_team_abbreviations(_normalize_digits(translated)),
-            source_text=source_text,
+            _translate_team_abbreviations(_normalize_digits(translated))
         )
 
     async def correct_transcript(
@@ -301,7 +300,7 @@ class Translator:
                 )
             except Exception:
                 continue
-            return await self._finish_article(article, text, transcript=transcript)
+            return await self._finish_article(article, transcript=transcript)
 
         # Fallback: translate normally. Summary generation is deliberately
         # handled separately, so a translation/API failure can never turn the
@@ -317,13 +316,10 @@ class Translator:
                 "complete": True,
                 "incomplete_reason": "",
             },
-            text,
             transcript=transcript,
         )
 
-    async def _finish_article(
-        self, article: dict, source_text: str, *, transcript: bool,
-    ) -> dict:
+    async def _finish_article(self, article: dict, *, transcript: bool) -> dict:
         """Format, summarize, and apply the channel's player spellings.
 
         The body is corrected before it is summarized: the summary is written
@@ -334,17 +330,13 @@ class Translator:
             article["body"] = await self._format_transcript_body(
                 article.get("body", "")
             )
-        article["body"] = player_names.enforce(
-            article.get("body", ""), source_text=source_text
-        )
+        article["body"] = player_names.enforce(article.get("body", ""))
         article["summary"] = (
             await self.summarize_article(article["body"])
             or article.get("summary", "")
         )
         for field in ("title", "summary"):
-            article[field] = player_names.enforce(
-                article.get(field, ""), source_text=source_text
-            )
+            article[field] = player_names.enforce(article.get(field, ""))
         return article
 
     # Talk-heavy FPL videos. Used only to give the model the arithmetic, since

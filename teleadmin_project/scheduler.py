@@ -20,16 +20,17 @@ _PRICE_CHANGES_RESUME_DATE = date(2026, 8, 21)
 # UTC minutes past midnight. FPL applies price changes at midnight GMT, so the
 # watchlist window is expressed in UTC too: reasoning about it in Iran time
 # made it look as though it straddled midnight, when in UTC it is one
-# uninterrupted evening. Opens at 20:00 UTC (23:30 Iran) and closes half an
-# hour before the change, by which point a watchlist has nothing left to say.
-_PRICE_CHANGE_UTC_MINUTE = 0
+# uninterrupted evening. It opens at 20:00 UTC (23:30 Iran) and stays open
+# almost to the change itself: a watchlist is only stale once the prices have
+# actually moved, and a narrow window is what lost it in the first place.
 _PRICE_PREDICTION_OPENS_UTC = 20 * 60
-_PRICE_PREDICTION_CLOSES_UTC = 23 * 60 + 30
+_PRICE_PREDICTION_CLOSES_UTC = 23 * 60 + 55
 # The bootstrap payload is ~1.7MB, so poll for price movement on its own
 # cadence rather than on every 30s scheduler tick.
 _PRICE_POLL_INTERVAL = 5 * 60
 _price_check_due_at = 0.0
-_prediction_window_logged = ""
+_notify_admin = None
+_prediction_skip_reported = ""
 _DB_REFRESH_INTERVAL = 6 * 60 * 60
 _DB_REFRESH_RETRY_INTERVAL = 30 * 60
 _SCHEDULER_INTERVAL = 30
@@ -40,8 +41,21 @@ def _now_iran() -> datetime:
     return datetime.now(tz=timezone.utc) + _IRAN_OFFSET
 
 
-async def run_scheduler(client, target_channel: str, league_code: str, price_predictions_enabled: bool = True):
-    logger.info("Scheduler started")
+async def run_scheduler(
+    client,
+    target_channel: str,
+    league_code: str,
+    price_predictions_enabled: bool = True,
+    notify=None,
+):
+    global _notify_admin
+    _notify_admin = notify
+    logger.info(
+        "Scheduler started; price predictions %s, watchlist window %02d:%02d-%02d:%02d UTC",
+        "enabled" if price_predictions_enabled else "DISABLED",
+        _PRICE_PREDICTION_OPENS_UTC // 60, _PRICE_PREDICTION_OPENS_UTC % 60,
+        _PRICE_PREDICTION_CLOSES_UTC // 60, _PRICE_PREDICTION_CLOSES_UTC % 60,
+    )
     await asyncio.sleep(5)
     next_db_refresh = 0.0
 
@@ -275,43 +289,58 @@ async def _check_price_post(client, target_channel, now_iran, price_predictions_
     prediction_key = _price_prediction_key(now_iran - _IRAN_OFFSET)
     if prediction_key is None:
         return
-    _log_prediction_window(prediction_key, price_predictions_enabled)
-    if not price_predictions_enabled or _already_posted(prediction_key):
+    if _already_posted(prediction_key):
         return
-    text = await asyncio.to_thread(
-        livefpl.build_price_changes_text,
-        include_actual=False,
-        include_potential=True,
-    )
+    if not price_predictions_enabled:
+        await _report_prediction_skip(
+            prediction_key,
+            "PRICE_PREDICTIONS_ENABLED خاموش است، بنابراین پیش‌بینی قیمت امشب "
+            "منتشر نمی‌شود. برای روشن کردن: <code>/set PRICE_PREDICTIONS_ENABLED true</code>",
+        )
+        return
+
+    try:
+        text = await asyncio.to_thread(
+            livefpl.build_price_changes_text,
+            include_actual=False,
+            include_potential=True,
+        )
+    except Exception as exc:
+        logger.exception("Price prediction watchlist could not be built")
+        await _report_prediction_skip(
+            prediction_key, f"ساخت پیش‌بینی قیمت با خطا روبه‌رو شد: {exc}"
+        )
+        return
     if not text:
         logger.warning("Price prediction watchlist produced no text; will retry")
+        await _report_prediction_skip(
+            prediction_key,
+            "دادهٔ پیش‌بینی قیمت از FPL در دسترس نبود؛ تا پایان بازهٔ امشب دوباره تلاش می‌شود.",
+        )
         return
+
     await client.send_message(target_channel, text, parse_mode="html")
     _mark_posted(prediction_key)
     logger.info("Posted price prediction watchlist for %s", prediction_key)
 
 
-def _log_prediction_window(prediction_key: str, enabled: bool) -> None:
-    """Say once a night that the window opened, and why nothing may come of it.
+async def _report_prediction_skip(prediction_key: str, reason: str) -> None:
+    """Tell the admin, once a night, why no watchlist is coming.
 
-    A watchlist that never appears used to leave no trace at all: every reason
-    to skip it was a bare `return`. One line per night is enough to tell a
-    disabled setting from an unreachable API from a scheduler that was not
-    running, without waiting for the next failure to reproduce.
+    Every reason to skip used to be a bare `return`, so a missing watchlist
+    left nothing to work back from and each diagnosis cost a whole day. The
+    operator reads Telegram rather than the server log, so the reason goes
+    there.
     """
-    global _prediction_window_logged
-    if _prediction_window_logged == prediction_key:
+    global _prediction_skip_reported
+    logger.warning("Price prediction watchlist skipped for %s: %s", prediction_key, reason)
+    if _prediction_skip_reported == prediction_key or _notify_admin is None:
         return
-    _prediction_window_logged = prediction_key
-    if not enabled:
-        logger.info(
-            "Price prediction window open for %s but PRICE_PREDICTIONS_ENABLED is off",
-            prediction_key,
-        )
-    elif _already_posted(prediction_key):
-        logger.info("Price prediction window open for %s; already posted", prediction_key)
-    else:
-        logger.info("Price prediction window open for %s; posting", prediction_key)
+    _prediction_skip_reported = prediction_key
+    try:
+        await _notify_admin(f"<b>⚠️ پیش‌بینی قیمت منتشر نشد</b>\n\n{reason}")
+    except Exception:
+        logger.exception("Could not report the skipped price prediction")
 
 
 def _price_prediction_key(now_utc) -> str | None:

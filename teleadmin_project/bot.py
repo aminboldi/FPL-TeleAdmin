@@ -762,6 +762,11 @@ async def _notify_article_abandoned(url: str, error: Exception):
     await _send_notification(None, caption, source="Article", is_media=False)
 
 
+async def _notify_admin(caption: str) -> None:
+    """Send a scheduler-level warning to the private admin chat."""
+    await _send_notification(None, caption, source="Scheduler", is_media=False)
+
+
 async def _next_queue_slot(target_channel: str) -> datetime:
     scheduled = await client.get_messages(target_channel, limit=100, scheduled=True)
     occupied = [message.date for message in scheduled if getattr(message, "date", None)]
@@ -2264,6 +2269,18 @@ async def main():
     else:
         logger.warning("Admin dashboard disabled: set TELEGRAM_BOT_TOKEN and ADMIN_USER_IDS")
 
+    # A short-lived feature guessed a player's Persian spelling from nearby
+    # words and recorded ordinary words as names, which then rewrote those
+    # words in every later translation. Remove what it wrote before the index
+    # is built from it.
+    purged = await asyncio.to_thread(db.purge_guessed_aliases)
+    if purged:
+        logger.warning(
+            "Removed %d guessed player alias(es): %s",
+            len(purged),
+            ", ".join(f"{alias!r} on {name}" for name, alias in purged[:20]),
+        )
+
     # Build the player-name index before the first message arrives, so no
     # translation pays for it.
     await asyncio.to_thread(player_names.reload)
@@ -2285,6 +2302,7 @@ async def main():
             target_channel=_target_channel(),
             league_code=runtime_config.get("EPL_LEAGUE_CODE"),
             price_predictions_enabled=runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"),
+            notify=_notify_admin,
         ),
         youtube_monitor.run_monitor(
             settings.youtube_api_key,
