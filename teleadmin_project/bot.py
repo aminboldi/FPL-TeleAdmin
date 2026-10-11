@@ -20,6 +20,7 @@ from telethon.tl.types import (
     Channel,
     MessageEntityBlockquote,
     MessageEntityTextUrl,
+    UpdateDeleteScheduledMessages,
     User,
 )
 
@@ -30,6 +31,9 @@ import price_changes
 import deadlines
 import articles
 import article_monitor
+import article_relay
+import source_articles
+import fplcore
 import database as db
 import post_queue
 import scheduler
@@ -40,6 +44,7 @@ import youtube_posts
 import youtube_monitor
 import livefpl
 import player_names
+import translate_names
 from admin_dashboard import AdminDashboard
 
 logging.basicConfig(
@@ -257,6 +262,22 @@ def _refresh_translator_model() -> None:
     translator.openrouter_model = runtime_config.get("OPEN_ROUTER_MODEL")
 
 
+async def _fill_missing_player_names() -> int:
+    last_error = None
+    for api_client, model in (
+        (translator.google_client, translator.google_model),
+        (translator.openrouter_client, translator.fallback_model),
+    ):
+        if api_client is None:
+            continue
+        try:
+            return await translate_names.fill_missing_names(api_client, model, model)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Missing player-name translation failed with %s: %s", model, exc)
+    raise TranslationError("Could not fill missing Persian player names") from last_error
+
+
 def _get_reply_to(event) -> int | None:
     if not event.message.reply_to:
         return None
@@ -266,8 +287,28 @@ def _get_reply_to(event) -> int | None:
     return db.lookup_target_msg(event.chat_id, reply_msg_id)
 
 
-def _save_mapping(event, target_msg_id: int) -> None:
-    db.store_message_mapping(event.chat_id, event.message.id, target_msg_id)
+def _save_mapping(event, message, target_channel, schedule_time) -> None:
+    db.store_message_mapping(
+        event.chat_id, event.message.id, message.id,
+        is_scheduled=schedule_time is not None,
+        target_channel=str(target_channel),
+        target_text=message.message or "",
+        scheduled_at=schedule_time.isoformat() if schedule_time else "",
+    )
+
+
+async def _handle_scheduled_publication(update) -> None:
+    if not update.sent_messages:
+        return
+    try:
+        target = _target_channel()
+        peer = await client.get_input_entity(target)
+        if getattr(peer, "channel_id", None) != getattr(update.peer, "channel_id", None):
+            return
+        for scheduled_id, published_id in zip(update.messages, update.sent_messages):
+            db.promote_scheduled_mapping(str(target), scheduled_id, published_id)
+    except Exception:
+        logger.exception("Could not record published scheduled-message IDs")
 
 
 def _strip_quotes(text: str) -> str:
@@ -342,7 +383,7 @@ def _youtube_thumbnail_url(url: str) -> str:
 def _format_telegraph_post(
     title: str, summary: str, telegraph_url: str,
 ) -> str:
-    summary_text = html_lib.unescape(_strip_html_tags(summary)).strip()
+    summary_text = _strip_visible_urls(html_lib.unescape(_strip_html_tags(summary)))
     post = (
         f"<b>{_escape_html(title)}</b>\n\n"
         f"- - - - - - - - -\n\n"
@@ -358,7 +399,9 @@ def _format_telegraph_post(
 def _format_short_article_post(
     title: str, body: str, original_url: str, *, source_name: str = "",
 ) -> str:
-    body = _telegraph_to_telegram_html(_strip_article_images(body))
+    body = _strip_visible_urls(
+        _telegraph_to_telegram_html(_strip_article_images(body)), html=True
+    )
     source_label = (
         f"منبع اصلی مقاله در {_escape_html(source_name)}"
         if source_name else "منبع اصلی مقاله"
@@ -474,7 +517,10 @@ _ENGLISH_DIGITS = "01234567890123456789"
 _DIGIT_TRANS = str.maketrans(_PERSIAN_DIGITS, _ENGLISH_DIGITS)
 
 _HASHTAG_RE = re.compile(r"(^|\s)#(?=\w)")
-_URL_RE = re.compile(r"(?:https?://|t\.me/)\S+")
+_URL_RE = re.compile(
+    r"(?:https?://|t\.me/|premierleague(?:-alternate)?\.app\.link/|"
+    r"preml\.ge/|(?:www\.)?premierleague\.com/(?:en/)?news/)\S+", re.IGNORECASE,
+)
 _TCO_URL_RE = re.compile(r"https?://t\.co/\S+", re.IGNORECASE)
 _TRAILING_URL_PUNCTUATION = ".,!?;:)]}»”"
 
@@ -515,12 +561,17 @@ def _extract_urls_from_message(message) -> list[str]:
     urls = []
     text = getattr(message, "text", None) or getattr(message, "message", None) or ""
     if text:
-        urls.extend(m.group(0) for m in _URL_RE.finditer(text))
+        urls.extend(
+            url if url.lower().startswith(("http://", "https://")) else "https://" + url
+            for m in _URL_RE.finditer(text) for url in [m.group(0)]
+        )
     entities = getattr(message, "entities", None)
     if entities:
         for entity in entities:
             url = getattr(entity, "url", None)
             if url:
+                if not url.lower().startswith(("http://", "https://")) and _URL_RE.match(url):
+                    url = "https://" + url
                 urls.append(url)
     return urls
 
@@ -598,10 +649,16 @@ async def _sync_catalog_visibility_from_target() -> None:
 
 
 def _canonical_link_url(url: str) -> str:
-    """Expand X's t.co link and use a canonical watch URL for youtu.be links."""
+    """Expand share links to their canonical public page URLs."""
     url = url.rstrip(_TRAILING_URL_PUNCTUATION)
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
+    if host in articles._PL_APP_LINK_HOSTS:
+        try:
+            return articles.resolve_pl_share_url(url) or url
+        except requests.RequestException as exc:
+            logger.warning("Could not resolve PL share URL %s: %s", url, exc)
+            return url
     if host == "youtu.be":
         try:
             return f"https://www.youtube.com/watch?v={youtube_posts.extract_video_id(url)}"
@@ -639,10 +696,25 @@ def _clean_text(text: str, event=None) -> tuple[str | None, str | None]:
     text = _strip_hashtags(text)
     urls = _extract_urls(event) if event else []
     link_url = urls[0] if urls else None
-    for url in urls:
-        text = text.replace(url, "")
-    text = text.strip() or None
+    text = _strip_visible_urls(text) or None
     return text, link_url
+
+
+def _strip_visible_urls(text: str, *, html: bool = False) -> str:
+    """Remove printed URLs without touching HTML tags or href attributes.
+
+    Matching visible text also handles an escaped URL's `&amp;` query string
+    and a model echoing the resolved destination rather than the source URL.
+    """
+    parts = re.split(r"(<[^>]+>)", text) if html else [text]
+    for index in range(0, len(parts), 2):
+        parts[index] = _URL_RE.sub("", parts[index])
+    cleaned = "".join(parts)
+    if html:
+        # A hidden link may use the URL itself as its visible label. Once
+        # that label is removed, discard the empty anchor as well.
+        cleaned = re.sub(r"<a\b[^>]*>\s*</a>", "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\n(?:[ \t]*\n){2,}", "\n\n", cleaned).strip()
 
 
 def _build_caption(
@@ -651,10 +723,9 @@ def _build_caption(
 ) -> str:
     parts = []
     if translated:
-        if html:
-            parts.append(translated)
-        else:
-            parts.append(_format_numbers(translated))
+        translated = _strip_visible_urls(translated, html=html)
+        if translated:
+            parts.append(translated if html else _format_numbers(translated))
     if link_url:
         parts.append(f'<a href="{_escape_html(link_url)}">{link_label}</a>')
     if not parts:
@@ -811,12 +882,13 @@ async def _next_queue_slot(target_channel: str) -> datetime:
 
 async def _send_to_target(
     text: str, *, event=None, file_path=None, album_paths=None,
-    queue: bool = False,
+    queue: bool = False, target_channel=None, reply_to=None,
 ):
-    target_channel = _target_channel()
+    target_channel = target_channel or _target_channel()
     if not target_channel:
         raise RuntimeError("TARGET_CHANNEL_ID is not configured")
-    reply_to = _get_reply_to(event) if event else None
+    if reply_to is None and event:
+        reply_to = _get_reply_to(event)
     slot_guard = _schedule_slot_lock if queue else _NullAsyncLock()
     async with slot_guard:
         schedule_time = await _next_queue_slot(target_channel) if queue else None
@@ -844,6 +916,13 @@ class _NullAsyncLock:
 
     async def __aexit__(self, exc_type, exc, traceback):
         return False
+
+
+async def _send_source_article_reply(target_channel, parent_id, caption, *, file_path=None):
+    return await _send_to_target(
+        caption, file_path=file_path, queue=True,
+        target_channel=target_channel, reply_to=parent_id,
+    )
 
 
 async def _send_to_target_at(
@@ -879,7 +958,7 @@ async def _send_to_target_at(
             )
         if event:
             mapped_message = msg[0] if isinstance(msg, (list, tuple)) else msg
-            _save_mapping(event, mapped_message.id)
+            _save_mapping(event, mapped_message, target_channel, schedule_time)
         return msg
     except FloodWaitError as e:
         logger.warning("FloodWaitError: sleeping %ss", e.seconds)
@@ -918,7 +997,7 @@ async def _send_to_target_at(
             )
         if event:
             mapped_message = msg[0] if isinstance(msg, (list, tuple)) else msg
-            _save_mapping(event, mapped_message.id)
+            _save_mapping(event, mapped_message, target_channel, schedule_time)
         return msg
 
 
@@ -1059,9 +1138,7 @@ async def _finish_album(gid: int):
                 html = _strip_quotes(html)
                 links = _extract_urls(first_evt)
                 link_url = await _display_link_url(links)
-                for url in links:
-                    html = html.replace(url, "")
-                html = html.strip()
+                html = _strip_visible_urls(html, html=True)
                 if html:
                     translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
                     caption = _build_caption(translated, link_url=link_url, html=True)
@@ -1127,9 +1204,7 @@ async def handle_new_message(event, *, automatic_only: bool = False):
     html = _strip_quotes(html)
     links = _extract_urls(event)
     link_url = await _display_link_url(links)
-    for url in links:
-        html = html.replace(url, "")
-    html = html.strip()
+    html = _strip_visible_urls(html, html=True)
 
     translated = None
     if html:
@@ -1195,40 +1270,45 @@ async def _finish_chunks(chat_id: int):
     if await _try_handle_automatic_content(merged_text, first_evt):
         return
 
-    html = _message_to_html(merged_text, first_evt.message.entities)
+    html = "\n".join(
+        _message_to_html(evt.message.text, evt.message.entities)
+        for evt in chunks if evt.message.text
+    )
     html = _strip_hashtags(html)
     html = _strip_quotes(html)
-    links = _extract_urls(first_evt)
+    links = list(dict.fromkeys(url for evt in chunks for url in _extract_urls(evt)))
     link_url = await _display_link_url(links)
-    for url in links:
-        html = html.replace(url, "")
-    html = html.strip()
+    html = _strip_visible_urls(html, html=True)
 
     translated = None
     if html:
         try:
-            source_html, allowed_links = _prepare_article_source(html)
-            result = await translator.translate_article(source_html)
-            title = _article_title(result.get("title", ""))
-            summary = result.get("summary", "")
-            body = articles.sanitize_article_links(
-                _fix_unclosed_tags(_strip_quotes(result.get("body", ""))),
-                allowed_links,
-            )
-            telegraph_url = articles.publish_to_telegraph(
-                title,
-                body,
-                summary=summary,
-                source_tag=_catalog_source_tag(first_evt),
-            )
-            if telegraph_url:
-                caption = _format_telegraph_post(title, summary, telegraph_url)
-                await _send_to_target(caption, event=first_evt, queue=True)
-                await _send_notification(first_evt, caption)
+            if len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
+                source_html, allowed_links = _prepare_article_source(html)
+                result = await translator.translate_article(source_html)
+                title = _article_title(result.get("title", ""))
+                summary = result.get("summary", "")
+                body = articles.sanitize_article_links(
+                    _fix_unclosed_tags(_strip_quotes(result.get("body", ""))),
+                    allowed_links,
+                )
+                telegraph_url = articles.publish_to_telegraph(
+                    title,
+                    body,
+                    summary=summary,
+                    source_tag=_catalog_source_tag(first_evt),
+                )
+                if telegraph_url:
+                    caption = _format_telegraph_post(title, summary, telegraph_url)
+                    await _send_to_target(caption, event=first_evt, queue=True)
+                else:
+                    caption = _build_caption(body, link_url=link_url, html=True)
+                    await _forward_message(caption, first_evt)
             else:
-                caption = _build_caption(body, link_url=link_url, html=True)
+                translated = _fix_unclosed_tags(_strip_quotes(await translator.translate(html)))
+                caption = _build_caption(translated, link_url=link_url, html=True)
                 await _forward_message(caption, first_evt)
-                await _send_notification(first_evt, caption)
+            await _send_notification(first_evt, caption)
         except TranslationError as e:
             logger.error("Translation error for chunks: %s", e)
             return
@@ -1236,14 +1316,20 @@ async def _finish_chunks(chat_id: int):
             logger.error("Unexpected translation error for chunks: %s", e)
             return
 
-    await _maybe_post_article(merged_text, first_evt)
+    await _maybe_post_article(merged_text, first_evt, urls=links)
 
 
-async def _maybe_post_article(text: str, event):
-    urls = []
-    for url in _extract_urls(event):
-        if url.startswith(("http://", "https://")) and url not in urls:
-            urls.append(url)
+async def _maybe_post_article(text: str, event, *, urls=None):
+    urls = list(dict.fromkeys(urls if urls is not None else _extract_urls(event)))
+    urls = [url for url in urls if url.lower().startswith(("http://", "https://"))]
+
+    # Telegram gives scheduled posts IDs from a separate queue. Wait for the
+    # original to publish before creating a reply using its real channel ID.
+    mapping = db.lookup_message_mapping(event.chat_id, event.message.id)
+    if mapping and mapping["target_channel"]:
+        for url in urls:
+            runtime_config.enqueue_source_article(event.chat_id, event.message.id, url)
+        return
 
     for url in urls:
         logger.info("Post-processing possible article URL: %s", url)
@@ -1256,8 +1342,14 @@ async def _maybe_post_article(text: str, event):
             return
 
 
-async def _publish_article_from_url(url: str, *, event=None) -> bool:
-    """Extract, translate, and schedule a readable article from a web URL."""
+async def _publish_article_from_url(url: str, *, event=None, deliver_post=None) -> bool:
+    """Translate an article, then use its delivery route or the review queue."""
+    async def send_post(caption, *, file_path):
+        if deliver_post is not None:
+            await deliver_post(caption, file_path=file_path)
+        else:
+            await _send_to_target(caption, file_path=file_path, event=event, queue=True)
+
     article = await asyncio.to_thread(articles.fetch_article, url)
     if not article:
         return False
@@ -1343,9 +1435,7 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
                 _download_remote_media, feature_image, "photo"
             )
             try:
-                await _send_to_target(
-                    caption, file_path=feature_path, event=event, queue=True
-                )
+                await send_post(caption, file_path=feature_path)
                 if event:
                     await _send_notification(event, caption, is_media=True)
                 else:
@@ -1397,9 +1487,7 @@ async def _publish_article_from_url(url: str, *, event=None) -> bool:
             summary,
             telegraph_url,
         )
-        await _send_to_target(
-            caption, file_path=feature_path, event=event, queue=True
-        )
+        await send_post(caption, file_path=feature_path)
         if event:
             await _send_notification(event, caption, is_media=True)
         else:
@@ -1624,8 +1712,7 @@ def _forwarded_post_html(event) -> tuple[str, list[str]]:
     text = message.text or ""
     html = _strip_quotes(_strip_hashtags(_message_to_html(text, message.entities)))
     links = _extract_urls(event)
-    for url in links:
-        html = html.replace(url, "")
+    html = _strip_visible_urls(html, html=True)
     html = _prepare_plain_article_layout(html).strip()
     if html and not re.search(r"<(?:p|h[1-6]|blockquote|ul|ol|pre)\b", html, re.IGNORECASE):
         html = f"<p>{html}</p>"
@@ -1845,9 +1932,7 @@ async def _translate_dashboard_single_submission(event) -> str:
     html = _strip_quotes(_strip_hashtags(_message_to_html(text, event.message.entities)))
     links = _extract_urls(event)
     link_url = await _display_link_url(links)
-    for url in links:
-        html = html.replace(url, "")
-    html = html.strip()
+    html = _strip_visible_urls(html, html=True)
 
     if html and len(_strip_html_tags(html)) > _ARTICLE_SOURCE_THRESHOLD:
         source_html, allowed_links = _prepare_article_source(html)
@@ -2246,6 +2331,7 @@ async def main():
     await client.start()
     await _ensure_automatic_sources()
     client.add_event_handler(_handle_configured_source_message, events.NewMessage(incoming=True))
+    client.add_event_handler(_handle_scheduled_publication, events.Raw(types=UpdateDeleteScheduledMessages))
     # Scheduled posts are emitted as normal channel messages when Telegram
     # publishes them. Edits are also observed in case a Telegraph link is
     # added or corrected after posting.
@@ -2310,8 +2396,15 @@ async def main():
     tasks = [
         _start_health_server(),
         _enrich_article_catalog(),
+        source_articles.SourceArticles(
+            client, _publish_article_from_url, _send_source_article_reply,
+        ).run(),
         article_monitor.run_monitor(
-            _publish_article_from_url, _notify_article_abandoned
+            _publish_article_from_url, _notify_article_abandoned,
+            import_fplarmo=article_relay.ArticleRelay(
+                client, fplcore.CHANNEL, _target_channel,
+                _publish_article_from_url, _send_to_target_at,
+            ).publish,
         ),
         client.run_until_disconnected(),
         deadlines.run_deadline_loop(
@@ -2325,6 +2418,7 @@ async def main():
             league_code=runtime_config.get("EPL_LEAGUE_CODE"),
             price_predictions_enabled=runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"),
             notify=_notify_admin,
+            enrich_player_names=_fill_missing_player_names,
         ),
         youtube_monitor.run_monitor(
             settings.youtube_api_key,

@@ -47,6 +47,7 @@ async def run_scheduler(
     league_code: str,
     price_predictions_enabled: bool = True,
     notify=None,
+    enrich_player_names=None,
 ):
     global _notify_admin
     _notify_admin = notify
@@ -58,6 +59,7 @@ async def run_scheduler(
     )
     await asyncio.sleep(5)
     next_db_refresh = 0.0
+    name_enrichment_task = None
 
     while True:
         try:
@@ -75,6 +77,16 @@ async def run_scheduler(
                         len(result["new_players"]),
                     )
                     next_db_refresh = now_monotonic + _DB_REFRESH_INTERVAL
+                    # New official players arrive without Persian names. Fill
+                    # them in the background so AI latency never holds up the
+                    # time-sensitive reporting jobs below. Existing incomplete
+                    # rows are retried even when this refresh adds no players.
+                    if enrich_player_names and (
+                        name_enrichment_task is None or name_enrichment_task.done()
+                    ):
+                        name_enrichment_task = asyncio.create_task(
+                            _enrich_player_names(enrich_player_names)
+                        )
                 except Exception as exc:
                     logger.warning("FPL database refresh failed: %s", exc)
                     next_db_refresh = now_monotonic + _DB_REFRESH_RETRY_INTERVAL
@@ -126,6 +138,18 @@ async def run_scheduler(
             logger.error("Scheduler error: %s", e)
 
         await asyncio.sleep(_SCHEDULER_INTERVAL)
+
+
+async def _enrich_player_names(enrich):
+    try:
+        count = await enrich()
+        logger.info("Filled missing Persian names for %d FPL players", count)
+    except Exception:
+        logger.exception("Player-name enrichment failed; incomplete rows will retry after the next FPL refresh")
+    finally:
+        # A provider may fill one batch before another fails; expose every
+        # successfully saved name to the shared translation glossary.
+        await asyncio.to_thread(player_names.reload)
 
 
 async def _check_official_lineups(client, target_channel):

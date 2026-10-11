@@ -93,10 +93,12 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 ## URL extraction from messages
 
 URLs come from two sources (`bot.py:_extract_urls()`):
-1. Raw text regex: `(?:https?://|t\.me/)\S+`
+1. Raw text regex: HTTP(S), `t.me/`, and known bare Premier League news/share domains (`premierleague.app.link/`, `premierleague-alternate.app.link/`, `preml.ge/`, `premierleague.com/en/news/`). Bare links get an HTTPS scheme before processing.
 2. Message entities: `MessageEntityTextUrl` (link text + hidden URL) — accessed via `getattr(entity, "url", None)`
 
 Both must be checked to catch all link types.
+
+Source-post translation removes printed URLs through `bot.py:_strip_visible_urls()` before translation and again in `_build_caption()` before appending the labelled footer link. Short-article bodies and Telegraph-post summaries use the same cleanup. Only visible text is stripped; HTML attributes and meaningful linked labels remain intact. Never remove source URLs using a plain `html.replace(url, "")`: HTML escaping changes query-string `&` to `&amp;`, and replacement inside an `href` breaks hidden links. Buffered posts collect URLs and HTML entities from every chunk, not only the first. URL article discovery still uses the original source event.
 
 ## OpenRouter API health check
 
@@ -158,9 +160,12 @@ Other invariants:
 
 Git remote is HTTPS (`https://github.com/aminboldi/FPL-TeleAdmin.git`). SSH was tested and failed — do not switch to SSH URLs. `gh auth` is configured and uses HTTPS.
 
-## No test/lint/typecheck infrastructure
+## Verification
 
-There are no tests, no CI, no pre-commit hooks, and no typechecker config. Verification is manual (run bot, check Telegram channels).
+Focused offline alert, player-name enrichment, article filtering, and delivery regression tests use the standard library: run
+`teleadmin_project/.venv/bin/python -m unittest discover -s tests` from the repo root.
+There is no CI, no pre-commit hook, and no typechecker config. Live verification
+is manual (run bot, check Telegram channels), observing the session-sharing rule above.
 
 ## FPL database (`fpl.db`)
 
@@ -171,6 +176,7 @@ In production, when `RUNTIME_CONFIG_PATH` points to the persistent Coolify volum
 - Player name quirks: `search_name` column stores ASCII-normalized `second_name` (strips diacritics). Use this for lookups, not raw `second_name`.
 - Team Farsi names live in `teams.name_fa` / `teams.short_name_fa`
 - Player Farsi names in `players.first_name_fa`, `second_name_fa`, `web_name_fa` (populated by `translate_names.py`)
+- After every successful scheduled FPL refresh, a background task fills missing Persian name fields through the configured translation providers and reloads the shared player-name index. It retries all incomplete rows, including players added by an earlier refresh, and preserves existing names and aliases even if an admin edits them during the API call. `translate_names.py` also fills only missing fields when run manually.
 - **Every** translated output uses those player Farsi columns as the authoritative English-name → Persian-name mapping, not just YouTube transcripts (see *Player name consistency*). Missing values mean a player name cannot be deterministically translated, so keep these columns populated when refreshing the player database.
 - Player community aliases in `players.alias`, comma-separated, populated by `generate_aliases.py` and by `/players` — **only by a person**, never by the bot (see *Never guess a spelling from nearby words*). A Persian entry here is a spelling somebody recorded on purpose; `purge_guessed_aliases()` cleared the ones a short-lived guesser wrote.
 - Country flags stored in `players.flag` — resolved from `regions.json` at DB import time via `database._region_to_flag()`
@@ -217,6 +223,16 @@ Player resolution for every match event is constrained to the two clubs in the
 fixture (`alerts._resolve_player()` takes `strict_team_code`/
 `allowed_team_codes`), preventing same-name players at unrelated clubs from
 being selected.
+
+`alerts._resolve_team()` maps source club names to the live FPL team codes using
+database names and explicit `_TEAM_ALIASES` (for example, Man United → MUN,
+Forest/Forrest → NFO, Tottenham → TOT). Case, spacing, and punctuation are
+normalized; ambiguous names such as United or City are never guessed. Headers,
+player lookups, and goal deduplication use the same resolved codes. If neither
+club resolves, player lookup must not fall back to searching every club.
+Unresolved alert players and matched players missing a Persian display name
+produce a warning with the effective database path and fixture codes, so a
+production roster mismatch can be distinguished from a missing name.
 
 ## Price-change alerts
 
@@ -362,6 +378,7 @@ Exceptions (sent immediately, no delay):
 - Official price-change report (`livefpl.py`)
 - Lineups (`alerts.py`)
 - All scheduler/automated posts
+- FPLArmo articles: publish in `@FPL_ARMO`, then immediately forward the actual channel post to the configured target (`@EPL_Fantasy`).
 
 ## Translated post signature
 
@@ -387,9 +404,11 @@ The bot has two separate article processing pipelines:
 
 ### 1. URL article handling
 
-When a source message contains a URL, `_maybe_post_article()` runs **after** the main message translation pipeline. It fetches readable content, translates the full HTML, and publishes to Telegraph. The dashboard exposes the same pipeline through `/a`.
+When a source message contains a URL, `_maybe_post_article()` runs **after** the main message translation pipeline. It records the URL in `runtime_config.db`'s `source_article_replies` table. `source_articles.py` waits until the translated original has a real channel message ID, then sends the URL through the shared article pipeline and queues its result as a reply to that original post. Failures retry and pending work survives a restart. The dashboard exposes the same article pipeline through `/a`.
 
-- `articles.is_pl_article_url()` selects the site-specific Premier League extractor for `premierleague.com/en/news/...`, short `preml.ge/...`, and `t.co/...` links.
+- `articles.is_pl_article_url()` selects the site-specific Premier League extractor for `premierleague.com/en/news/...`, short `preml.ge/...`, and Premier League app-share links. App-share landing pages expose their article destination through `og:url` or canonical metadata; only a Premier League news URL is accepted. Arbitrary `t.co` links use reader mode, switching to the Premier League parser if they redirect there.
+- Premier League body photos may be JavaScript gallery placeholders with `data-media-type="photo"` and `data-media-id`. The parser fetches each photo's metadata from the public Premier League content API and replaces the placeholder with its image in the original DOM position. Do not remove every `.articleWidget`: it also contains real article photos. Photo retrieval failures raise so automatic imports can retry instead of publishing incomplete articles.
+- Scheduled queue IDs are different from published channel IDs. `message_map` stores queue status, target channel, rendered caption, and scheduled time. `UpdateDeleteScheduledMessages.sent_messages` promotes the mapping on publication; after downtime, only a unique exact caption near its saved slot can recover the mapping. Article delivery has no source event, so it cannot overwrite the original post's mapping. This source-driven workflow runs independently of website-feed monitoring.
 - `articles.fetch_article()` uses BeautifulSoup for Premier League pages and Trafilatura reader mode for other article-like pages. General pages need at least 500 readable characters and are skipped if inaccessible or likely paywalled.
 - Source-specific cleanup is now **structural only**: it selects the article container, extracts the feature image, and drops related-article cards and tag buttons. It must not try to find the end of the article.
 - Promotional *text* removal is the translator's job (`article_prompt.txt`). The old scripted end-of-article detection — FFFix's promo-banner filename and offer wording, FFScout's final `wp-block-separator` and `READ MORE:` paragraphs, AllAboutFPL's `Further reads`/FFHUB blocks — was removed. Each keyed on exact site wording or separator structure, so when a site changed either one the heuristic silently truncated real content. Do not reintroduce it.
@@ -409,7 +428,7 @@ returns otherwise unstructured prose.
 
 ## Telegraph articles
 
-Long-form content (>940 source chars) and merged text chunks are published as Telegraph articles via `articles.publish_to_telegraph()`.
+Long-form content (>940 source chars), including merged chunks above that threshold, is published as Telegraph articles via `articles.publish_to_telegraph()`.
 
 - `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله جدید <source>` header, title, AI-generated summary, and `👈👈متن کامل فارسی مقاله👉👉` linked to the Telegraph URL. URL article posts include their feature image as Telegram media.
 - `translator.translate_article()` uses `article_prompt.txt` for structured JSON output (`title`/`summary`/`body`), falling back to regular translation if JSON parsing fails
@@ -429,7 +448,11 @@ When changing the published HTML, check a real page rather than the stored conte
 - `_enrich_article_catalog()` backfills older indexed pages: it generates an AI summary from the full Telegraph content, recovers the original source link when present, derives YouTube thumbnails, and attempts to refetch source-article images. It runs once per start and works through the **whole** backlog in batches (`_CATALOG_ENRICHMENT_BATCH`, capped by `_CATALOG_ENRICHMENT_LIMIT`), not just the first page of it.
 - Recovery is impossible when an old page contains neither an image nor an original source link, so `pages_needing_enrichment()` takes never-attempted pages first and then the oldest attempt (`ORDER BY enriched_at, published_at DESC`), and `_enrich_catalog_page()` stamps `enriched_at` in a `finally` whether or not anything was recovered. That is what makes the sweep terminate and lets the next start continue past the unfixable remainder. `enriched_at` is a separate column on purpose: `sync_from_telegraph()` rewrites `updated_at` for every page it imports, which would keep resetting the backlog position.
 - `article_catalog.first_source_url()` recovers that source URL from an already-published page. It must never return the catalogue footer link that every page ends with, nor a `telegra.ph`/`graph.org` link — since internal-link rerouting, those can be our own articles. It prefers the anchor labelled `منبع اصلی`. Values stored by the earlier version, which returned the footer, are cleared once by the `catalog_footer_source_cleared` migration.
-- `article_monitor.py` polls Premier League and Fantasy Football Fix listing pages plus the Fantasy Football Scout and AllAboutFPL RSS feeds every 15 minutes. It seeds the current backlog on first startup, then sends only newly discovered URLs through `_publish_article_from_url()` and the normal half-hour review queue. Seen URLs and retry state live in `runtime_config.db`; `/set ARTICLE_MONITOR_ENABLED false` pauses polling.
+- `article_monitor.py` polls the Fantasy Football Fix listing page plus the Fantasy Football Scout and AllAboutFPL RSS feeds every 15 minutes. Premier League automatic monitoring is disabled; manual URL imports remain available. It seeds the current backlog on first startup, then sends only newly discovered URLs through `_publish_article_from_url()` and the normal half-hour review queue. Seen URLs and retry state live in `runtime_config.db`; `/set ARTICLE_MONITOR_ENABLED false` pauses polling.
+- Scout automatic imports use the feed's `<category>` labels: exclude Team News, every Pro Pundits author section (including the separately named FPL Milanista), Team Reveals, Home Page Exclusions, Dugout Discussion, Scoreboard, and other fantasy games. All weekly recommendation sections remain eligible: Scout Picks (including Bus Team), Scout Squad, Captain Sensible/polls, Watchlist, and Spot the Differential. An excluded label wins on a multi-label article. Match known section labels rather than title keywords; ordinary injury tags must not suppress Scout Notes. Manual `/a` imports are unaffected.
+- `fplcore.py` reads the public WordPress API used by `https://www.fplcore.com/blog`; its HTML listing is JavaScript-rendered. Automatic discovery requests author `284376366` and verifies the embedded `fplarmo` identity; other authors are excluded. Article extraction uses the full API body and featured media, preserving inline image positions through the shared sanitization and translation path.
+- FPLArmo uses a separate first-poll baseline so adding the source does not import its historical backlog. Subsequent articles are detected on the normal 15-minute poll, translated, published immediately to `@FPL_ARMO`, and forwarded with Telethon `forward_messages` to the configured target. Do not add `@FPL_ARMO` as a normal translation source or copy/re-upload its post to the target: the forward must retain the originating channel attribution.
+- `article_relay.py` persists the origin channel/message ID and intended target in `runtime_config.db`'s `article_relays` table before forwarding. A failed forward retries on a later poll without retranslating or reposting the origin, even if the article leaves the website feed. Completed relays are skipped after a restart. The shared `ARTICLE_MONITOR_ENABLED` setting also controls this source; ordinary article imports still use the review queue.
 
 ## Internal-link rerouting
 
@@ -501,7 +524,7 @@ Only the automated feeds are gated (`_publish_article_from_url` and the YouTube 
 
 Telegram splits long messages into chunks for non-premium accounts. `bot.py` buffers sent text messages from the same chat for 3 seconds (`_CHUNK_TIMEOUT`), merges them, then processes as a single message.
 
-**Important**: Merged chunks ALWAYS go through `translate_article()` → Telegraph (no length threshold). The 940-char `_ARTICLE_SOURCE_THRESHOLD` only applies to single messages, not chunks.
+The merged text uses the same 940-source-character `_ARTICLE_SOURCE_THRESHOLD` as a single message, after stripping HTML tags, hashtags, quotes, and raw URLs. At or below the threshold it uses `translator.translate()` and a normal queued Telegram text post; above it, `translate_article()` → Telegraph. A single short text-only post also enters the chunk buffer, so never route buffered text to the article pipeline unconditionally. Explicit admin-forwarded batches still use their separate merged-article workflow.
 
 ## Rich formatting preservation
 

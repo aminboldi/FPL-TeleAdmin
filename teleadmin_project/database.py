@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS message_map (
     source_chat_id  INTEGER NOT NULL,
     source_msg_id   INTEGER NOT NULL,
     target_msg_id   INTEGER NOT NULL,
+    is_scheduled   INTEGER NOT NULL DEFAULT 0,
+    target_channel TEXT NOT NULL DEFAULT '',
+    target_text    TEXT NOT NULL DEFAULT '',
+    scheduled_at   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (source_chat_id, source_msg_id)
 );
 
@@ -150,6 +154,15 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(message_map)")}
+        for name, definition in (
+            ("is_scheduled", "INTEGER NOT NULL DEFAULT 0"),
+            ("target_channel", "TEXT NOT NULL DEFAULT ''"),
+            ("target_text", "TEXT NOT NULL DEFAULT ''"),
+            ("scheduled_at", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE message_map ADD COLUMN {name} {definition}")
     logger.info("Database schema initialized at %s", DB_PATH)
 
 
@@ -554,12 +567,35 @@ def get_db_path() -> Path:
     return DB_PATH
 
 
-def store_message_mapping(source_chat_id: int, source_msg_id: int, target_msg_id: int) -> None:
+def store_message_mapping(
+    source_chat_id: int, source_msg_id: int, target_msg_id: int, *,
+    is_scheduled: bool = False, target_channel: str = "", target_text: str = "", scheduled_at: str = "",
+) -> None:
     with _connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO message_map (source_chat_id, source_msg_id, target_msg_id) "
-            "VALUES (?, ?, ?)",
-            (source_chat_id, source_msg_id, target_msg_id),
+            "INSERT OR REPLACE INTO message_map "
+            "(source_chat_id, source_msg_id, target_msg_id, is_scheduled, target_channel, target_text, scheduled_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (source_chat_id, source_msg_id, target_msg_id, int(is_scheduled), target_channel, target_text, scheduled_at),
+        )
+
+
+def lookup_message_mapping(source_chat_id: int, source_msg_id: int) -> dict | None:
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM message_map WHERE source_chat_id=? AND source_msg_id=?",
+            (source_chat_id, source_msg_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def promote_scheduled_mapping(target_channel: str, scheduled_id: int, published_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE message_map SET target_msg_id=?, is_scheduled=0 "
+            "WHERE target_channel=? AND target_msg_id=? AND is_scheduled=1",
+            (published_id, target_channel, scheduled_id),
         )
 
 

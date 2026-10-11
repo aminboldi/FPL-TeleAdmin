@@ -144,6 +144,23 @@ def init() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS article_relays (
+                url TEXT PRIMARY KEY,
+                source_channel TEXT NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                target_channel TEXT NOT NULL,
+                forwarded INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS source_article_replies (
+                source_chat_id INTEGER NOT NULL,
+                source_msg_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                last_attempt TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (source_chat_id, source_msg_id, url)
+            );
             CREATE TABLE IF NOT EXISTS youtube_transcript_provider_health (
                 provider_key TEXT PRIMARY KEY,
                 disabled_month TEXT NOT NULL,
@@ -186,20 +203,113 @@ def get_bool(key: str) -> bool:
     return get(key).strip().lower() not in {"0", "false", "no", "off", ""}
 
 
-def article_monitor_is_bootstrapped() -> bool:
+def article_monitor_is_bootstrapped(source_key: str = "") -> bool:
     init()
     with _connect() as conn:
         return conn.execute(
-            "SELECT 1 FROM article_monitor_meta WHERE key='bootstrapped'"
+            "SELECT 1 FROM article_monitor_meta WHERE key=?",
+            (f"bootstrapped:{source_key}" if source_key else "bootstrapped",),
         ).fetchone() is not None
 
 
-def mark_article_monitor_bootstrapped() -> None:
+def mark_article_monitor_bootstrapped(source_key: str = "") -> None:
     init()
     with _connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO article_monitor_meta (key, value) VALUES ('bootstrapped', '1')"
+            "INSERT OR REPLACE INTO article_monitor_meta (key, value) VALUES (?, '1')",
+            (f"bootstrapped:{source_key}" if source_key else "bootstrapped",),
         )
+
+
+def get_article_relay(url: str) -> dict | None:
+    init()
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM article_relays WHERE url=?", (url,)).fetchone()
+        return dict(row) if row else None
+
+
+def enqueue_source_article(source_chat_id: int, source_msg_id: int, url: str) -> None:
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO source_article_replies (source_chat_id, source_msg_id, url) VALUES (?, ?, ?)",
+            (source_chat_id, source_msg_id, url),
+        )
+
+
+def pending_source_articles() -> list[dict]:
+    init()
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM source_article_replies WHERE state IN ('pending', 'failed', 'processing')"
+        )]
+
+
+def claim_source_article(row: dict) -> bool:
+    init()
+    now = datetime.now(timezone.utc)
+    with _connect() as conn:
+        current = conn.execute(
+            "SELECT state, last_attempt FROM source_article_replies WHERE source_chat_id=? AND source_msg_id=? AND url=?",
+            (row["source_chat_id"], row["source_msg_id"], row["url"]),
+        ).fetchone()
+        if not current or current[0] not in {"pending", "failed", "processing"}:
+            return False
+        if current[1]:
+            age = (now - datetime.fromisoformat(current[1])).total_seconds()
+            if age < (3600 if current[0] == "processing" else 900):
+                return False
+        conn.execute(
+            "UPDATE source_article_replies SET state='processing', last_attempt=? "
+            "WHERE source_chat_id=? AND source_msg_id=? AND url=?",
+            (now.isoformat(), row["source_chat_id"], row["source_msg_id"], row["url"]),
+        )
+        return True
+
+
+def finish_source_article(row: dict, *, success: bool, error: str = "") -> None:
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE source_article_replies SET state=?, last_error=? "
+            "WHERE source_chat_id=? AND source_msg_id=? AND url=?",
+            ("done" if success else "failed", error[:1000], row["source_chat_id"], row["source_msg_id"], row["url"]),
+        )
+
+
+def save_article_relay(url: str, source_channel: str, message_id: int, target_channel: str) -> None:
+    """Persist the origin post before attempting its forward."""
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO article_relays "
+            "(url, source_channel, source_message_id, target_channel, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (url, source_channel, message_id, target_channel, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def mark_article_relay_forwarded(url: str) -> None:
+    init()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE article_relays SET forwarded=1, updated_at=? WHERE url=?",
+            (datetime.now(timezone.utc).isoformat(), url),
+        )
+
+
+def pending_article_relays() -> list[dict]:
+    """Retry an unfinished forward even after its article leaves the feed."""
+    init()
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(
+            "SELECT seen.url, seen.source_key, seen.title, seen.published_at "
+            "FROM article_relays relay JOIN article_monitor_seen seen ON seen.url=relay.url "
+            "WHERE relay.forwarded=0 AND seen.status != 'abandoned'"
+        )]
 
 
 def seed_article_monitor_candidates(candidates: list[dict]) -> None:

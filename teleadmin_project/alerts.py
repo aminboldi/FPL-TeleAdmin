@@ -1,11 +1,14 @@
 """Parse English game-action alerts and format them in Farsi."""
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
 
 import database as db
+
+logger = logging.getLogger(__name__)
 
 _POS_LETTER = {"Goalkeeper": "G", "Defender": "D", "Midfielder": "M", "Forward": "F"}
 
@@ -20,6 +23,64 @@ def _normalize(text: str) -> str:
     return "".join(
         c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
     )
+
+
+# Feeds use full names, FPL abbreviations, and common short names interchangeably.
+# Keep these explicit: a bare "United" or "City" cannot identify a club safely.
+# Codes are matched against the live teams table, so this also survives a new
+# season without assuming that the same twenty clubs are still present.
+_TEAM_ALIASES = {
+    "AVL": ("Villa",),
+    "BOU": ("AFC Bournemouth",),
+    "BHA": ("Brighton & Hove Albion", "Brighton and Hove Albion", "Brighton Hove Albion"),
+    "CRY": ("Palace",),
+    "COV": ("Coventry", "Coventry City"),
+    "HUL": ("Hull", "Hull City"),
+    "IPS": ("Ipswich", "Ipswich Town"),
+    "LEE": ("Leeds", "Leeds United", "Leeds Utd"),
+    "LEI": ("Leicester", "Leicester City"),
+    "LUT": ("Luton", "Luton Town"),
+    "MCI": ("Man City", "Manchester City"),
+    "MUN": ("Man Utd", "Man United", "Manchester United", "Manchester Utd"),
+    "NEW": ("Newcastle", "Newcastle United", "Newcastle Utd"),
+    "NFO": (
+        "Nott'm Forest", "Nottm Forest", "Nottingham Forest", "Nottingham",
+        "Forest", "Forrest", "Nottingham Forrest", "Nottingam Forest",
+        "Nottingam Forrest", "Nottm Forrest", "Nott'm Forrest", "Notts Forest",
+    ),
+    "NOR": ("Norwich", "Norwich City"),
+    "SHU": ("Sheffield United", "Sheffield Utd", "Sheff United", "Sheff Utd"),
+    "SOU": ("Southampton", "Saints"),
+    "STK": ("Stoke", "Stoke City"),
+    "SWA": ("Swansea", "Swansea City"),
+    "TOT": ("Spurs", "Tottenham", "Tottenham Hotspur"),
+    "WBA": ("West Brom", "West Bromwich Albion"),
+    "WHU": ("West Ham", "West Ham United", "West Ham Utd"),
+    "WOL": ("Wolves", "Wolverhampton", "Wolverhampton Wanderers"),
+}
+
+
+def _team_key(name: str) -> str:
+    """Ignore case, spacing, and punctuation, but never guess a club name."""
+    return re.sub(r"[\W_]+", "", _normalize(name or "").casefold())
+
+
+def _resolve_team(code: str, name: str) -> dict | None:
+    teams = db.query("SELECT name, short_name, name_fa, short_name_fa FROM teams")
+    if code:
+        for team in teams:
+            if team["short_name"].casefold() == code.casefold():
+                return team
+    key = _team_key(name)
+    if not key:
+        return None
+    matches = []
+    for team in teams:
+        spellings = [team[field] for field in ("name", "short_name", "name_fa", "short_name_fa")]
+        spellings.extend(_TEAM_ALIASES.get(team["short_name"].upper(), ()))
+        if any(key == _team_key(spelling) for spelling in spellings if spelling):
+            matches.append(team)
+    return matches[0] if len(matches) == 1 else None
 
 
 _ACTION_RE = re.compile(
@@ -195,8 +256,8 @@ def dedup_key(alert: ParsedAlert) -> str:
         return re.sub(r"\s+", " ", _normalize(text or "")).strip().casefold()
 
     payload = {
-        "home": value(alert.home_team) or value(alert.home_team_code),
-        "away": value(alert.away_team) or value(alert.away_team_code),
+        "home": value(alert.home_team_code) or value(alert.home_team),
+        "away": value(alert.away_team_code) or value(alert.away_team),
         "home_score": alert.home_score,
         "away_score": alert.away_score,
         "actions": sorted(
@@ -229,11 +290,13 @@ def _resolve_player(
         # winning before the team-priority ordering is even applied.
         where += " AND upper(t.short_name) = upper(?)"
         params.append(strict_team_code)
-    elif allowed_team_codes:
+    elif allowed_team_codes is not None:
         codes = tuple(code for code in allowed_team_codes if code)
-        if codes:
-            where += " AND upper(t.short_name) IN (" + ",".join("?" for _ in codes) + ")"
-            params.extend(codes)
+        if not codes:
+            logger.warning("Cannot resolve alert player %r: neither fixture club resolved", name)
+            return None
+        where += " AND upper(t.short_name) IN (" + ",".join("?" for _ in codes) + ")"
+        params.extend(codes)
     params.extend((home_team_code, away_team_code))
     results = db.query(
         f"""SELECT players.*, pos.singular_name AS pos_name, t.short_name AS team_code,
@@ -249,7 +312,17 @@ def _resolve_player(
     )
     for player in results:
         if db.player_name_matches(player, name, allow_partial=True):
+            if not player["web_name_fa"]:
+                logger.warning(
+                    "Alert player %r matched id=%s club=%s, but has no Persian display name; database=%s",
+                    name, player["id"], player["team_code"], db.DB_PATH,
+                )
             return player
+    logger.warning(
+        "Alert player %r not found: fixture=%s/%s strict_club=%s allowed_clubs=%s candidates=%d database=%s",
+        name, home_team_code, away_team_code, strict_team_code,
+        allowed_team_codes, len(results), db.DB_PATH,
+    )
     return None
 
 
@@ -260,37 +333,19 @@ def _price_display(player: dict) -> str:
 
 
 def _lookup_team(code: str, fallback_name: str) -> dict:
-    if code:
-        result = db.query_one(
-            "SELECT name_fa, short_name_fa FROM teams WHERE short_name=?",
-            (code,),
-        )
-        if result:
-            return result
-    result = db.query_one(
-        "SELECT name_fa, short_name_fa FROM teams WHERE lower(name) LIKE ?",
-        (f"%{fallback_name.lower()}%",),
-    )
-    return result or {"short_name_fa": fallback_name}
+    team = _resolve_team(code, fallback_name)
+    if team:
+        return {**team, "short_name_fa": team["short_name_fa"] or team["name_fa"] or team["name"]}
+    return {"short_name_fa": _esc(fallback_name), "short_name": ""}
 
 
 def format_farsi(alert: ParsedAlert) -> str | None:
-    # Hashtags normally provide the compact team codes. If a direct/manual
-    # alert omits them, infer the same codes from the two named clubs before
-    # resolving any player so the lookup remains fixture-scoped.
-    for field, team_name in (
-        ("home_team_code", alert.home_team),
-        ("away_team_code", alert.away_team),
-    ):
-        if not getattr(alert, field) and team_name:
-            team = db.query_one(
-                "SELECT short_name FROM teams WHERE lower(name) = lower(?) LIMIT 1",
-                (team_name,),
-            )
-            if team:
-                setattr(alert, field, team["short_name"])
+    # Resolve aliases once for both the header and fixture-scoped player lookup.
+    # The canonical codes also identify duplicate alerts from different feeds.
     home = _lookup_team(alert.home_team_code, alert.home_team)
     away = _lookup_team(alert.away_team_code, alert.away_team)
+    alert.home_team_code = home["short_name"]
+    alert.away_team_code = away["short_name"]
 
     header = (
         f"'<b>{alert.minute}</b> | "

@@ -9,6 +9,7 @@ import requests
 from bs4 import BeautifulSoup, Comment, NavigableString
 from telegraph import Telegraph
 import trafilatura
+import fplcore
 
 logger = logging.getLogger(__name__)
 
@@ -27,14 +28,17 @@ _PL_WHO_AM_I_PATH_RE = re.compile(r"(?:^|/)who-am-i(?:[-/]|$)", re.IGNORECASE)
 _SHORT_URL_RE = re.compile(
     r"(?:https?://)?preml\.ge/\S+"
 )
+_PL_APP_LINK_RE = re.compile(r"(?:https?://)?premierleague(?:-alternate)?\.app\.link/\S+", re.IGNORECASE)
+_PL_APP_LINK_HOSTS = {"premierleague.app.link", "premierleague-alternate.app.link"}
 
 _TCO_URL_RE = re.compile(
     r"https?://t\.co/\S+"
 )
 
 _PL_PROMOTIONAL_SELECTORS = (
-    ".articleWidget",
     ".embeddable-article",
+    ".image-promo",
+    ".video-player",
     ".article-related-content",
     ".media-actions",
     ".article__share-container",
@@ -63,6 +67,7 @@ _ARTICLE_SOURCE_NAMES = {
     "fantasyfootballscout.co.uk": "Fantasy Football Scout",
     "allaboutfpl.com": "AllAboutFPL",
     "premierleague.com": "Premier League",
+    "fplcore.com": "FPL Core",
 }
 _FFFIX_PROMO_LINKS = {
     "/premium/",
@@ -202,7 +207,7 @@ def is_pl_article_url(text: str, entities: list | None = None) -> bool:
     # used by every X post.  Treating it as one sent arbitrary X links through
     # the brittle PL-only parser.  ``fetch_general_article`` follows redirects
     # safely for those links instead.
-    if text and (_PL_URL_RE.search(text) or _SHORT_URL_RE.search(text)):
+    if text and (_PL_URL_RE.search(text) or _SHORT_URL_RE.search(text) or _PL_APP_LINK_RE.search(text)):
         return True
     for m in re.finditer(r"https?://\S+", text or ""):
         raw = m.group(0)
@@ -212,7 +217,7 @@ def is_pl_article_url(text: str, entities: list | None = None) -> bool:
         for e in entities:
             url = getattr(e, "url", None)
             if url and (
-                _PL_URL_RE.search(url) or _SHORT_URL_RE.search(url)
+                _PL_URL_RE.search(url) or _SHORT_URL_RE.search(url) or _PL_APP_LINK_RE.search(url)
             ):
                 return True
     return False
@@ -227,6 +232,8 @@ def is_excluded_premier_league_article(url: str) -> bool:
     )
 
 def resolve_url(text: str, entities: list | None = None) -> str | None:
+    for m in _PL_APP_LINK_RE.finditer(text or ""):
+        return _ensure_https(m.group(0))
     for m in _SHORT_URL_RE.finditer(text or ""):
         return _ensure_https(m.group(0))
     for m in _TCO_URL_RE.finditer(text or ""):
@@ -237,14 +244,14 @@ def resolve_url(text: str, entities: list | None = None) -> str | None:
         for e in entities:
             url = getattr(e, "url", None)
             if url and (
-                _PL_URL_RE.search(url) or _SHORT_URL_RE.search(url) or _TCO_URL_RE.search(url)
+                _PL_URL_RE.search(url) or _SHORT_URL_RE.search(url) or _TCO_URL_RE.search(url) or _PL_APP_LINK_RE.search(url)
             ):
                 return url
     return None
 
 
 def _ensure_https(url: str) -> str:
-    if not url.startswith("http"):
+    if not url.lower().startswith(("http://", "https://")):
         return "https://" + url
     return url
 
@@ -255,18 +262,72 @@ def article_source_name(url: str) -> str:
     return _ARTICLE_SOURCE_NAMES.get(host, host or "منبع وب")
 
 
+def resolve_pl_share_url(url: str) -> str | None:
+    """Read a PL app share page's web destination, rather than its app CTA."""
+    url = _ensure_https(url)
+    if urlparse(url).hostname not in _PL_APP_LINK_HOSTS:
+        return url
+    response = requests.get(url, headers=_HEADERS, timeout=25)
+    response.raise_for_status()
+    candidates = [response.url]
+    page = BeautifulSoup(response.text, "html.parser")
+    candidates.append(_metadata_content(page, "og:url"))
+    canonical = page.find("link", rel="canonical")
+    if canonical:
+        candidates.append(canonical.get("href", ""))
+    for candidate in candidates:
+        parsed = urlparse(candidate)
+        match = re.fullmatch(r"/(?:en/)?news/(\d+)(?:/[^/]*)?/?", parsed.path)
+        if parsed.hostname in {"premierleague.com", "www.premierleague.com"} and match:
+            return f"https://www.premierleague.com/en/news/{match.group(1)}"
+    return None
+
+
+def _hydrate_pl_photos(content, base_url: str) -> None:
+    """Replace JS photo widgets with images at the original body position."""
+    for widget in content.select('[data-media-type="photo"][data-media-id]'):
+        existing = widget.find("img")
+        if existing and (existing.get("src") or existing.get("data-src") or existing.get("data-original")):
+            continue
+        photo_id = str(widget.get("data-media-id", ""))
+        if not photo_id.isdigit():
+            raise ValueError("Premier League article has an invalid photo ID")
+        response = requests.get(
+            f"https://api.premierleague.com/content/premierleague/photo/EN/{photo_id}",
+            headers=_HEADERS, timeout=20,
+        )
+        response.raise_for_status()
+        photo = response.json()
+        src = photo.get("onDemandUrl") or photo.get("imageUrl")
+        if not src or not urljoin(base_url, src).startswith(("http://", "https://")):
+            raise ValueError(f"Premier League photo {photo_id} has no image URL")
+        image = BeautifulSoup("", "html.parser").new_tag("img", src=urljoin(base_url, src))
+        image["alt"] = photo.get("title") or ""
+        widget.replace_with(image)
+
+
 def _fetch_pl_article(url: str) -> dict | None:
-    if not url.startswith("http"):
-        url = "https://" + url
+    url = _ensure_https(url)
+    if urlparse(url).hostname in _PL_APP_LINK_HOSTS:
+        url = resolve_pl_share_url(url)
+        if not url:
+            return None
     try:
         resp = requests.get(url, headers=_HEADERS, timeout=15)
         resp.raise_for_status()
     except Exception as e:
         logger.error("Failed to fetch article %s: %s", url, e)
-        return None
+        raise
 
-    final_url = resp.url
-    soup = BeautifulSoup(resp.text, "html.parser")
+    article = _parse_pl_article(resp.text, resp.url)
+    if article:
+        return article
+    logger.info("PL article layout not recognized; using reader mode for %s", resp.url)
+    return fetch_general_article(resp.url)
+
+
+def _parse_pl_article(page_html: str, final_url: str) -> dict | None:
+    soup = BeautifulSoup(page_html, "html.parser")
 
     title_el = soup.select_one(".article__header-title")
     title = title_el.get_text(strip=True) if title_el else ""
@@ -292,8 +353,7 @@ def _fetch_pl_article(url: str) -> dict | None:
         # the semantic article/main content rather than a private CSS class,
         # retains the official metadata, and follows future server-rendered
         # layouts without requiring another scraper rewrite.
-        logger.info("PL legacy article container missing; using reader-mode fallback for %s", final_url)
-        return fetch_general_article(final_url)
+        return None
 
     # The PL site uses content cards/widgets for promotions and related
     # articles. Remove them before walking the article body. Related Content
@@ -302,46 +362,22 @@ def _fetch_pl_article(url: str) -> dict | None:
     for widget in soup.select(", ".join(_PL_PROMOTIONAL_SELECTORS)):
         widget.decompose()
 
-    rerouted_links = reroute_internal_links(content_el, final_url)
-    parts = []
-    for child in content_el.children:
-        if not hasattr(child, "name"):
-            continue
-        tag = child.name
-        if tag == "p":
-            text = child.get_text(strip=True)
-            if text and not text.startswith("Share"):
-                parts.append({
-                    "type": "p",
-                    "text": text,
-                    "html": _paragraph_html_with_links(child, rerouted_links),
-                })
-        elif tag in ("figure", "picture"):
-            img = child.find("img")
-            if img:
-                src = img.get("src") or img.get("data-src") or ""
-                if src:
-                    parts.append({"type": "img", "src": urljoin(final_url, src)})
-
-    if not parts:
-        raw_text = content_el.get_text(separator="\n", strip=True)
-        if raw_text:
-            parts = [{"type": "p", "text": raw_text}]
-
-    if not title or not parts:
-        logger.info("PL legacy article extraction was incomplete; using reader-mode fallback for %s", final_url)
-        return fetch_general_article(final_url)
+    _hydrate_pl_photos(content_el, final_url)
+    # Preserve headings, lists, nested figure/picture widgets, and images in
+    # DOM order. The old top-level p/figure walker silently lost all of these.
+    content_html, images = _telegraph_safe_article_html(str(content_el), final_url)
+    if not title or not BeautifulSoup(content_html, "html.parser").get_text(strip=True):
+        return None
 
     return {
         "title": title,
         "summary": summary,
         "date": date_str,
-        "parts": parts,
+        "html": content_html,
+        "images": images,
         "url": final_url,
         "header_image": header_image,
-        "feature_image": header_image or next(
-            (part["src"] for part in parts if part["type"] == "img"), ""
-        ),
+        "feature_image": header_image or next(iter(images), ""),
         "source_name": article_source_name(final_url),
     }
 
@@ -450,6 +486,8 @@ def _telegraph_safe_article_html(extracted_html: str, base_url: str) -> tuple[st
     for tag in soup.find_all(True):
         if tag.name in {"h1", "h2"}:
             tag.name = "h3"
+        elif tag.name in {"h5", "h6"}:
+            tag.name = "h4"
         elif tag.name not in _TELEGRAPH_TAGS:
             tag.unwrap()
             continue
@@ -467,7 +505,10 @@ def _telegraph_safe_article_html(extracted_html: str, base_url: str) -> tuple[st
             continue
 
         if tag.name == "img":
-            src = str(tag.get("src") or "").strip()
+            src = str(tag.get("src") or tag.get("data-src") or tag.get("data-original") or "").strip()
+            if not src:
+                tag.decompose()
+                continue
             src = urljoin(base_url, src)
             if not src.startswith(("http://", "https://")):
                 tag.decompose()
@@ -687,6 +728,10 @@ def fetch_general_article(url: str) -> dict | None:
         return None
 
     source_html = response.text
+    if urlparse(response.url).hostname in {"premierleague.com", "www.premierleague.com"}:
+        article = _parse_pl_article(source_html, response.url)
+        if article:
+            return article
     is_fff_article = _is_fff_article_url(response.url)
     is_ffscout_article = _is_ffscout_article_url(response.url)
     is_allaboutfpl_article = _is_allaboutfpl_article_url(response.url)
@@ -832,6 +877,14 @@ def fetch_article(url: str) -> dict | None:
         return None
     if is_pl_article_url(url):
         article = _fetch_pl_article(url)
+    elif fplcore.is_article_url(url):
+        article = fplcore.fetch_article(url)
+        if article:
+            article["html"], article["images"] = _telegraph_safe_article_html(
+                article["html"], article.pop("content_base_url", article["url"])
+            )
+            if not article["feature_image"] and article["images"]:
+                article["feature_image"] = article["images"][0]
     else:
         article = fetch_general_article(url)
     return _drop_recurring_images(article) if article else article

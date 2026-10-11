@@ -2,13 +2,12 @@
 import asyncio
 import json
 import logging
-import sys
-import textwrap
+import re
 
 from openai import AsyncOpenAI
 
 from config import load_config
-from database import _connect, query_scalar
+from database import _connect
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +52,7 @@ async def translate_batch(
             messages=[
                 {
                     "role": "user",
-                    "content": NAME_TRANSLATION_PROMPT.format(input_json=input_json),
+                    "content": NAME_TRANSLATION_PROMPT.replace("{input_json}", input_json),
                 }
             ],
             temperature=0.1,
@@ -67,7 +66,7 @@ async def translate_batch(
             raise ValueError(f"Expected list, got {type(result)}")
         expected_ids = {p["id"] for p in players}
         returned_ids = {item["id"] for item in result}
-        if expected_ids != returned_ids:
+        if expected_ids != returned_ids or len(result) != len(players):
             raise ValueError(
                 f"ID mismatch: expected {len(expected_ids)} IDs, "
                 f"got {len(returned_ids)}. "
@@ -88,85 +87,60 @@ async def translate_batch(
         raise
 
 
-async def main():
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-    )
+async def fill_missing_names(client: AsyncOpenAI, model: str, fallback_model: str) -> int:
+    """Fill missing Persian fields, preserving every existing spelling and alias.
 
+    Scan all incomplete rows, including additions from earlier refreshes whose
+    translation failed. Recheck each field at write time so a concurrent admin
+    edit made during the API call also wins.
+    """
+    with _connect() as conn:
+        conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
+        rows = conn.execute(
+            "SELECT id, first_name, second_name, web_name FROM players "
+            "WHERE trim(coalesce(first_name_fa, '')) = '' "
+            "OR trim(coalesce(second_name_fa, '')) = '' "
+            "OR trim(coalesce(web_name_fa, '')) = '' ORDER BY id"
+        ).fetchall()
+    updated = 0
+    for offset in range(0, len(rows), BATCH_SIZE):
+        batch = rows[offset:offset + BATCH_SIZE]
+        result = await translate_batch(client, model, batch, fallback_model)
+        updates = []
+        for item in result:
+            names = []
+            for field in ("first_name_fa", "second_name_fa", "web_name_fa"):
+                value = item.get(field)
+                if not isinstance(value, str) or not re.search(r"[\u0600-\u06ff]", value):
+                    raise ValueError(f"Missing Persian {field} for player {item['id']}")
+                names.append(value.strip())
+            updates.append((*names, item["id"]))
+        with _connect() as conn:
+            cursor = conn.executemany(
+                "UPDATE players SET "
+                "first_name_fa=CASE WHEN trim(coalesce(first_name_fa, ''))='' THEN ? ELSE first_name_fa END, "
+                "second_name_fa=CASE WHEN trim(coalesce(second_name_fa, ''))='' THEN ? ELSE second_name_fa END, "
+                "web_name_fa=CASE WHEN trim(coalesce(web_name_fa, ''))='' THEN ? ELSE web_name_fa END "
+                "WHERE id=? AND (trim(coalesce(first_name_fa, ''))='' "
+                "OR trim(coalesce(second_name_fa, ''))='' OR trim(coalesce(web_name_fa, ''))='')",
+                updates,
+            )
+            updated += cursor.rowcount
+        if offset + BATCH_SIZE < len(rows):
+            await asyncio.sleep(DELAY_BETWEEN_BATCHES)
+    return updated
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     settings = load_config()
     client = AsyncOpenAI(
         api_key=settings.openrouter_api_key,
         base_url="https://openrouter.ai/api/v1",
         default_headers={"X-Title": "TeleAdmin"},
     )
-
-    total = query_scalar("SELECT count(*) FROM players")
-    logger.info("Re-translating names for %d players (batch size: %d)", total, BATCH_SIZE)
-
-    translated = 0
-    offset = 0
-
-    while True:
-        with _connect() as conn:
-            conn.row_factory = lambda c, r: dict(
-                zip([col[0] for col in c.description], r)
-            )
-            rows = conn.execute(
-                "SELECT id, first_name, second_name, web_name FROM players "
-                "ORDER BY id LIMIT ? OFFSET ?",
-                (BATCH_SIZE, offset),
-            ).fetchall()
-
-        if not rows:
-            break
-
-        logger.info(
-            "Batch %d: players %d-%d (%d names)",
-            offset // BATCH_SIZE + 1,
-            rows[0]["id"],
-            rows[-1]["id"],
-            len(rows),
-        )
-
-        try:
-            result = await translate_batch(
-                client, settings.openrouter_model, rows, settings.fallback_model
-            )
-        except Exception as e:
-            logger.error("Failed to translate batch: %s", e)
-            sys.exit(1)
-
-        result_by_id = {item["id"]: item for item in result}
-
-        with _connect() as conn:
-            for player in rows:
-                pid = player["id"]
-                tr = result_by_id.get(pid, {})
-                conn.execute(
-                    "UPDATE players SET first_name_fa=?, second_name_fa=?, web_name_fa=? WHERE id=?",
-                    (
-                        tr.get("first_name_fa", ""),
-                        tr.get("second_name_fa", ""),
-                        tr.get("web_name_fa", ""),
-                        pid,
-                    ),
-                )
-
-        translated += len(rows)
-        offset += len(rows)
-        logger.info(
-            "Updated %d players in DB (%d/%d complete)",
-            len(rows),
-            translated,
-            total,
-        )
-
-        if len(rows) < BATCH_SIZE:
-            break
-
-        await asyncio.sleep(DELAY_BETWEEN_BATCHES)
-
-    logger.info("Done. Translated %d players.", translated)
+    updated = await fill_missing_names(client, settings.openrouter_model, settings.fallback_model)
+    logger.info("Filled missing Persian names for %d players", updated)
 
 
 if __name__ == "__main__":
