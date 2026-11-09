@@ -8,6 +8,7 @@ import livefpl
 import runtime_config
 import alerts
 import official_lineups
+import fixtures_post
 import player_names
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,11 @@ async def run_scheduler(
                 await _check_official_lineups(client, target_channel)
             except Exception:
                 logger.exception("Official lineup check failed")
+
+            try:
+                await _check_fixtures_post(client, target_channel)
+            except Exception:
+                logger.exception("Fixtures post check failed")
 
             # Price reports use the official FPL bootstrap and must not be
             # blocked by a temporary outage or empty response from LiveFPL.
@@ -219,6 +225,44 @@ async def _check_official_lineups(client, target_channel):
             fixture["home_en"], fixture["away_en"],
         )
         await asyncio.sleep(2)
+
+
+async def _check_fixtures_post(client, target_channel, now=None):
+    """Put the next gameweek's fixtures in the channel's scheduled messages.
+
+    Once the previous gameweek's last match is over, the post is scheduled
+    for exactly ``fixtures_post.LEAD_TIME`` before the deadline. When that
+    moment has already passed — a short midweek turnaround — it goes out at
+    once rather than not at all. Its text is fixed when it is scheduled.
+    """
+    now = now or datetime.now(tz=timezone.utc)
+    due = fixtures_post.due_post(now)
+    if not due:
+        return
+    gameweek, send_at = due
+    posted_key = f"fixtures_post_{gameweek['id']}"
+    if _already_posted(posted_key):
+        return
+
+    text = fixtures_post.text(gameweek)
+    # Telegram rejects a schedule time that is not comfortably in the future.
+    schedule = send_at if send_at > now + timedelta(minutes=1) else None
+    await client.send_file(
+        target_channel, str(fixtures_post.IMAGE),
+        caption=text, parse_mode="html", schedule=schedule,
+    )
+    _mark_posted(posted_key)
+    iran_time = (schedule + _IRAN_OFFSET).strftime("%Y-%m-%d %H:%M") if schedule else ""
+    logger.info(
+        "Fixtures post for GW%d %s", gameweek["id"],
+        f"scheduled for {iran_time} Iran time" if schedule else "sent now",
+    )
+    if _notify_admin is not None:
+        where = f"در زمان‌بندی کانال برای {iran_time} قرار گرفت" if schedule else "همین حالا در کانال منتشر شد"
+        try:
+            await _notify_admin(f"📅 برنامهٔ هفته {gameweek['id']} {where}.")
+        except Exception:
+            logger.exception("Could not tell the admin about the fixtures post")
 
 
 async def _check_game_points(client, target_channel, games):

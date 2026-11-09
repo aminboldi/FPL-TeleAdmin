@@ -1,13 +1,10 @@
 """Content the admin dashboard prepares on request: provider balances,
 fixtures, and the pending publish-confirmation post."""
 import asyncio
-from datetime import datetime, timedelta, timezone
 
 import requests
 
-
-import price_changes
-import database as db
+import fixtures_post
 import livefpl
 from app import (
     settings,
@@ -20,12 +17,9 @@ from delivery import (
 )
 
 
-# A match plus stoppage, a delayed start, and the wait before the API marks it
-# finished. A fixture unfinished for longer than this was postponed.
-_FIXTURE_IN_PROGRESS_HOURS = 4
-
-
 _pending_dashboard_content: str | None = None
+# An image to send with the pending post; only the fixtures post has one.
+_pending_dashboard_file: str | None = None
 
 
 def _fetch_openrouter_balance() -> dict:
@@ -104,93 +98,13 @@ async def _openrouter_balance() -> str:
     )
 
 
-def _gameweek_has_football_left(gameweek_id: int) -> bool:
-    """Whether this gameweek still has a match to come or in progress.
-
-    A fixture that has been unfinished for longer than a match can last was
-    postponed rather than played, and must not hold a gameweek open until the
-    rescheduled date.
-    """
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(hours=_FIXTURE_IN_PROGRESS_HOURS)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return bool(
-        db.query_scalar(
-            "SELECT count(*) FROM fixtures "
-            "WHERE gameweek_id=? AND finished=0 AND kickoff_time > ?",
-            (gameweek_id, cutoff),
-        )
-    )
-
-
-def _fixtures_gameweek() -> dict:
-    """Return the gameweek whose fixtures are worth posting.
-
-    The FPL API keeps a gameweek ``is_current`` until the *next* one's
-    deadline, so between the final whistle and that deadline this command was
-    still advertising matches that had already been played. Once the current
-    gameweek has no football left in it, the next one is what people want.
-    """
-    current = db.query_one(
-        "SELECT id, name FROM gameweeks WHERE is_current=1 ORDER BY id LIMIT 1"
-    )
-    if current:
-        if _gameweek_has_football_left(current["id"]):
-            return current
-        upcoming = db.query_one(
-            "SELECT g.id, g.name FROM gameweeks g "
-            "JOIN fixtures f ON f.gameweek_id = g.id "
-            "WHERE g.id > ? GROUP BY g.id ORDER BY g.id LIMIT 1",
-            (current["id"],),
-        )
-        # Nothing follows the final gameweek of a season.
-        return upcoming or current
-
-    upcoming = db.query_one(
-        "SELECT id, name FROM gameweeks WHERE is_next=1 ORDER BY id LIMIT 1"
-    )
-    if not upcoming:
-        raise RuntimeError("گیم‌ویک فعلی یا بعدی پیدا نشد.")
-    return upcoming
-
-
-def _fixtures_text() -> str:
-    gameweek = _fixtures_gameweek()
-    fixtures = db.query(
-        """SELECT f.kickoff_time, ht.short_name_fa AS home_fa, ht.short_name AS home_en,
-                  at.short_name_fa AS away_fa, at.short_name AS away_en
-           FROM fixtures f
-           JOIN teams ht ON ht.id=f.team_h JOIN teams at ON at.id=f.team_a
-           WHERE f.gameweek_id=? ORDER BY f.kickoff_time""",
-        (gameweek["id"],),
-    )
-    if not fixtures:
-        raise RuntimeError("بازی‌ای برای این گیم‌ویک پیدا نشد.")
-    iran_offset = timedelta(hours=3, minutes=30)
-    lines = [f"<b>📅 برنامهٔ {gameweek['name']}</b>", ""]
-    current_day = None
-    for fixture in fixtures:
-        kickoff = datetime.strptime(fixture["kickoff_time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) + iran_offset
-        # The post goes out weekly, so the weekday tells a reader which match
-        # is which far quicker than a calendar date does.
-        day = price_changes.persian_weekday(kickoff)
-        if day != current_day:
-            if current_day is not None:
-                lines.append("")
-            current_day = day
-            lines.extend([f"<b>{day}</b>", ""])
-        home = fixture["home_fa"] or fixture["home_en"]
-        away = fixture["away_fa"] or fixture["away_en"]
-        lines.append(f"<blockquote>{home} - {away} | <b>{kickoff.strftime('%H:%M')}</b></blockquote>")
-    lines.extend(["", "@EPL_Fantasy"])
-    return "\n".join(lines)
-
-
 async def _prepare_dashboard_content(kind: str) -> str:
-    global _pending_dashboard_content
+    global _pending_dashboard_content, _pending_dashboard_file
     _pending_dashboard_content = None
+    _pending_dashboard_file = None
     if kind == "fixtures":
-        text = _fixtures_text()
+        text = fixtures_post.text(fixtures_post.current_gameweek())
+        _pending_dashboard_file = str(fixtures_post.IMAGE)
     elif kind == "points":
         livefpl._games_cache = None
         fixtures = livefpl.get_finished_fixtures()
@@ -223,10 +137,10 @@ async def _prepare_dashboard_content(kind: str) -> str:
 
 
 async def _publish_dashboard_content() -> str:
-    global _pending_dashboard_content
+    global _pending_dashboard_content, _pending_dashboard_file
     if not _pending_dashboard_content:
         raise RuntimeError("پیش‌نمایش قابل انتشار وجود ندارد.")
-    text = _pending_dashboard_content
-    _pending_dashboard_content = None
-    await _send_to_target(text)
+    text, file_path = _pending_dashboard_content, _pending_dashboard_file
+    _pending_dashboard_content = _pending_dashboard_file = None
+    await _send_to_target(text, file_path=file_path)
     return "✅ محتوا در کانال منتشر شد."
