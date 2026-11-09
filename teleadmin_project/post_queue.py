@@ -52,16 +52,25 @@ def first_candidate(now: datetime) -> datetime:
     return _next_allowed_slot(current_upcoming)
 
 
-def next_available_slot(
-    now: datetime,
-    occupied: Iterable[datetime] = (),
-    after: datetime | None = None,
-) -> datetime:
-    """Return the first unoccupied slot, optionally after a prior reservation."""
+def slot_at_or_after(value: datetime) -> datetime:
+    """Return the half-hour boundary at or after ``value``, in UTC.
+
+    Unlike ``_next_allowed_slot`` this ignores the overnight blackout: it is
+    for working out when something else will happen, not where a post goes.
+    """
+    value = value.astimezone(timezone.utc)
+    floor = value.replace(minute=0 if value.minute < 30 else 30, second=0, microsecond=0)
+    return floor if floor == value else floor + timedelta(minutes=30)
+
+
+def next_available_slot(now: datetime, occupied: Iterable[datetime] = ()) -> datetime:
+    """Return the first slot from now on that nothing occupies.
+
+    Only ``occupied`` decides what is taken. A slot freed because a scheduled
+    post was published early or deleted is filled again by the next post,
+    rather than the queue resuming after the last slot it once used.
+    """
     candidate = first_candidate(now)
-    if after is not None:
-        while candidate <= after:
-            candidate = _next_allowed_slot(after)
     occupied_keys = {_slot_key(value) for value in occupied if value.tzinfo is not None}
     while _slot_key(candidate) in occupied_keys:
         candidate = _next_allowed_slot(candidate)

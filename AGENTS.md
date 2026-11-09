@@ -289,6 +289,10 @@ The channel's price post has a fixed look: `تغییرات قیمت 💷 صبح 
 
 Every report renders through `format_price_report()`, and new report kinds must too rather than growing a second layout. The producer resolves its own players and hands over `PriceMove` records, so the formatter never touches the database: `livefpl._price_move()` resolves an official element through `_load_db_players()`. `PriceMove.note` carries the prediction's progress percentage and is empty for a confirmed change, which needs no annotation. The watchlist is also **brief**: `livefpl._price_move(..., brief=True)` drops the flag and the club, because a list of maybes does not warrant the detail that a confirmed change does.
 
+### The watchlist never goes out during a match
+
+`scheduler.prediction_slot()` decides when tonight's watchlist goes out: 23:30 Iran (the window's opening), unless a match is on that night, in which case it is the first half-hour slot after the last match's expected end (kickoff + `_MATCH_LENGTH`, 2h). A match kicking off at 23:30 is part of the night, so the watchlist follows it rather than going out in front of it. Reaching the slot is not enough: `_check_price_post()` also waits until LiveFPL reports every match of the night Done (`_fixture_over()`), with `_MATCH_OVERDUE` (4h after kickoff) as the fallback so a LiveFPL outage or a postponement cannot hold it all night. The scheduler fetches LiveFPL games *before* the price check for this reason.
+
 ### The prediction window is hours wide, not minutes
 
 `_price_prediction_key()` returns the key for tonight's watchlist, or `None` outside its window. It is expressed **in UTC**, because FPL applies the change at midnight GMT: the window is 20:00–23:55 UTC, opening at the same moment it always did (23:30 Iran) and staying open almost to the change itself — a watchlist is only stale once the prices have actually moved, and a narrow window is what lost it in the first place. Reasoning about it in Iran time made it look as though it straddled midnight; in UTC it is one uninterrupted evening, and the key is simply the next UTC date.
@@ -392,7 +396,7 @@ Runs alongside the bot in `asyncio.gather()`. Automated posts:
 
 | Post | Trigger | Source |
 |---|---|---|
-| Price predictions | Nightly, 20:00–23:30 UTC (23:30–03:00 Iran) | official FPL bootstrap via `livefpl.build_price_changes_text()` |
+| Price predictions | Nightly at 23:30 Iran, or after that night's last match is Done | official FPL bootstrap via `livefpl.build_price_changes_text()` |
 | Actual price changes | Whenever official prices differ from the saved baseline (checked every 5 min) | official FPL bootstrap diffed against `price_prediction_snapshot` |
 | EO leaderboard | 75 minutes after each deadline | `livefpl.build_eo_text()` |
 | Game points | When game status becomes "Done" in API (polled every 30s) | `livefpl.build_game_text()` |
@@ -411,7 +415,8 @@ All messages that go through LLM translation (forwarded source posts, articles, 
 - The next upcoming slot is treated as the current slot and skipped. For example, a post received at 13:12 starts at 14:00, then later posts take 14:30, 15:00, and so on.
 - During the 00:30–08:00 blackout, queued posts start at 08:30.
 - Existing Telegram scheduled messages are read before each allocation, so occupied slots remain respected after a bot restart.
-- Slot allocation and sending share an async lock. The process also remembers the last reserved slot per target, ensuring successive queued posts advance by 30 minutes even if Telegram has not yet returned a just-created scheduled message; Telegram's scheduled list remains the restart-safe baseline.
+- **A slot is taken only by a message in Telegram's scheduled list** (plus the nightly price watchlist's slot, below). Every post fills the first free slot from now on. The queue used to remember the last slot it had reserved and always continue after it, so a slot freed when an admin published a reviewed post early, or deleted one, was never reused. Slot allocation and sending share an async lock, and a slot reserved in the last two minutes (`_RESERVATION_GRACE`) also counts as taken, because Telegram may not list a just-created scheduled message straight away; a send that fails gives its slot back.
+- **The price watchlist owns its slot.** `scheduler.reserved_prediction_slots()` lists the coming nights' watchlist slots and `delivery._next_queue_slot()` treats them as occupied, so no review-queue post lands on 23:30. Nothing is reserved while `PRICE_PREDICTIONS_ENABLED` is off.
 
 Exceptions (sent immediately, no delay):
 - Game-action alerts (`alerts.py`)

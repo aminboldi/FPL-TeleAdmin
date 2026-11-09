@@ -3,7 +3,7 @@ media forwarding, reply mapping and admin notifications."""
 import asyncio
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -16,6 +16,7 @@ import alerts
 import price_changes
 import database as db
 import post_queue
+import scheduler
 import runtime_config
 from app import (
     _target_channel,
@@ -39,7 +40,10 @@ _schedule_slot_lock = asyncio.Lock()
 # the last allocated slot locally so successive posts advance even when the
 # scheduled-message history has not caught up yet. The history remains the
 # restart-safe source of truth because this cursor only lives in memory.
-_last_reserved_queue_slots: dict[str, datetime] = {}
+# Slots reserved in the last few minutes, per target channel: Telegram may not
+# list a just-created scheduled message straight away.
+_recent_queue_reservations: dict[str, dict[datetime, datetime]] = {}
+_RESERVATION_GRACE = timedelta(minutes=2)
 
 
 _automatic_alert_lock = asyncio.Lock()
@@ -132,24 +136,29 @@ async def _notify_admin(caption: str) -> None:
 
 
 async def _next_queue_slot(target_channel: str) -> datetime:
+    """Reserve the first free half-hour slot from now on.
+
+    A slot is taken only by a message actually sitting in the channel's
+    scheduled list, or by the nightly price watchlist. The queue used to
+    resume after the last slot the bot had reserved, so a slot freed when an
+    admin published a reviewed post early, or deleted one, was never reused.
+    A slot reserved moments ago also counts as taken for a short while, in
+    case Telegram does not list the new scheduled message yet.
+    """
     scheduled = await client.get_messages(target_channel, limit=100, scheduled=True)
     occupied = [message.date for message in scheduled if getattr(message, "date", None)]
-    target_key = str(target_channel)
     now = datetime.now(tz=timezone.utc)
-    last_reserved = _last_reserved_queue_slots.get(target_key)
-    if last_reserved is not None:
-        last_key = post_queue._slot_key(last_reserved)
-        if any(
-            value.tzinfo is not None and post_queue._slot_key(value) == last_key
-            for value in occupied
-        ):
-            _last_reserved_queue_slots.pop(target_key, None)
-    slot = post_queue.next_available_slot(
-        now,
-        occupied,
-        after=_last_reserved_queue_slots.get(target_key),
-    )
-    _last_reserved_queue_slots[target_key] = slot
+    try:
+        occupied.extend(scheduler.reserved_prediction_slots(now))
+    except Exception:
+        logger.exception("Could not work out the price watchlist slots; not reserving them")
+    reservations = _recent_queue_reservations.setdefault(str(target_channel), {})
+    for slot, reserved_at in list(reservations.items()):
+        if now - reserved_at > _RESERVATION_GRACE:
+            del reservations[slot]
+    occupied.extend(reservations)
+    slot = post_queue.next_available_slot(now, occupied)
+    reservations[slot] = now
     return slot
 
 
@@ -177,9 +186,8 @@ async def _send_to_target(
             )
         except Exception:
             if schedule_time:
-                target_key = str(target_channel)
-                if _last_reserved_queue_slots.get(target_key) == schedule_time:
-                    _last_reserved_queue_slots.pop(target_key, None)
+                # The post never reached Telegram; give its slot back.
+                _recent_queue_reservations.get(str(target_channel), {}).pop(schedule_time, None)
             raise
 
 

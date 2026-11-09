@@ -10,6 +10,7 @@ import alerts
 import official_lineups
 import fixtures_post
 import player_names
+import post_queue
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,13 @@ _DB_REFRESH_INTERVAL = 6 * 60 * 60
 _DB_REFRESH_RETRY_INTERVAL = 30 * 60
 _SCHEDULER_INTERVAL = 30
 _LINEUP_LEAD_TIME = timedelta(minutes=75)
+# How long a match is assumed to last when planning the watchlist's slot.
+# LiveFPL reporting the match Done is what actually releases the post.
+_MATCH_LENGTH = timedelta(hours=2)
+# A match still not Done this long after kickoff is treated as over, so a
+# LiveFPL outage or a postponement cannot hold the watchlist all night.
+_MATCH_OVERDUE = timedelta(hours=4)
+_prediction_wait_logged = ""
 
 
 def _now_iran() -> datetime:
@@ -117,19 +125,21 @@ async def run_scheduler(
             except Exception:
                 logger.exception("Fixtures post check failed")
 
-            # Price reports use the official FPL bootstrap and must not be
-            # blocked by a temporary outage or empty response from LiveFPL.
-            try:
-                await _check_price_post(
-                    client, target_channel, now_iran, price_predictions_enabled
-                )
-            except Exception:
-                logger.exception("Price report check failed")
-
             # LiveFPL changes as matches progress. A one-time startup fetch
             # leaves all games permanently at their initial status and makes
             # both Done-game posts and the post-deadline EO snapshot invisible.
             games = await asyncio.to_thread(livefpl.refresh_games)
+
+            # Price reports use the official FPL bootstrap and must not be
+            # blocked by a temporary outage or empty response from LiveFPL;
+            # LiveFPL only tells the watchlist when tonight's matches are Done.
+            try:
+                await _check_price_post(
+                    client, target_channel, now_iran, price_predictions_enabled, games
+                )
+            except Exception:
+                logger.exception("Price report check failed")
+
             if games:
                 try:
                     await _check_game_points(client, target_channel, games)
@@ -331,7 +341,9 @@ async def _check_eo_post(client, target_channel):
     logger.info("Posted EO leaderboard for GW%d", gw["id"])
 
 
-async def _check_price_post(client, target_channel, now_iran, price_predictions_enabled=True):
+async def _check_price_post(
+    client, target_channel, now_iran, price_predictions_enabled=True, games=None,
+):
     """Report real price changes when they happen, and the nightly watchlist.
 
     Actual changes are detected by diffing the official prices against the
@@ -365,6 +377,24 @@ async def _check_price_post(client, target_channel, now_iran, price_predictions_
             "PRICE_PREDICTIONS_ENABLED خاموش است، بنابراین پیش‌بینی قیمت امشب "
             "منتشر نمی‌شود. برای روشن کردن: <code>/set PRICE_PREDICTIONS_ENABLED true</code>",
         )
+        return
+
+    # The watchlist has its own half-hour slot, 23:30 unless a match is on, and
+    # never goes out while a match that night is still being played.
+    global _prediction_wait_logged
+    now_utc = now_iran - _IRAN_OFFSET
+    night = _night_fixtures(now_utc.date())
+    slot = prediction_slot(now_utc.date(), night)
+    if now_utc < slot:
+        return
+    live = [f for f in night if not _fixture_over(f, games, now_utc)]
+    if live:
+        if _prediction_wait_logged != prediction_key:
+            _prediction_wait_logged = prediction_key
+            logger.info(
+                "Price watchlist waiting for %s to finish",
+                ", ".join(f"{f['home_en']} v {f['away_en']}" for f in live),
+            )
         return
 
     try:
@@ -409,6 +439,74 @@ async def _report_prediction_skip(prediction_key: str, reason: str) -> None:
         await _notify_admin(f"<b>⚠️ پیش‌بینی قیمت منتشر نشد</b>\n\n{reason}")
     except Exception:
         logger.exception("Could not report the skipped price prediction")
+
+
+def _utc(value: str) -> datetime:
+    return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def _night_window(day: date) -> tuple[datetime, datetime]:
+    """The watchlist window on the evening of UTC ``day``."""
+    midnight = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    return (
+        midnight + timedelta(minutes=_PRICE_PREDICTION_OPENS_UTC),
+        midnight + timedelta(minutes=_PRICE_PREDICTION_CLOSES_UTC),
+    )
+
+
+def _night_fixtures(day: date, fixtures: list[dict] | None = None) -> list[dict]:
+    """Matches that may still be running, or will start, during that window."""
+    opens, closes = _night_window(day)
+    if fixtures is None:
+        fixtures = livefpl.get_fixtures()
+    return [
+        f for f in fixtures
+        if f.get("kickoff_time") and opens - _MATCH_OVERDUE < _utc(f["kickoff_time"]) < closes
+    ]
+
+
+def prediction_slot(day: date, night: list[dict] | None = None) -> datetime:
+    """When the watchlist for the evening of UTC ``day`` goes out.
+
+    It is the window's opening, 23:30 Iran time, unless a match is on that
+    night; then it is the first half-hour slot after the last one should have
+    ended. A match kicking off at 23:30 is part of the night, not something
+    the watchlist can go out in front of.
+    """
+    opens, _ = _night_window(day)
+    night = _night_fixtures(day) if night is None else night
+    ends = [_utc(f["kickoff_time"]) + _MATCH_LENGTH for f in night]
+    return post_queue.slot_at_or_after(max([opens, *ends]))
+
+
+def reserved_prediction_slots(now: datetime, days: int = 8) -> list[datetime]:
+    """Slots the queue must leave free for upcoming nightly watchlists."""
+    if not runtime_config.get_bool("PRICE_PREDICTIONS_ENABLED"):
+        return []
+    fixtures = livefpl.get_fixtures()
+    slots = []
+    for offset in range(-1, days):
+        day = now.date() + timedelta(days=offset)
+        if day < _PRICE_CHANGES_RESUME_DATE:
+            continue
+        slot = prediction_slot(day, _night_fixtures(day, fixtures))
+        if slot >= now - timedelta(minutes=30):
+            slots.append(slot)
+    return slots
+
+
+def _fixture_over(fixture: dict, games, now: datetime) -> bool:
+    if fixture.get("finished"):
+        return True
+    kickoff = _utc(fixture["kickoff_time"])
+    if now < kickoff:
+        return False
+    if now >= kickoff + _MATCH_OVERDUE:
+        return True
+    for game in games or ():
+        if (game[0], game[1]) == (fixture.get("home_en"), fixture.get("away_en")):
+            return livefpl.is_game_finished(game)
+    return False
 
 
 def _price_prediction_key(now_utc) -> str | None:
