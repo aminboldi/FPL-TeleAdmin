@@ -29,7 +29,7 @@ When downloading and re-uploading media, the temp file must include the original
 - Telethon session: if `TELETHON_SESSION_STRING` env var is set, a `StringSession` is used (cloud deployment). Otherwise it falls back to the local file `teleadmin_project/translation_session.session`.
 - First run locally prompts for phone number + verification code. After login, run `python export_session.py` to export the session as a string for cloud deployment.
 - **Never use the same Telethon user session concurrently from local development and the cloud VPS.** Telegram invalidates it with `AuthKeyDuplicatedError`. For deployment, create a fresh local login, export it, set `TELETHON_SESSION_STRING` only in Coolify, then do not run that same session locally while the VPS is running.
-- Keep `.env` out of git. The session file is committed as a convenience, but `TELETHON_SESSION_STRING` takes priority.
+- Keep `.env` **and every `*.session` file** out of git (`.gitignore` covers both). A session file is a logged-in Telegram account with no password needed; four of them were once committed to this public repository and had to be revoked. `TELETHON_SESSION_STRING` takes priority in deployment, so the image needs no session file.
 - The env var is `OPEN_ROUTER_API_KEY` (with underscore between OPEN and ROUTER). The old specs.md uses `OPENROUTER_API_KEY` (no underscore) — that's wrong.
 - `TELEGRAPH_ACCESS_TOKEN` (optional): set this to keep all Telegraph articles under a single account. Without it, a new account is created on every bot restart.
 - `TELEGRAPH_EDITOR_BASE_URL` (optional): public HTTPS base URL of the deployed app. `/edit` uses it for short-lived editor links; on Coolify, `COOLIFY_URL`/`COOLIFY_FQDN` is detected automatically.
@@ -87,7 +87,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 
 - Deployed on a Coolify-managed VPS. The Procfile at root (`web: cd teleadmin_project && python bot.py`) is used as the start command.
 - **Health server**: `bot.py:_start_health_server()` runs a minimal async HTTP server on `PORT` env var. This enables uptime monitoring on any platform.
-- **StringSession**: Export with `python export_session.py`, add as `TELETHON_SESSION_STRING` env var. The committed `.session` file won't work reliably across deployment machines.
+- **StringSession**: Export with `python export_session.py`, add as `TELETHON_SESSION_STRING` env var. Never commit the local `.session` file; deployment uses only the env var.
 - **Root `requirements.txt`**: points to `teleadmin_project/requirements.txt`. Required for buildpack-based deployment that runs `pip install -r requirements.txt`.
 
 ## URL extraction from messages
@@ -359,7 +359,7 @@ Helper: `_build_stat_emojis()` in livefpl.py. Emojis:
 
 Divider between team sections: `ـ ـ ـ` using RTL Arabic tatweel (`_DIVIDER` in `livefpl.py`), so it follows Persian text direction in Telegram.
 
-**Known issue**: The EO leaderboard heading is hardcoded to "GW38" in `livefpl.py:303` (`build_eo_text()`). It doesn't reflect the actual gameweek. Fix by reading the current GW from the DB.
+The EO leaderboard heading uses the gameweek passed to `build_eo_text()` (`GW{n}`), falling back to `EO`.
 
 ### HTML escaping
 
@@ -570,7 +570,6 @@ All run from `teleadmin_project/`:
 |---|---|
 | `send_livefpl.py` | Manually post game points/EOLB/price predictions (CLI args: `--all` or GW number) |
 | `send_test_deadline.py` | Send a test deadline-passed post (GW39) with `deadline.jpg` |
-| `send_test_reminder.py` | **Broken** — imports `deadline_scheduled_text` from `deadlines.py` which doesn't define that function |
 | `export_session.py` | Export the local `.session` file as a `TELETHON_SESSION_STRING` for cloud deployment |
 | `generate_aliases.py` | Populate `players.alias` column — community nicknames for player matching |
 | `translate_names.py` | Populate `players.*_fa` columns — Farsi name translations |

@@ -1,7 +1,8 @@
-telethon
-openai
-python-dotenv
-beautifulsoup4
-requests
-telegraph
-trafilatura
+# Pinned to the versions the bot runs with; upgrade deliberately, not on deploy.
+telethon==1.44.0
+openai==2.46.0
+python-dotenv==1.2.2
+beautifulsoup4==4.15.0
+requests==2.34.2
+telegraph==2.2.0
+trafilatura==2.2.0

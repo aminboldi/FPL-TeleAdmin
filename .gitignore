@@ -6,3 +6,8 @@ test.session
 fpl.db-*
 manual_data.json
 runtime_config.db
+
+# Telethon logins are credentials: never commit them
+*.session
+*.session.old
+*.session-journal
