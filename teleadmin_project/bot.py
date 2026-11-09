@@ -3,7 +3,6 @@ import html as html_lib
 import logging
 import os
 import re
-import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -75,7 +74,6 @@ client = TelegramClient(
     settings.telegram_api_hash,
 )
 
-SIGNATURE = "@EPL_Fantasy"
 AI_SIGNATURE = "@EPL_Fantasy | \u2728AI"
 QUEUED_POST_CONFIRMATION = "در اولین بازهٔ خالی زمان‌بندی کانال قرار گرفت."
 _ALBUM_TIMEOUT = 5
@@ -698,13 +696,6 @@ async def _display_link_url(urls: list[str]) -> str | None:
 def _expand_x_short_links(text: str) -> str:
     return _TCO_URL_RE.sub(lambda match: _canonical_link_url(match.group(0)), text)
 
-
-def _clean_text(text: str, event=None) -> tuple[str | None, str | None]:
-    text = _strip_hashtags(text)
-    urls = _extract_urls(event) if event else []
-    link_url = urls[0] if urls else None
-    text = _strip_visible_urls(text) or None
-    return text, link_url
 
 
 def _strip_visible_urls(text: str, *, html: bool = False) -> str:

@@ -1,7 +1,6 @@
 """Send a test deadline-passed post to the target channel."""
 import asyncio
 import os
-import sys
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -28,7 +27,7 @@ async def main():
         f"@EPL_Fantasy"
     )
 
-    import sys, pathlib
+    import pathlib
     img = pathlib.Path(__file__).parent / "deadline.jpg"
 
     await client.send_file(

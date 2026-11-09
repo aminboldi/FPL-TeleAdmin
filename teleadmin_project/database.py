@@ -7,9 +7,8 @@ import shutil
 import sqlite3
 import unicodedata
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any
 
-T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -349,12 +348,6 @@ def player_name_matches(player: dict, name: str, *, allow_partial: bool = False)
         return True
     return allow_partial and any(target in value for value in values if value)
 
-
-def _region_to_flag(region_id: int | None) -> str:
-    if not region_id:
-        return ""
-    _load_region_map()
-    return _REGION_FLAG_MAP.get(region_id, "")
 
 
 _REGION_FLAG_MAP: dict[int, str] | None = None

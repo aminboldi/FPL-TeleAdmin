@@ -400,19 +400,6 @@ def _inline_paragraph_html(node, rerouted_links: set[str]) -> str:
     return inner
 
 
-def _paragraph_html_with_links(paragraph, rerouted_links: set[str]) -> str:
-    """Return paragraph HTML that keeps only its rerouted internal links.
-
-    Empty when the paragraph has none, so an ordinary Premier League paragraph
-    keeps taking the plain-text path it always has.
-    """
-    if not rerouted_links or not any(
-        str(anchor.get("href") or "").strip() in rerouted_links
-        for anchor in paragraph.find_all("a", href=True)
-    ):
-        return ""
-    return _inline_paragraph_html(paragraph, rerouted_links).strip()
-
 
 def _metadata_content(soup: BeautifulSoup, *names: str) -> str:
     for name in names:
@@ -1321,10 +1308,6 @@ def restore_images_in_place(
         root.append(soup.new_tag("img", src=url))
     return "".join(str(child) for child in root.contents).strip()
 
-
-def restore_missing_images(html_content: str, image_urls: list[str]) -> str:
-    """Backward-compatible wrapper for callers using the old helper name."""
-    return restore_images_in_place(html_content, image_urls)
 
 
 def normalize_telegraph_structure(html_content: str) -> str:

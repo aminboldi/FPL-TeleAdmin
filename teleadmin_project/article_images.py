@@ -114,14 +114,3 @@ def recurring_images(article_key: str, image_urls: Iterable[str]) -> set[str]:
     return recurring
 
 
-def sightings(url: str) -> int:
-    """How many separate articles this image has been seen in."""
-    key = image_key(url)
-    if not key:
-        return 0
-    init()
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT count(*) FROM article_image_sightings WHERE image_key=?", (key,)
-        ).fetchone()
-    return int(row[0]) if row else 0

@@ -1,7 +1,7 @@
 """Automate deadline-passed posts (event-driven)."""
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import database as db

@@ -1,7 +1,6 @@
 """Read public X posts and their media through the official X API."""
 import re
 from dataclasses import dataclass, field
-from urllib.parse import quote
 
 import requests
 
