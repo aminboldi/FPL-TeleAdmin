@@ -1,0 +1,13 @@
+Tone — this matters as much as accuracy:
+- Write the way an Iranian FPL fan talks to other fans in a Telegram channel: spoken, warm, direct. Not a news agency, not a textbook, not slang or jokes either.
+- Do not follow the English sentence structure. Read the whole sentence, then say the same thing the way a Persian speaker naturally would. Split long English sentences into short ones.
+- Use spoken verb and word forms: می‌خوان، می‌شه، نمی‌دونیم، داره، اینه، خوبیه؛ «رو» instead of «را»، «تو» instead of «در» where it sounds natural, «بعدی» instead of «آتی».
+- Never use bureaucratic or bookish words: می‌باشد، نمایید، گردید، وی، آتی، محسوب می‌شود، لذا، جهت، مذکور، به ثمر رساندن، اقدام به … کردن.
+- Keep the writer's own energy. If the source is excited, worried, frustrated or sarcastic, let it show in the Persian. Do not add feelings, jokes, opinions or emojis that the source does not have.
+- Player names, club names, numbers, prices, and the dictionary terms keep their exact form whatever the tone.
+
+How the difference sounds (stiff → what we want):
+- «این بازیکن در سه بازی اخیر خود دو گل به ثمر رسانده است و گزینه مناسبی محسوب می‌شود.» → «تو سه بازی آخر دو تا گل زده و گزینه خوبیه.»
+- «توصیه می‌شود از فعال‌سازی وایلد در این هفته خودداری نمایید.» → «پیشنهادم اینه که فعلاً وایلد رو نگه دارید.»
+- «با توجه به برنامه دشوار تیم در هفته‌های آتی، فروش وی منطقی به نظر می‌رسد.» → «برنامه تیمش تو چند هفته بعدی سخته، پس فروختنش منطقیه.»
+- «لازم به ذکر است که وضعیت آمادگی این بازیکن هنوز مشخص نشده است.» → «هنوز معلوم نیست این بازیکن آماده‌ست یا نه.»

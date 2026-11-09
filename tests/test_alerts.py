@@ -176,6 +176,19 @@ class TeamAliasAlertsTests(unittest.TestCase):
         self.assertNotIn("امبومو", text)
         self.assertNotIn("بازیکن اشتباه", text)
 
+    def test_own_goal_resolves_player_in_name_first_format(self):
+        # Source feeds write this as "Davis (own goal)", not "own goal (Davis)".
+        parsed, text = self.format_goal(player="MBEUMO (own goal)")
+        self.assertEqual(parsed.actions[0].type, "own_goal")
+        self.assertEqual(parsed.actions[0].player_name, "MBEUMO")
+        self.assertIn("⚽ امبومو <b>8.0M</b> (گل بخودی)", text)
+
+    def test_own_goal_also_resolves_name_second_format(self):
+        parsed, text = self.format_goal(player="own goal (MBEUMO)")
+        self.assertEqual(parsed.actions[0].type, "own_goal")
+        self.assertEqual(parsed.actions[0].player_name, "MBEUMO")
+        self.assertIn("⚽ امبومو <b>8.0M</b> (گل بخودی)", text)
+
 
 if __name__ == "__main__":
     unittest.main()

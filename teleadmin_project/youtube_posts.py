@@ -60,6 +60,24 @@ _DESCRIPTION_LINK_RE = re.compile(
 )
 
 
+# The Persian first name each creator goes by in the channel. Keyed on the
+# channel title with "FPL", spacing and punctuation removed, so "FPL Harry"
+# and "Let's Talk FPL" both resolve without depending on exact styling.
+_CREATOR_NAMES = {
+    "harry": "هری",
+    "raptor": "راس",
+    "focal": "اسکار",
+    "letstalk": "اندی",
+    "mate": "دن",
+}
+
+
+def creator_name(channel_title: str) -> str:
+    """Return the creator's Persian name, or "" for a channel we don't know."""
+    key = re.sub(r"[\W_]+", "", re.sub(r"fpl", "", channel_title or "", flags=re.IGNORECASE))
+    return _CREATOR_NAMES.get(key.casefold(), "")
+
+
 class YouTubeImportError(Exception):
     """An expected, user-facing failure while importing a YouTube transcript."""
 

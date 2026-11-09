@@ -417,11 +417,18 @@ def _format_short_article_post(
 
 # The thumbnail already shows whose video it is, so the posts open with the
 # title rather than with a "new video from <channel>" line that repeated it.
+# The summary is written in the creator's own voice, so the post names them
+# right under the title; otherwise "I" would read as the channel admin.
+def _youtube_byline(creator: str) -> str:
+    return f"\n🎙 {_escape_html(creator)}" if creator else ""
+
+
 def _format_youtube_telegraph_post(
     title: str, summary: str, telegraph_url: str, original_url: str,
+    *, creator: str = "",
 ) -> str:
     return (
-        f"<b>{_escape_html(title)}</b>\n\n"
+        f"<b>{_escape_html(title)}</b>{_youtube_byline(creator)}\n\n"
         f"- - - - - - - - -\n\n"
         f"{summary}\n\n"
         f'<a href="{_escape_html(original_url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a>\n\n'
@@ -431,10 +438,10 @@ def _format_youtube_telegraph_post(
 
 
 def _format_youtube_inline_post(
-    title: str, transcript: str, original_url: str,
+    title: str, transcript: str, original_url: str, *, creator: str = "",
 ) -> str:
     return (
-        f"<b>{title}</b>\n\n"
+        f"<b>{title}</b>{_youtube_byline(creator)}\n\n"
         f"{transcript}\n\n"
         f'<a href="{_escape_html(original_url)}">مشاهدهٔ ویدیوی اصلی در YouTube</a>\n\n'
         f"{AI_SIGNATURE}"
@@ -1600,8 +1607,9 @@ async def _import_youtube_transcript(url: str) -> str:
             )
         )
     )
+    creator = youtube_posts.creator_name(metadata.channel_title)
     article = await translator.translate_article(
-        _escape_html(transcript), transcript=True,
+        _escape_html(transcript), transcript=True, speaker=creator,
     )
     # A transcript contains no hyperlinks, so any link in the translation was
     # invented by the model.
@@ -1618,6 +1626,7 @@ async def _import_youtube_transcript(url: str) -> str:
         translated_title,
         _telegraph_to_telegram_html(article_body),
         url,
+        creator=creator,
     )
     transcript_length = _rendered_text_length(article_body)
     caption_length = _caption_length(inline_caption)
@@ -1679,6 +1688,7 @@ async def _import_youtube_transcript(url: str) -> str:
         article_summary,
         telegraph_url,
         url,
+        creator=creator,
     )
     thumbnail = await asyncio.to_thread(
         _download_remote_media, metadata.thumbnail_url, "photo"

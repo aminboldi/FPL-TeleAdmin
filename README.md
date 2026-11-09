@@ -75,7 +75,7 @@ TARGET_CHANNEL_ID=@targetchannel
 NOTIF_CHANNEL_ID=@admin_notifications
 OPEN_ROUTER_MODEL=google/gemini-2.5-flash-lite
 GOOGLE_AISTUDIO_KEY=your_gemini_api_key
-GOOGLE_AISTUDIO_MODEL=gemini-3.1-flash-lite
+GOOGLE_AISTUDIO_MODEL=gemini-3.5-flash-lite
 TELEGRAM_BOT_TOKEN=123456:botfather-token
 ADMIN_USER_IDS=123456789
 X_BEARER_TOKEN=your_x_app_bearer_token
@@ -102,7 +102,7 @@ The bot is a long-lived process. Run it with a process manager (systemd, supervi
 | `TELEGRAM_API_HASH`  | Yes      | Telegram app API hash                          |
 | `OPEN_ROUTER_API_KEY`| Yes      | OpenRouter API key                             |
 | `GOOGLE_AISTUDIO_KEY` | No | Google AI Studio key used as the primary translator |
-| `GOOGLE_AISTUDIO_MODEL` | No | Google model (default: `gemini-3.1-flash-lite`) |
+| `GOOGLE_AISTUDIO_MODEL` | No | Google model (default: `gemini-3.5-flash-lite`) |
 | `TARGET_CHANNEL_ID`  | No       | Initial target channel (dashboard-editable)    |
 | `NOTIF_CHANNEL_ID`   | No       | Channel for admin scheduling notifications     |
 | `OPEN_ROUTER_MODEL`  | No       | LLM model (default: gemini-2.5-flash-lite)     |

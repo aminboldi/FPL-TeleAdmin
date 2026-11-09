@@ -4,18 +4,14 @@ Return your response as a JSON object with exactly these fields:
 
 {
   "title": "A compelling Persian title (one line, under 100 chars)",
-  "summary": "A synthesized AI summary of the article's overall key points (2-3 sentences, under 400 chars; do not copy only the first paragraph)",
+  "summary": "A synthesized summary of the article's key points (2-3 sentences; do not copy only the first paragraph)",
   "body": "The full translated article in Persian",
   "removed_images": [2, 5],
   "complete": true,
   "incomplete_reason": ""
 }
 
-Tone:
-- Write in casual, conversational Persian — the way an Iranian FPL fan actually talks to other fans, not formal written Persian.
-- Prefer everyday spoken vocabulary and contractions over bookish or bureaucratic phrasing. Address the reader directly and informally where the source does.
-- Keep it natural, not slangy or comedic. Do not add jokes, opinions, emojis, or filler that is not in the source.
-- Player names, club names, numbers, prices, and all FPL terminology below stay exactly as specified regardless of tone.
+{tone}
 
 Removing promotional material:
 - Delete promotional and non-editorial material entirely: subscription and paywall pitches, "try Premium/Plus" offers, affiliate or sponsor blocks, discount codes, app-download prompts, newsletter sign-ups, social-follow calls to action, "read more"/"related articles" link lists, tag lists, comment prompts, and site navigation or footer text.
@@ -43,13 +39,7 @@ Constraints for the body:
 - Preserve emojis and meaningful existing layout, but improve unstructured transcript text into the readable HTML structure above.
 - Do NOT translate or modify HTML tag attributes.
 
-FPL Terminology:
-Asset: گزینه فانتزی | Bandwagon: ورودی محبوب | Bench Boost: بنچ بوست | Bench fodder: نیمکت سوم | Blank Gameweek / BGW: هفته پوچ | Blanked: امتیاز نیاورد | Bus team: تیم حداقلی | Chips: چیپ ها | Dead teams: تیم های مرده | Defensive contribution points: امتیاز دفکان | Differential: دیف | Double Gameweek / DGW: هفته دوبل | Effective ownership / EO: مالکیت موثر | Enabler: گزینه اقتصادی | Essential: گزینه ضروری | Eye test: به چشم | FDR rating / FDR: درجه سختی بازی ها | FPL: فانتزی | FPL Managers: فانتزی بازان | Free Hit: فری هیت | Heavy-hitters / Premium: گزینه های انفجاری | Hit: منفی | Out of position / OOP: OOP | Rank killer: قاتل رتبه | Return: امتیاز | Rolling a transfer: ترنسفر نکردن | Rotation-proof: فیکس | Single Gameweek: هفته معمولی | Template: تمپلیت | Triple Captain: تریپل | Wildcard: وایلد | xA: xA | xG: xG | xGA: xGA | xGI: xGI | H: میزبان | A: مهمان
-
-Team Abbreviations:
-BOU: بورنموث | ARS: آرسنال | AVL: استون ویلا | BRE: برنتفورد | BHA: برایتون | BUR: برنلی | CHE: چلسی | CRY: کریستال پالاس | EVE: اورتون | FUL: فولام | LEE: لیدز | LIV: لیورپول | MCI: منچستر سیتی | MUN: منچستر یونایتد | NEW: نیوکاسل | NFO: ناتینگهام فارست | SUN: ساندرلند | TOT: تاتنهام | WHU: وست هم | WOL: ولوز
-
-Don't translate "m" in prices (e.g., "£10.0m" stays "£10.0m").
+{glossary}
 
 {player_names}
 

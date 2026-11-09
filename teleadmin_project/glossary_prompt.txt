@@ -1,0 +1,33 @@
+FPL terminology — use these exact Persian forms. They win over any other wording, including the tone guide.
+
+The one rule that matters most:
+- «امتیاز» means FPL points and nothing else. Never use it for goals, assists, "returns", "goal contributions" or "goal involvements". Readers count points, so «۶ امتیاز» and «۶ مشارکت در گل» say completely different things.
+
+Terms that are easy to get wrong:
+- Points / pts / FPL points → امتیاز
+- Return / attacking return / goal contribution / goal involvement / G+A → مشارکت در گل (a goal or an assist; never «امتیاز»). As a verb: "he returned" → «گل یا پاس گل داد».
+- Blank / blanked (a player with no goal or assist) → «گل و پاس گل نداشت». Not «امتیاز نیاورد»: a player who blanks still gets points.
+- Blank Gameweek / BGW (a team has no match that week) → هفته پوچ. This is a different thing from a player who blanked.
+- Haul / hauled (a big score) → امتیاز بالا; "he hauled" → «امتیاز بالایی گرفت». Here «امتیاز» is right, because a haul is points.
+- Bonus / bonus points → بونس
+- Defensive contribution / DefCon → دفکان; Defensive contribution points → امتیاز دفکان
+- Hit (a −4 for an extra transfer) → منفی; "take a hit" → «منفی گرفتن»
+- Scout (an FPL expert) → کارشناس. "Fantasy Football Scout" (the website) stays a name: فانتزی فوتبال اسکات
+- (H) / (A) after an opponent → میزبان / مهمان. Only in that position; a bare "A" or "H" anywhere else is not this.
+
+Wrong → right:
+- "Saka has 6 goal contributions in his last 4" → not «ساکا تو 4 بازی آخر 6 امتیاز گرفته» → «ساکا تو 4 بازی آخر 6 تا مشارکت در گل داشته»
+- "Palmer blanked again" → not «پالمر باز هم امتیاز نیاورد» → «پالمر باز هم گل و پاس گل نداشت»
+- "He's returned in every home game" → not «تو همه بازی‌های خونگی امتیاز گرفته» → «تو همه بازی‌های خونگی گل یا پاس گل داشته»
+- "Haaland hauled with 18 points" → «هالند 18 امتیاز گرفت و امتیاز بالایی آورد»
+
+FPL Terms:
+Asset: گزینه فانتزی | Bandwagon: ورودی محبوب | Bench Boost: بنچ بوست | Bench fodder: نیمکت سوم | Big chance: موقعیت مسلم | BPS: BPS | Bus team: تیم حداقلی | Captain: کاپیتان | Vice-captain: معاون کاپیتان | Chips: چیپ‌ها | Clean sheet: کلین شیت | Dead teams: تیم‌های مرده | Deadline: ددلاین | Differential: دیف | Double Gameweek / DGW: هفته دوبل | Double-up / Triple-up: دو / سه بازیکن از یک تیم | Draft: درفت | Effective ownership / EO: مالکیت موثر | Enabler: گزینه اقتصادی | Essential: گزینه ضروری | Eye test: به چشم | FDR rating / FDR: درجه سختی بازی‌ها | Fixture swing: تغییر برنامه بازی‌ها | Flagged / doubt: مشکوک به بازی | FPL: فانتزی | FPL Managers: فانتزی‌بازان | Free Hit: فری هیت | Free transfer / FT: ترنسفر رایگان | Gameweek / GW: هفته (GW12 → هفته 12) | Heavy-hitters / Premium: گزینه‌های انفجاری | Money in the bank / ITB: پول باقی‌مانده | Nailed / Rotation-proof: فیکس | Out of position / OOP: OOP | Ownership / selected by: درصد مالکیت | Penalty taker: پنالتی‌زن | Price Risers: افزایش قیمت | Price Fallers: کاهش قیمت | Punt: ریسک | Rank killer: قاتل رتبه | Rolling a transfer: ترنسفر نکردن | Rotation risk: خطر روتیشن | Set pieces: ضربات ایستگاهی | Sideways transfer: ترنسفر هم‌سطح | Single Gameweek: هفته معمولی | Template: تمپلیت | Triple Captain: تریپل | Wildcard: وایلد | xA: xA | xG: xG | xGA: xGA | xGC: xGC | xGI: xGI
+
+Nicknames:
+DCL: کالورت لوین | VVD: فن دایک | RDZ: دیزربی | MLS: لوئیس اسکلی
+
+Team Abbreviations:
+BOU: بورنموث | ARS: آرسنال | AVL: استون ویلا | BRE: برنتفورد | BHA: برایتون | BUR: برنلی | CHE: چلسی | CRY: کریستال پالاس | EVE: اورتون | FUL: فولام | LEE: لیدز | LIV: لیورپول | MCI: منچستر سیتی | MUN: منچستر یونایتد | NEW: نیوکاسل | NFO: ناتینگهام فارست | SUN: ساندرلند | TOT: تاتنهام | WHU: وست هم | WOL: ولوز | BIR: بیرمنگام | BBR: بلکبرن | BRC: بریستول | CHA: چارلتون | COV: کاونتری | DER: داربی کانتی | HUL: هال سیتی | IPS: ایپسویچ | LEI: لستر | MID: میدلزبرو | MIL: میلوال | NOR: نوریچ | OXF: آکسفورد | POR: پورتموث | PNE: پرستون | QPR: کیو پی آر | SHU: شفیلد یونایتد | SHW: شفیلد ونزدی | SOU: ساوتهمپتون | STO: استوک | SWA: سوانزی | WAT: واتفورد | WBA: وست بروم | WXH: رکسهم
+
+Prices: never translate the "m". "£10.0m" stays "£10.0m"; do not write «£10.0م» or «10 میلیون پوند».

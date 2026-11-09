@@ -204,7 +204,12 @@ def parse(text: str) -> ParsedAlert | None:
         detail = None
 
         if action_type in ("Goal", "Goal_penalty"):
-            own_goal_m = re.match(r"^own goal\s*\((.+)\)$", raw, re.IGNORECASE)
+            # Source feeds write this both ways: "Davis (own goal)" and,
+            # less often, "own goal (Davis)".
+            own_goal_m = (
+                re.match(r"^(.+?)\s*\(own goal\)$", raw, re.IGNORECASE)
+                or re.match(r"^own goal\s*\((.+)\)$", raw, re.IGNORECASE)
+            )
             pen_m = re.match(r"^(.+?)\s*\(pen(?:alty)?\)$", raw, re.IGNORECASE)
             if own_goal_m:
                 action_type = "own_goal"

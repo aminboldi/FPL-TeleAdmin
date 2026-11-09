@@ -24,6 +24,14 @@ _transcript_format_prompt_path = Path(__file__).parent / "transcript_format_prom
 TRANSCRIPT_FORMAT_PROMPT = _transcript_format_prompt_path.read_text(encoding="utf-8")
 _completeness_prompt_path = Path(__file__).parent / "completeness_prompt.txt"
 COMPLETENESS_PROMPT = _completeness_prompt_path.read_text(encoding="utf-8")
+# One tone guide for every prompt that writes reader-facing Persian, so the
+# translation, the article body and the preview cannot drift apart.
+_tone_prompt_path = Path(__file__).parent / "tone_prompt.txt"
+TONE_PROMPT = _tone_prompt_path.read_text(encoding="utf-8").strip()
+# One FPL glossary for both translating prompts. It used to be copied into
+# each, and the copies drifted (the article prompt lacked whole sections).
+_glossary_prompt_path = Path(__file__).parent / "glossary_prompt.txt"
+GLOSSARY_PROMPT = _glossary_prompt_path.read_text(encoding="utf-8").strip()
 
 # Output-token ceilings. Persian is token-heavy relative to English, so a long
 # transcript or article needs far more room than the English source suggests.
@@ -35,7 +43,7 @@ _MAX_TOKENS_TRANSLATE = 32768
 _MAX_TOKENS_ARTICLE = 32768
 _MAX_TOKENS_FORMAT = 32768
 _MAX_TOKENS_CORRECTION = 32768
-_MAX_TOKENS_SUMMARY = 800
+_MAX_TOKENS_SUMMARY = 1500
 _MAX_TOKENS_ASSESS = 600
 VIDEO_TITLE_INSTRUCTIONS = """
 
@@ -64,7 +72,44 @@ Additional instructions for this raw YouTube transcript:
 - Split it into short, logical <p> paragraphs even where the transcript provides no paragraph boundaries.
 - Detect meaningful topic shifts. When there are two or more, add concise, descriptive <h3> headings that reflect the transcript; do not invent facts, claims, or topics.
 - Turn clearly enumerated advice, options, comparisons, or steps into a <ul> or <ol>. Do not force ordinary prose into a list.
+- This is the creator talking to their viewers. Keep it in their own first-person voice, addressing the reader the way they address the viewer. Never turn it into third-person reporting such as «او می‌گه» or «در این ویدیو گفته می‌شه».
 """
+
+# The preview grows with the article: a 300-word post and a 2,000-word guide
+# should not get the same three sentences. The longest tier still leaves room
+# for the title, links and signature inside Telegram's 1024-unit media caption.
+_SUMMARY_TIERS = (
+    (500, "1 or 2 sentences, at most 250 characters.", 250),
+    (1300, "3 or 4 sentences, at most 450 characters.", 450),
+)
+_LONG_SUMMARY = (
+    "5 or 6 sentences, at most 650 characters, covering each main point.", 650,
+)
+
+_EDITOR_VOICE = (
+    "Speak to the reader as the channel's editor passing on what the article says."
+)
+
+
+def _creator_voice(speaker: str) -> str:
+    return (
+        f"This is a video by {speaker}. Write the summary as {speaker} talking "
+        "directly to the channel's audience in the first person, as if they "
+        "wrote this post themselves (من، به نظرم، پیشنهادم اینه). If the video is "
+        "clearly a conversation between several people, use «ما» instead and do "
+        "not put everything in one person's mouth. Never use the third person "
+        "(«او می‌گه», «در این ویدیو»), and do not write the creator's name: the "
+        "post already shows it."
+    )
+
+
+def _summary_plan(source: str) -> tuple[str, int]:
+    """Return the length instruction and the hard character cap for a body."""
+    words = len(source.split())
+    for max_words, guidance, limit in _SUMMARY_TIERS:
+        if words < max_words:
+            return guidance, limit
+    return _LONG_SUMMARY
 
 # Translation providers occasionally return Persian or Arabic-Indic digits. All
 # bot output uses English digits, so normalize the provider response once here
@@ -164,7 +209,7 @@ class Translator:
         model: str,
         fallback_model: str,
         google_api_key: str | None = None,
-        google_model: str = "gemini-3.1-flash-lite",
+        google_model: str = "gemini-3.5-flash-lite",
     ):
         self.openrouter_client = AsyncOpenAI(
             api_key=api_key,
@@ -279,7 +324,12 @@ class Translator:
         return "\n".join(lines)
 
     async def translate_article(
-        self, text: str, *, transcript: bool = False, merged_posts: bool = False,
+        self,
+        text: str,
+        *,
+        transcript: bool = False,
+        merged_posts: bool = False,
+        speaker: str = "",
     ) -> dict[str, str]:
         formatting_instructions = ""
         if transcript:
@@ -300,7 +350,9 @@ class Translator:
                 )
             except Exception:
                 continue
-            return await self._finish_article(article, transcript=transcript)
+            return await self._finish_article(
+                article, transcript=transcript, speaker=speaker,
+            )
 
         # Fallback: translate normally. Summary generation is deliberately
         # handled separately, so a translation/API failure can never turn the
@@ -317,9 +369,12 @@ class Translator:
                 "incomplete_reason": "",
             },
             transcript=transcript,
+            speaker=speaker,
         )
 
-    async def _finish_article(self, article: dict, *, transcript: bool) -> dict:
+    async def _finish_article(
+        self, article: dict, *, transcript: bool, speaker: str = "",
+    ) -> dict:
         """Format, summarize, and apply the channel's player spellings.
 
         The body is corrected before it is summarized: the summary is written
@@ -332,7 +387,7 @@ class Translator:
             )
         article["body"] = player_names.enforce(article.get("body", ""))
         article["summary"] = (
-            await self.summarize_article(article["body"])
+            await self.summarize_article(article["body"], speaker=speaker)
             or article.get("summary", "")
         )
         for field in ("title", "summary"):
@@ -401,26 +456,40 @@ class Translator:
         # Never let an unavailable checker block publishing.
         return {"complete": True, "confidence": "low", "reason": "assessment unavailable"}
 
-    async def summarize_article(self, translated_html: str) -> str:
-        """Create a concise Telegram preview from the complete translated article."""
+    async def summarize_article(self, translated_html: str, *, speaker: str = "") -> str:
+        """Create a Telegram preview sized to the article.
+
+        With ``speaker`` the preview is written in that creator's own voice;
+        without it, the channel editor reports the article.
+        """
         source = self._summary_source_text(translated_html)
         if not source:
             return ""
+        length, limit = _summary_plan(source)
+        prompt = _render(
+            SUMMARY_PROMPT,
+            tone=TONE_PROMPT,
+            voice=_creator_voice(speaker) if speaker else _EDITOR_VOICE,
+            length=length,
+            text=source,
+        )
 
         try:
             if not self.google_client:
                 raise TranslationError("Google AI Studio is not configured")
             return self._clean_summary(
                 await self._call_summary_model(
-                    self.google_client, self.google_model, source
-                )
+                    self.google_client, self.google_model, prompt
+                ),
+                limit,
             )
         except Exception:
             try:
                 return self._clean_summary(
                     await self._call_summary_model(
-                        self.openrouter_client, self.fallback_model, source
-                    )
+                        self.openrouter_client, self.fallback_model, prompt
+                    ),
+                    limit,
                 )
             except Exception:
                 # The long article itself is still publishable if this optional
@@ -444,7 +513,7 @@ class Translator:
         return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
-    def _clean_summary(text: str) -> str:
+    def _clean_summary(text: str, limit: int = _LONG_SUMMARY[1]) -> str:
         """Normalize a model response and enforce a caption-sized summary."""
         raw = text.strip()
         if raw.startswith("```"):
@@ -472,14 +541,14 @@ class Translator:
         # The summary is written from an already-corrected body, but it is also
         # generated on its own for catalog cards, so it is normalized here too.
         raw = player_names.enforce(raw)
-        if len(raw) <= 400:
+        if len(raw) <= limit:
             return raw
 
         # Prefer a complete sentence over a hard character cut. Persian text
         # may use either Persian or Latin punctuation.
-        candidate = raw[:400]
+        candidate = raw[:limit]
         boundary = max(candidate.rfind("."), candidate.rfind("؟"), candidate.rfind("!"), candidate.rfind("؛"))
-        if boundary >= 160:
+        if boundary >= limit * 0.4:
             return candidate[:boundary + 1].strip()
         return candidate.rstrip() + "…"
 
@@ -616,6 +685,8 @@ class Translator:
                     "role": "user",
                     "content": _render(
                         TRANSLATION_PROMPT,
+                        tone=TONE_PROMPT,
+                        glossary=GLOSSARY_PROMPT,
                         player_names=player_names.prompt_glossary(text),
                         text=text,
                     ) + instructions,
@@ -652,6 +723,8 @@ class Translator:
                     "role": "user",
                     "content": _render(
                         ARTICLE_PROMPT,
+                        tone=TONE_PROMPT,
+                        glossary=GLOSSARY_PROMPT,
                         player_names=player_names.prompt_glossary(text),
                         text=text,
                     ) + formatting_instructions,
@@ -691,13 +764,11 @@ class Translator:
         return _response_text(response)
 
     async def _call_summary_model(
-        self, client: AsyncOpenAI, model: str, text: str,
+        self, client: AsyncOpenAI, model: str, prompt: str,
     ) -> str:
         response = await client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "user", "content": _render(SUMMARY_PROMPT, text=text)}
-            ],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=_MAX_TOKENS_SUMMARY,
         )

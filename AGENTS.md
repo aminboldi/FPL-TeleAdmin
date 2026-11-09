@@ -129,6 +129,24 @@ Persian is token-heavy relative to English, so translated output is much longer 
 
 All translation prompts ask for casual, conversational Persian — how an Iranian FPL fan talks to other fans — rather than formal written Persian. Tone never overrides the FPL terminology dictionary, player/club names, numbers, or prices. `transcript_format_prompt.txt` is explicitly told to preserve the casual register, because that pass runs after translation and would otherwise re-formalize the text.
 
+The tone guide lives in **one** file, `tone_prompt.txt`, injected through the `{tone}` placeholder into `prompt.txt`, `article_prompt.txt` and `summary_prompt.txt`. Change it there, never in a single prompt. An earlier version only said "casual" next to a list of don'ts ("not slangy", "no jokes, opinions, emojis"), and the model read that as "stay formal": it produced formal Persian with a few spoken words. The guide now lists the spoken forms to use, the bureaucratic words to avoid, and stiff → natural example pairs. Those examples are what moved the output.
+
+### FPL glossary
+
+The terminology dictionary and team abbreviations live in **one** file, `glossary_prompt.txt`, injected through `{glossary}` into `prompt.txt` and `article_prompt.txt`. It used to be pasted into each, and the copies drifted (the article prompt lacked Bonus, Scout, price risers and every non-PL club). The summary and transcript-formatting passes work from already-translated Persian and get no glossary.
+
+**«امتیاز» means FPL points and nothing else.** The old dictionary mapped `Return: امتیاز`, and the model generalized it: "goal contribution", "goal involvement" and "attacking returns" all came out as points. Goal-or-assist terms are now «مشارکت در گل», a blank is «گل و پاس گل نداشت», and the file carries wrong → right examples for them. An ambiguous term gets its meaning and a "not this", not just a bare mapping — that is what the model needs to tell neighbouring terms apart.
+
+`teleadmin_project/glossary_check.py` is a live regression set of sentences that have gone wrong before, each with Persian it must and must not contain. Run it after changing the glossary, the tone guide or the model: `cd teleadmin_project && .venv/bin/python glossary_check.py`. It uses real quota, one call per case. Add a case whenever a new mistranslation is reported.
+
+### Summary length scales with the article
+
+`translator._summary_plan()` picks the preview size from the translated body's word count: under 500 words 1–2 sentences (≤250 chars), under 1300 words 3–4 (≤450), otherwise 5–6 (≤650). The prompt gets the instruction and `_clean_summary()` enforces the cap. 650 is the ceiling because Telegraph posts carry a feature image, and the whole caption must fit Telegram's 1024-unit media limit (`tests/test_post_voice.py` checks the worst case). The summary is written from already-translated Persian, so its prompt has no FPL dictionary; it is told to copy names and terms verbatim, because Flash-Lite otherwise re-spells clubs and turns «دیف» into nonsense.
+
+### YouTube posts speak in the creator's voice
+
+`youtube_posts.creator_name()` maps a channel title to the creator's Persian first name (`_CREATOR_NAMES`: هری, راس, اسکار, اندی, دن; "FPL", spacing and punctuation are ignored when matching). For a known creator, the summary is written in first person as that creator talking to the audience («ما» for multi-speaker videos), and both YouTube post formats put a `🎙 <name>` byline under the title so "I" isn't read as the channel admin. An unknown channel gets no byline and the normal editor voice. The transcript body is always kept in the speaker's own first person (`_TRANSCRIPT_FORMATTING_INSTRUCTIONS`). Add a new creator by adding a line to `_CREATOR_NAMES`.
+
 ## Player name consistency (`player_names.py`)
 
 The database holds the Persian spelling the channel uses for each player. A model does not know those spellings — it transliterates from English every time, so the same player arrives as زولیس in one post and تزولیس in the next, and is sometimes left in English. `player_names.py` makes the stored spelling win everywhere: titles, summaries, translated posts, Telegraph articles, and catalog card summaries.

@@ -54,7 +54,7 @@ def load_config() -> Settings:
         ),
         fallback_model="google/gemini-2.5-flash-lite",
         google_aistudio_key=os.getenv("GOOGLE_AISTUDIO_KEY") or None,
-        google_aistudio_model=os.getenv("GOOGLE_AISTUDIO_MODEL", "gemini-3.1-flash-lite"),
+        google_aistudio_model=os.getenv("GOOGLE_AISTUDIO_MODEL", "gemini-3.5-flash-lite"),
         target_channel_id=os.getenv("TARGET_CHANNEL_ID", ""),
         league_code=os.getenv("LEAGUE_CODE", "433b70"),
         price_predictions_enabled=os.getenv("PRICE_PREDICTIONS_ENABLED", "true").lower() != "false",
