@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "teleadmin_project"))
 
-import bot
+import post_format
 import translator
 import youtube_posts
 
@@ -49,14 +49,14 @@ class SummaryLengthTests(unittest.TestCase):
                 self.assertLessEqual(len(cleaned), limit + 1)
 
     def test_longest_youtube_caption_fits_telegram_media_limit(self):
-        caption = bot._format_youtube_telegraph_post(
+        caption = post_format._format_youtube_telegraph_post(
             "ع" * 100,
             "س" * translator._LONG_SUMMARY[1],
             "https://telegra.ph/Some-Long-Persian-Article-Path-11-09",
             "https://www.youtube.com/watch?v=abcdefghijk",
             creator="اسکار",
         )
-        self.assertLessEqual(bot._caption_length(caption), bot._MEDIA_CAPTION_LIMIT)
+        self.assertLessEqual(post_format._caption_length(caption), post_format._MEDIA_CAPTION_LIMIT)
 
 
 class PromptTests(unittest.TestCase):
@@ -110,9 +110,9 @@ class PromptTests(unittest.TestCase):
 
 class YouTubeBylineTests(unittest.TestCase):
     def test_byline_sits_under_the_title_only_for_known_creators(self):
-        named = bot._format_youtube_inline_post("عنوان", "متن", "https://youtu.be/x", creator="دن")
+        named = post_format._format_youtube_inline_post("عنوان", "متن", "https://youtu.be/x", creator="دن")
         self.assertTrue(named.startswith("<b>عنوان</b>\n🎙 دن\n\n"))
-        unnamed = bot._format_youtube_inline_post("عنوان", "متن", "https://youtu.be/x")
+        unnamed = post_format._format_youtube_inline_post("عنوان", "متن", "https://youtu.be/x")
         self.assertNotIn("🎙", unnamed)
 
 

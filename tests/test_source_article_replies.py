@@ -1,5 +1,5 @@
 """Persist source links and attach articles to live channel message IDs."""
-import ast
+import bot_source
 import sys
 import tempfile
 import unittest
@@ -70,12 +70,8 @@ class SourceArticleReplyTests(unittest.IsolatedAsyncioTestCase):
         self.client.iter_messages = Mock(side_effect=iterate)
 
     def bot_functions(self, names, **namespace):
-        path = Path(__file__).resolve().parents[1] / "teleadmin_project" / "bot.py"
-        nodes = [node for node in ast.parse(path.read_text()).body
-                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
         namespace.update(db=db, runtime_config=runtime_config, logger=Mock())
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
-        return namespace
+        return bot_source.load(names, namespace)
 
     async def test_pending_original_waits_without_translating_article(self):
         await self.worker.poll_once()

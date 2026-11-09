@@ -1,5 +1,5 @@
 """Exercise both real article-delivery branches without initializing Telethon."""
-import ast
+import bot_source
 import sys
 import tempfile
 import unittest
@@ -17,12 +17,9 @@ async def inline_thread(function, *args, **kwargs):
 
 class ArticleDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        # Importing bot.py creates a session and initializes production paths.
-        # Load just the production importer function to exercise its control
-        # flow with mocked services, without those module-level side effects.
-        path = Path(__file__).resolve().parents[1] / "teleadmin_project" / "bot.py"
-        tree = ast.parse(path.read_text())
-        function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_publish_article_from_url")
+        # Importing the runtime creates a session and initializes production
+        # paths. Load just the production importer function to exercise its
+        # control flow with mocked services, without those side effects.
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.photo = Path(directory.name) / "photo.jpg"
@@ -54,7 +51,7 @@ class ArticleDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "_download_remote_media": Mock(return_value=str(self.photo)),
             "_send_to_target": self.queue, "_send_notification": AsyncMock(),
         }
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), self.namespace)
+        bot_source.load({"_publish_article_from_url"}, self.namespace)
         self.publish = self.namespace["_publish_article_from_url"]
 
     def choose_format(self, long_article):

@@ -8,6 +8,26 @@ cd teleadmin_project && python bot.py
 
 Must run from `teleadmin_project/` (not repo root) because the Telethon session file path is relative.
 
+## Module layout
+
+`bot.py` used to hold every pipeline in one 2,400-line file. It now keeps only the source-channel handlers (albums, text chunks, configured sources) and `main()`. Everything else lives in a module per job, imported in this order — a module only imports from the ones above it:
+
+| Module | Holds |
+|---|---|
+| `app.py` | `settings`, `translator`, the Telethon `client`, logging setup, `_target_channel()`. Importing it loads config and initialises both databases. |
+| `post_format.py` | Pure text/HTML/caption helpers and caption formats (`AI_SIGNATURE`, `_MEDIA_CAPTION_LIMIT`, `_caption_length`, URL extraction/stripping). Never imports `app`, so tests import it directly. |
+| `delivery.py` | Review queue, immediate sends, alerts/lineups (`_try_handle_automatic_content`), media forwarding, reply mapping, admin notifications. |
+| `catalog_sync.py` | Catalog visibility from the target channel and the startup enrichment sweep. |
+| `article_pipeline.py` | URL articles (`_publish_article_from_url`), `/a`, Telegraph editor links. |
+| `youtube_pipeline.py` | `_import_youtube_transcript` and its failure notifications. |
+| `x_pipeline.py` | `/x` imports. |
+| `forwarded.py` | Admin-forwarded posts and merged batches. |
+| `dashboard_content.py` | Balances, `/fixtures`, and the pending publish-confirmation post. |
+
+Cross-module state that is **reassigned** must be set on the owning module, not imported: `main()` sets `delivery._admin_bot_client`. Buffers that are only mutated in place (dicts, locks) can be imported normally.
+
+Handler tests compile single definitions into a namespace of mocks rather than importing the runtime; `tests/bot_source.py` finds a definition in whichever module holds it, so moving a function between these modules does not break them.
+
 ## Parse mode: HTML only
 
 Telethon supports `"md"`, `"markdown"`, `"html"`, `"htm"` — but NOT `"md2"` or `"markdownv2"`. The repo uses `parse_mode="html"` everywhere.
@@ -21,7 +41,7 @@ HTML formatting conventions used in the code:
 
 ## Media must preserve file extension
 
-When downloading and re-uploading media, the temp file must include the original extension from `event.message.file.ext` (`bot.py:_media_suffix()`). Without it, Telethon falls back to sending as a generic document attachment instead of an inline photo/video.
+When downloading and re-uploading media, the temp file must include the original extension from `event.message.file.ext` (`post_format._media_suffix()`). Without it, Telethon falls back to sending as a generic document attachment instead of an inline photo/video.
 
 ## Config and session layout
 
@@ -45,7 +65,7 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 - The database has an audit log and every setting change requires a Telegram confirmation.
 - **Precedence: a dashboard `/set` beats the environment, which beats a seeded default.** Settings are seeded from environment variables the first time the database is created, with `INSERT OR IGNORE`; the row is authoritative afterwards so the dashboard can change it. That meant editing `.env` and redeploying did nothing at all, silently — a `PRICE_PREDICTIONS_ENABLED=false` seeded during the off-season stayed false forever, and no amount of correcting `.env` reached it. `_apply_env_overrides()` now corrects the row at startup from any variable that is **explicitly set and non-empty**, logging the replacement, but never touches a value that appears in `audit_log` — that is, one an operator chose through `/set`.
 - **Two deployments must not share the persistent volume.** `runtime_config.db` and `fpl.db` both live in the `RUNTIME_CONFIG_PATH` directory, so a Coolify preview mounting the production volume shares every setting, post marker, price baseline, and the Telegraph catalog with it. Whichever instance creates the settings row decides the value for both, which is exactly how a watchlist gets disabled for a deployment whose own environment enables it. It is worse than a wrong setting: two Telethon clients on one session invalidate it (`AuthKeyDuplicatedError`), and both instances post to the target channel and race the queue. Give a preview its own volume. Pinning a setting with `/set` protects it from a preview's environment, but not from the rest of the sharing.
-- `bot.py:_log_effective_settings()` logs both database paths and every effective setting at startup, marking any the environment disagrees with. Read that first when a scheduled post does not appear — it answers "which database am I using and what does it say" in one look.
+- `delivery._log_effective_settings()` logs both database paths and every effective setting at startup, marking any the environment disagrees with. Read that first when a scheduled post does not appear — it answers "which database am I using and what does it say" in one look.
 - The **⚙️ مدیریت** screen lists every editable setting with its effective value. It used to show only the target channel, so a setting quietly sitting at the wrong value could not be checked from Telegram at all.
 - The key is `PRICE_PREDICTIONS_ENABLED`. There is no `PRICE_CHANGES_ENABLED`; an unrecognised name in `.env` is read by nothing and reports nothing.
 - `runtime_config.db` is ignored by git. In Coolify it must live in persistent storage: mount a volume at `/app/teleadmin_project/data` and set `RUNTIME_CONFIG_PATH=/app/teleadmin_project/data/runtime_config.db`.
@@ -86,19 +106,19 @@ Operational settings are dashboard-editable and persist in `runtime_config.db`, 
 ## Deployment
 
 - Deployed on a Coolify-managed VPS. The Procfile at root (`web: cd teleadmin_project && python bot.py`) is used as the start command.
-- **Health server**: `bot.py:_start_health_server()` runs a minimal async HTTP server on `PORT` env var. This enables uptime monitoring on any platform.
+- **Health server**: `bot._start_health_server()` runs a minimal async HTTP server on `PORT` env var. This enables uptime monitoring on any platform.
 - **StringSession**: Export with `python export_session.py`, add as `TELETHON_SESSION_STRING` env var. Never commit the local `.session` file; deployment uses only the env var.
 - **Root `requirements.txt`**: points to `teleadmin_project/requirements.txt`. Required for buildpack-based deployment that runs `pip install -r requirements.txt`.
 
 ## URL extraction from messages
 
-URLs come from two sources (`bot.py:_extract_urls()`):
+URLs come from two sources (`post_format._extract_urls()`):
 1. Raw text regex: HTTP(S), `t.me/`, and known bare Premier League news/share domains (`premierleague.app.link/`, `premierleague-alternate.app.link/`, `preml.ge/`, `premierleague.com/en/news/`). Bare links get an HTTPS scheme before processing.
 2. Message entities: `MessageEntityTextUrl` (link text + hidden URL) — accessed via `getattr(entity, "url", None)`
 
 Both must be checked to catch all link types.
 
-Source-post translation removes printed URLs through `bot.py:_strip_visible_urls()` before translation and again in `_build_caption()` before appending the labelled footer link. Short-article bodies and Telegraph-post summaries use the same cleanup. Only visible text is stripped; HTML attributes and meaningful linked labels remain intact. Never remove source URLs using a plain `html.replace(url, "")`: HTML escaping changes query-string `&` to `&amp;`, and replacement inside an `href` breaks hidden links. Buffered posts collect URLs and HTML entities from every chunk, not only the first. URL article discovery still uses the original source event.
+Source-post translation removes printed URLs through `post_format._strip_visible_urls()` before translation and again in `_build_caption()` before appending the labelled footer link. Short-article bodies and Telegraph-post summaries use the same cleanup. Only visible text is stripped; HTML attributes and meaningful linked labels remain intact. Never remove source URLs using a plain `html.replace(url, "")`: HTML escaping changes query-string `&` to `&amp;`, and replacement inside an `href` breaks hidden links. Buffered posts collect URLs and HTML entities from every chunk, not only the first. URL article discovery still uses the original source event.
 
 ## OpenRouter API health check
 
@@ -448,7 +468,7 @@ returns otherwise unstructured prose.
 
 Long-form content (>940 source chars), including merged chunks above that threshold, is published as Telegraph articles via `articles.publish_to_telegraph()`.
 
-- `bot.py:_format_telegraph_post()` produces the Telegram post layout: `✍ مقاله جدید <source>` header, title, AI-generated summary, and `👈👈متن کامل فارسی مقاله👉👉` linked to the Telegraph URL. URL article posts include their feature image as Telegram media.
+- `post_format._format_telegraph_post()` produces the Telegram post layout: `✍ مقاله جدید <source>` header, title, AI-generated summary, and `👈👈متن کامل فارسی مقاله👉👉` linked to the Telegraph URL. URL article posts include their feature image as Telegram media.
 - `translator.translate_article()` uses `article_prompt.txt` for structured JSON output (`title`/`summary`/`body`), falling back to regular translation if JSON parsing fails
 - Set `TELEGRAPH_ACCESS_TOKEN` env var to keep articles under a single Telegraph account; without it a new account is created on every restart
 
@@ -526,8 +546,8 @@ Partial content is never published. Two independent checks exist:
 
 Retry then give up, reporting once:
 
-- Articles: `runtime_config.finish_article_monitor_candidate(..., max_attempts=4)` returns `True` when the attempt budget is spent and moves the URL to status `abandoned`, which `claim_article_monitor_candidate()` never re-claims. `bot._notify_article_abandoned()` then sends one private admin message.
-- YouTube: `bot._notify_youtube_monitor_failure()` counts attempts in memory, retries across polls, then marks the video `skipped` and notifies admins once.
+- Articles: `runtime_config.finish_article_monitor_candidate(..., max_attempts=4)` returns `True` when the attempt budget is spent and moves the URL to status `abandoned`, which `claim_article_monitor_candidate()` never re-claims. `article_pipeline._notify_article_abandoned()` then sends one private admin message.
+- YouTube: `youtube_pipeline._notify_youtube_monitor_failure()` counts attempts in memory, retries across polls, then marks the video `skipped` and notifies admins once.
 
 Only the automated feeds are gated (`_publish_article_from_url` and the YouTube transcript path). Source-channel Telegram posts and admin submissions are not — a forwarded post is complete by definition, and gating it would block legitimate content.
 

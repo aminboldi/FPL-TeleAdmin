@@ -1,5 +1,7 @@
 """Text-only source posts should not become articles just by being buffered."""
 import ast
+
+import bot_source
 import asyncio
 import html
 import re
@@ -28,13 +30,8 @@ class TextPostRoutingTests(unittest.IsolatedAsyncioTestCase):
             "_strip_visible_urls", "_extract_urls", "_extract_urls_from_message",
             "_format_telegraph_post", "_format_short_article_post",
         }
-        tree = ast.parse(path.read_text())
-        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
         constants = {"_HASHTAG_RE", "_URL_RE", "_ARTICLE_SOURCE_THRESHOLD", "_CHUNK_TIMEOUT", "AI_SIGNATURE"}
-        functions.extend(
-            node for node in tree.body if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id in constants for target in node.targets)
-        )
+        functions = bot_source.definitions(names | constants)
         self.translation = AsyncMock(return_value="خبر کوتاه\nخط دوم")
         self.article_translation = AsyncMock(return_value={"title": "عنوان", "summary": "خلاصه", "body": "متن بلند"})
         self.publish = Mock(return_value="https://telegra.ph/long-post")

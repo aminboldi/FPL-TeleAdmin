@@ -35,7 +35,12 @@ TeleAdmin/
 ├── specs.md                      # Original project specification
 ├── README.md
 └── teleadmin_project/
-    ├── bot.py                    # Main bot: event handlers, forwarding, notifications
+    ├── bot.py                    # Entry point: source-channel handlers and main()
+    ├── app.py                    # Settings, translator and Telegram client
+    ├── post_format.py            # Text, HTML and caption helpers
+    ├── delivery.py               # Queue, sending, alerts, admin notifications
+    ├── *_pipeline.py, forwarded.py, catalog_sync.py, dashboard_content.py
+    │                             # One module per content pipeline (see AGENTS.md)
     ├── config.py                 # Settings dataclass, env var loading
     ├── translator.py             # OpenRouter translation client
     ├── prompt.txt                # Editable LLM translation prompt
