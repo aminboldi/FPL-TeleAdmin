@@ -47,7 +47,7 @@ When downloading and re-uploading media, the temp file must include the original
 
 - `.env` lives at repo root. `config.py` loads it from `Path(__file__).parent.parent / ".env"`.
 - Telethon session: if `TELETHON_SESSION_STRING` env var is set, a `StringSession` is used (cloud deployment). Otherwise it falls back to the local file `teleadmin_project/translation_session.session`.
-- First run locally prompts for phone number + verification code. After login, run `python export_session.py` to export the session as a string for cloud deployment.
+- First run locally prompts for phone number + verification code. For deployment, run `python export_session.py`: it makes a **separate, in-memory** login (phone + code) and prints it as a session string, without starting the bot or touching the local `.session` file. Never export the local login for the server — that is how the server once ended up on a login that had been committed.
 - **Never use the same Telethon user session concurrently from local development and the cloud VPS.** Telegram invalidates it with `AuthKeyDuplicatedError`. For deployment, create a fresh local login, export it, set `TELETHON_SESSION_STRING` only in Coolify, then do not run that same session locally while the VPS is running.
 - Keep `.env` **and every `*.session` file** out of git (`.gitignore` covers both). A session file is a logged-in Telegram account with no password needed; four of them were once committed to this public repository and had to be revoked. `TELETHON_SESSION_STRING` takes priority in deployment, so the image needs no session file.
 - The env var is `OPEN_ROUTER_API_KEY` (with underscore between OPEN and ROUTER). The old specs.md uses `OPENROUTER_API_KEY` (no underscore) — that's wrong.
@@ -590,7 +590,7 @@ All run from `teleadmin_project/`:
 |---|---|
 | `send_livefpl.py` | Manually post game points/EOLB/price predictions (CLI args: `--all` or GW number) |
 | `send_test_deadline.py` | Send a test deadline-passed post (GW39) with `deadline.jpg` |
-| `export_session.py` | Export the local `.session` file as a `TELETHON_SESSION_STRING` for cloud deployment |
+| `export_session.py` | Make a fresh in-memory login and print it as a `TELETHON_SESSION_STRING` for Coolify |
 | `generate_aliases.py` | Populate `players.alias` column — community nicknames for player matching |
 | `translate_names.py` | Populate `players.*_fa` columns — Farsi name translations |
 | `translate_teams.py` | Populate `teams.*_fa` columns — Farsi team name translations |
